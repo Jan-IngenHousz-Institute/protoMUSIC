@@ -1,0 +1,9 @@
+.*/
+include/certs.c
+components/certs/certs.c
+components/certs/certs.h
+include/certs/
+dom_ludo_prototype_ambyte_thing_certs/
+sdkconfig.defaults
+MQTT TLS test client.py
+sdkconfig.adafruit_feather_esp32s3

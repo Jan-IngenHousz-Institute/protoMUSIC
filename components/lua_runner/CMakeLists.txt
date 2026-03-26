@@ -1,0 +1,84 @@
+set(LUA_LOCAL_DIR "${CMAKE_SOURCE_DIR}/components/lua")
+set(HAVE_LOCAL_LUA FALSE)
+if (EXISTS "${LUA_LOCAL_DIR}/lapi.c")
+    set(HAVE_LOCAL_LUA TRUE)
+endif()
+
+if (HAVE_LOCAL_LUA)
+    idf_component_register(
+        SRCS
+            "lua_runner.c"
+            "lua_script_blob.c"
+        INCLUDE_DIRS
+            "include"
+        REQUIRES
+            ambyte_status
+            pcf2131tfy_rtc
+            lua
+            sd_card
+    )
+else()
+    set(LUA_DEP_PACKAGES "${CMAKE_SOURCE_DIR}/.pio/libdeps/*/lua")
+    file(GLOB LUA_DEP_DIRS "${LUA_DEP_PACKAGES}")
+    if (NOT LUA_DEP_DIRS)
+        message(FATAL_ERROR "Lua package sources not found. Ensure lib_deps includes lua and run a clean PlatformIO dependency fetch/build.")
+    endif()
+
+    list(GET LUA_DEP_DIRS 0 LUA_SRC_BASE)
+    set(LUA_SRC_DIR "${LUA_SRC_BASE}/src")
+    set(LUA_INCLUDE_DIRS
+        "${LUA_SRC_BASE}"
+        "${LUA_SRC_DIR}"
+    )
+
+    idf_component_register(
+        SRCS
+            "lua_runner.c"
+            "lua_script_blob.c"
+        INCLUDE_DIRS
+            "include"
+        REQUIRES
+            ambyte_status
+            pcf2131tfy_rtc
+            sd_card
+    )
+
+    target_include_directories(${COMPONENT_LIB} PRIVATE ${LUA_INCLUDE_DIRS})
+
+    set(LUA_SOURCES
+        "${LUA_SRC_DIR}/lapi.c"
+        "${LUA_SRC_DIR}/lcode.c"
+        "${LUA_SRC_DIR}/lctype.c"
+        "${LUA_SRC_DIR}/ldebug.c"
+        "${LUA_SRC_DIR}/ldo.c"
+        "${LUA_SRC_DIR}/ldump.c"
+        "${LUA_SRC_DIR}/lfunc.c"
+        "${LUA_SRC_DIR}/lgc.c"
+        "${LUA_SRC_DIR}/llex.c"
+        "${LUA_SRC_DIR}/lmem.c"
+        "${LUA_SRC_DIR}/lobject.c"
+        "${LUA_SRC_DIR}/lopcodes.c"
+        "${LUA_SRC_DIR}/lparser.c"
+        "${LUA_SRC_DIR}/lstate.c"
+        "${LUA_SRC_DIR}/lstring.c"
+        "${LUA_SRC_DIR}/ltable.c"
+        "${LUA_SRC_DIR}/ltm.c"
+        "${LUA_SRC_DIR}/lundump.c"
+        "${LUA_SRC_DIR}/lvm.c"
+        "${LUA_SRC_DIR}/lzio.c"
+        "${LUA_SRC_DIR}/lauxlib.c"
+        "${LUA_SRC_DIR}/lbaselib.c"
+        "${LUA_SRC_DIR}/ldblib.c"
+        "${LUA_SRC_DIR}/liolib.c"
+        "${LUA_SRC_DIR}/lmathlib.c"
+        "${LUA_SRC_DIR}/loslib.c"
+        "${LUA_SRC_DIR}/ltablib.c"
+        "${LUA_SRC_DIR}/lstrlib.c"
+        "${LUA_SRC_DIR}/lutf8lib.c"
+        "${LUA_SRC_DIR}/loadlib.c"
+        "${LUA_SRC_DIR}/lcorolib.c"
+        "${LUA_SRC_DIR}/linit.c"
+    )
+
+    target_sources(${COMPONENT_LIB} PRIVATE ${LUA_SOURCES})
+endif()

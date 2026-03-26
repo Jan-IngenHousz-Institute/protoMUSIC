@@ -1,0 +1,17 @@
+menu "Ambbyte IoT Settings"
+
+config AMBYTE_WIFI_SSID
+    string "Wi-Fi SSID"
+    default "__UNPROVISIONED__"
+    help
+        Provision this on the build machine with a local sdkconfig or menuconfig change.
+        Do not commit live Wi-Fi credentials to source control.
+
+config AMBYTE_WIFI_PASSWORD
+    string "Wi-Fi Password"
+    default "__UNPROVISIONED__"
+    help
+        Provision this on the build machine with a local sdkconfig or menuconfig change.
+        Leave it empty only for an intentionally open network.
+
+endmenu
