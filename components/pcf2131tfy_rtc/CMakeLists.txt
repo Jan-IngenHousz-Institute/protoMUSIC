@@ -5,5 +5,6 @@ idf_component_register(
         "RTC_NXP.cpp"
         "pcf2131tfy_rtc_api.cpp"
     INCLUDE_DIRS "include"
+    PRIV_INCLUDE_DIRS "."
     PRIV_REQUIRES driver i2c_bus
 )

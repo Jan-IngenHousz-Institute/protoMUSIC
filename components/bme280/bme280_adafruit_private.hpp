@@ -3,12 +3,10 @@
 
 #include "bme280.h"
 
-#include "Arduino.h"
-#include "I2C_device.h"
-
-#if defined(BME280_ENABLE_ADAFRUIT_SENSOR_API)
-#include <Adafruit_Sensor.h>
-#endif
+#include <cstdint>
+#include <cmath>
+#include "driver/i2c.h"
+#include "i2c_bus.h"
 
 #define BME280_ADDRESS (BME280_I2C_ADDR_PRIMARY)
 #define BME280_ADDRESS_ALTERNATE (BME280_I2C_ADDR_SECONDARY)
@@ -73,43 +71,6 @@ typedef struct {
   int8_t dig_H6;
 } bme280_calib_data;
 
-class Adafruit_BME280;
-
-#if defined(BME280_ENABLE_ADAFRUIT_SENSOR_API)
-class Adafruit_BME280_Temp : public Adafruit_Sensor {
-public:
-  Adafruit_BME280_Temp(Adafruit_BME280 *parent) { _theBME280 = parent; }
-  bool getEvent(sensors_event_t *);
-  void getSensor(sensor_t *);
-
-private:
-  int _sensorID = 280;
-  Adafruit_BME280 *_theBME280 = NULL;
-};
-
-class Adafruit_BME280_Pressure : public Adafruit_Sensor {
-public:
-  Adafruit_BME280_Pressure(Adafruit_BME280 *parent) { _theBME280 = parent; }
-  bool getEvent(sensors_event_t *);
-  void getSensor(sensor_t *);
-
-private:
-  int _sensorID = 280;
-  Adafruit_BME280 *_theBME280 = NULL;
-};
-
-class Adafruit_BME280_Humidity : public Adafruit_Sensor {
-public:
-  Adafruit_BME280_Humidity(Adafruit_BME280 *parent) { _theBME280 = parent; }
-  bool getEvent(sensors_event_t *);
-  void getSensor(sensor_t *);
-
-private:
-  int _sensorID = 280;
-  Adafruit_BME280 *_theBME280 = NULL;
-};
-#endif
-
 class Adafruit_BME280 {
 public:
   enum sensor_sampling {
@@ -148,7 +109,7 @@ public:
 
   Adafruit_BME280();
   ~Adafruit_BME280(void);
-  bool begin(uint8_t addr = BME280_ADDRESS, TwoWire *theWire = &Wire);
+  bool begin(i2c_port_t port, uint8_t addr = BME280_ADDRESS);
   bool init();
 
   void setSampling(sensor_mode mode = MODE_NORMAL,
@@ -170,33 +131,21 @@ public:
   float getTemperatureCompensation(void);
   void setTemperatureCompensation(float);
 
-#if defined(BME280_ENABLE_ADAFRUIT_SENSOR_API)
-  Adafruit_Sensor *getTemperatureSensor(void);
-  Adafruit_Sensor *getPressureSensor(void);
-  Adafruit_Sensor *getHumiditySensor(void);
-#endif
-
 protected:
-  I2C_device *i2c_dev = nullptr;
-
-#if defined(BME280_ENABLE_ADAFRUIT_SENSOR_API)
-  Adafruit_BME280_Temp *temp_sensor = NULL;
-  Adafruit_BME280_Pressure *pressure_sensor = NULL;
-  Adafruit_BME280_Humidity *humidity_sensor = NULL;
-#endif
+  i2c_port_t port_ = I2C_NUM_0;
+  uint8_t addr_ = BME280_ADDRESS;
 
   void readCoefficients(void);
   bool isReadingCalibration(void);
 
-  void write8(byte reg, byte value);
-  uint8_t read8(byte reg);
-  uint16_t read16(byte reg);
-  uint32_t read24(byte reg);
-  int16_t readS16(byte reg);
-  uint16_t read16_LE(byte reg);
-  int16_t readS16_LE(byte reg);
+  void write8(uint8_t reg, uint8_t value);
+  uint8_t read8(uint8_t reg);
+  uint16_t read16(uint8_t reg);
+  uint32_t read24(uint8_t reg);
+  int16_t readS16(uint8_t reg);
+  uint16_t read16_LE(uint8_t reg);
+  int16_t readS16_LE(uint8_t reg);
 
-  uint8_t _i2caddr;
   int32_t _sensorID;
   int32_t t_fine;
   int32_t t_fine_adjust = 0;

@@ -21,8 +21,6 @@ typedef struct {
 
 /*
  * The platform I2C bus must be initialized before calling bme280_init().
- * The current implementation is Arduino-backed internally, but it does not
- * initialize or own that bus.
  */
 esp_err_t bme280_init(uint8_t i2c_addr);
 bool bme280_is_ready(void);

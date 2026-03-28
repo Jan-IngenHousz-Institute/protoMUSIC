@@ -48,8 +48,8 @@ extern "C" esp_err_t bme280_read(bme280_reading_t *out_reading)
   out_reading->humidity_percent = s_bme280_device.readHumidity();
   out_reading->pressure_pa = s_bme280_device.readPressure();
 
-  if (isnan(out_reading->temperature_c) || isnan(out_reading->humidity_percent) ||
-      isnan(out_reading->pressure_pa)) {
+  if (std::isnan(out_reading->temperature_c) || std::isnan(out_reading->humidity_percent) ||
+      std::isnan(out_reading->pressure_pa)) {
     return ESP_FAIL;
   }
 

@@ -16,9 +16,6 @@
 #include "wifi_manager.h"
 
 #define APP_TAG "APP_MAIN"
-#define APP_SENSOR_REPORT_INTERVAL_MS 5000
-#define APP_SENSOR_TASK_STACK 4096
-#define APP_SENSOR_TASK_PRIO 5
 
 static const i2c_bus_config_t s_i2c_bus_cfg = {
     .port = I2C_BUS_DEFAULT_PORT,
@@ -26,61 +23,6 @@ static const i2c_bus_config_t s_i2c_bus_cfg = {
     .scl_gpio = I2C_BUS_DEFAULT_SCL_GPIO,
     .clock_speed_hz = I2C_BUS_DEFAULT_SPEED_HZ,
 };
-
-static void sensor_report_task(void *arg)
-{
-    (void)arg;
-
-    bme280_reading_t bme;
-    time_t rtc_now;
-    struct tm rtc_tm;
-    char rtc_str[32];
-
-    while (true) {
-        const bool bme_ready = bme280_is_ready();
-        const bool rtc_ready = pcf2131tfy_rtc_is_ready();
-        bool rtc_read_ok = false;
-
-        if (!bme_ready) {
-            ESP_LOGW(APP_TAG, "BME280 not initialized yet");
-        }
-
-        if (!rtc_ready) {
-            ESP_LOGW(APP_TAG, "RTC not initialized yet");
-        } else if (pcf2131tfy_rtc_get_time(&rtc_now) == ESP_OK) {
-            rtc_read_ok = true;
-            localtime_r(&rtc_now, &rtc_tm);
-            strftime(rtc_str, sizeof(rtc_str), "%Y-%m-%d %H:%M:%S", &rtc_tm);
-        } else {
-            ESP_LOGW(APP_TAG, "RTC read failed");
-        }
-
-        if (bme_ready) {
-            const esp_err_t bme_err = bme280_read(&bme);
-            if (bme_err != ESP_OK) {
-                ESP_LOGW(APP_TAG, "BME280 read failed: %s", esp_err_to_name(bme_err));
-            } else if (rtc_read_ok) {
-                ESP_LOGI(
-                    APP_TAG,
-                    "T: %.2f C | RH: %.2f %% | P: %.2f Pa | RTC: %s (%lld)",
-                    bme.temperature_c,
-                    bme.humidity_percent,
-                    bme.pressure_pa,
-                    rtc_str,
-                    (long long)rtc_now);
-            } else {
-                ESP_LOGI(
-                    APP_TAG,
-                    "T: %.2f C | RH: %.2f %% | P: %.2f Pa | RTC: unavailable",
-                    bme.temperature_c,
-                    bme.humidity_percent,
-                    bme.pressure_pa);
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(APP_SENSOR_REPORT_INTERVAL_MS));
-    }
-}
 
 static esp_err_t app_init_nvs(void)
 {
@@ -169,20 +111,6 @@ static void app_start_lua_runner(void)
     ESP_LOGI(APP_TAG, "Lua runner started");
 }
 
-static void app_start_sensor_task(void)
-{
-    const BaseType_t rc = xTaskCreate(
-        sensor_report_task,
-        "sensor_report",
-        APP_SENSOR_TASK_STACK,
-        NULL,
-        APP_SENSOR_TASK_PRIO,
-        NULL);
-    if (rc != pdPASS) {
-        ESP_LOGE(APP_TAG, "Sensor report task creation failed");
-    }
-}
-
 static void app_start_cli(void)
 {
     const esp_err_t err = cli_start();
@@ -225,7 +153,6 @@ void app_main(void)
     }
 
     app_start_lua_runner();
-    // app_start_sensor_task();
     app_start_cli();
 
     ESP_LOGI(APP_TAG, "Startup sequence complete");
