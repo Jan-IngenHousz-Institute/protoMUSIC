@@ -63,7 +63,6 @@ static int cli_cmd_status(int argc, char **argv)
 
     const bool bme_ready = bme280_is_ready();
     const bool rtc_ready = pcf2131tfy_rtc_is_ready();
-
     printf("CLI status:\r\n");
     printf(" - BME280 ready: %s\r\n", bme_ready ? "yes" : "no");
     printf(" - RTC ready: %s\r\n", rtc_ready ? "yes" : "no");
