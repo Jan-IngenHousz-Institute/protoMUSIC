@@ -53,3 +53,8 @@ extern "C" esp_err_t pcf2131tfy_rtc_get_time(time_t *out_time)
 
     return ESP_OK;
 }
+
+extern "C" clock_read_fn pcf2131tfy_rtc_get_clock_read_fn(void)
+{
+    return pcf2131tfy_rtc_get_time;
+}

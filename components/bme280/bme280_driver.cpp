@@ -55,3 +55,21 @@ extern "C" esp_err_t bme280_read(bme280_reading_t *out_reading)
 
   return ESP_OK;
 }
+
+static esp_err_t bme280_sensor_read_adapter(measurement_t *out)
+{
+  bme280_reading_t reading;
+  esp_err_t err = bme280_read(&reading);
+  if (err != ESP_OK) {
+    return err;
+  }
+  out->temperature_c = reading.temperature_c;
+  out->humidity_percent = reading.humidity_percent;
+  out->pressure_pa = reading.pressure_pa;
+  return ESP_OK;
+}
+
+extern "C" sensor_read_fn bme280_get_sensor_read_fn(void)
+{
+  return bme280_sensor_read_adapter;
+}

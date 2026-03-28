@@ -123,3 +123,8 @@ esp_err_t ambyte_status_set_rgb(uint8_t r, uint8_t g, uint8_t b)
     (void)xSemaphoreGive(s_status_mutex);
     return err;
 }
+
+status_set_fn ambyte_status_get_set_fn(void)
+{
+    return ambyte_status_set_rgb;
+}

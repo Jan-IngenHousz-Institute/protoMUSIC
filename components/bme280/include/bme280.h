@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "sensing_port.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +26,7 @@ typedef struct {
 esp_err_t bme280_init(uint8_t i2c_addr);
 bool bme280_is_ready(void);
 esp_err_t bme280_read(bme280_reading_t *out_reading);
+sensor_read_fn bme280_get_sensor_read_fn(void);
 
 #ifdef __cplusplus
 }
