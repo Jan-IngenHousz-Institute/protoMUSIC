@@ -2,6 +2,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -10,23 +11,25 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "ambyte_status.h"
+#include "device_commands.h"
 #include "lauxlib.h"
 #include "lua.h"
+#include "lualib.h"
 #include "lua_runner.h"
-#include "pcf2131tfy_rtc_api.h"
-#include "sd_card.h"
 
 #define LUA_RUNNER_TAG "lua_runner"
 #define LUA_RUNNER_TASK_NAME "lua_runner"
-#define LUA_RUNNER_TASK_STACK 4096
+#define LUA_RUNNER_TASK_STACK 8192
 #define LUA_RUNNER_TASK_PRIORITY 5
+#define LUA_QUERY_MAX_RECORDS 64
 
 extern const uint8_t g_lua_script[];
 extern const size_t g_lua_script_len;
 
 static TaskHandle_t s_lua_task_handle = NULL;
 static const uint8_t *const s_lua_script_start = g_lua_script;
+
+/* ── helpers ─────────────────────────────────────────────────────────── */
 
 static int lua_push_nil_reason(lua_State *L, const char *reason)
 {
@@ -35,228 +38,299 @@ static int lua_push_nil_reason(lua_State *L, const char *reason)
     return 2;
 }
 
-static const char *lua_err_detail(esp_err_t err)
+/* ── device.* bindings ───────────────────────────────────────────────── */
+
+static int l_device_set_rgb(lua_State *L)
 {
-    switch (err) {
-        case ESP_ERR_INVALID_ARG:
-            return "invalid argument or path";
-        case ESP_ERR_INVALID_SIZE:
-            return "path too long";
-        case ESP_ERR_INVALID_STATE:
-            return "service not ready";
-        case ESP_ERR_TIMEOUT:
-            return "operation timed out";
-        case ESP_ERR_NOT_FOUND:
-            return "not found";
-        default:
-            return esp_err_to_name(err);
-    }
-}
-
-static int lua_push_esp_err_reason(lua_State *L, const char *context, esp_err_t err)
-{
-    char reason[96];
-    snprintf(reason, sizeof(reason), "%s: %s", context, lua_err_detail(err));
-    return lua_push_nil_reason(L, reason);
-}
-
-static bool lua_string_has_embedded_nul(const char *value, size_t value_len)
-{
-    return (value == NULL) || (strlen(value) != value_len);
-}
-
-static esp_err_t lua_sd_make_default_name(char *out_name, size_t out_name_len)
-{
-    if ((out_name == NULL) || (out_name_len == 0)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (!pcf2131tfy_rtc_is_ready()) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    time_t now = 0;
-    esp_err_t err = pcf2131tfy_rtc_get_time(&now);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    struct tm tm_now;
-    if (localtime_r(&now, &tm_now) == NULL) {
-        return ESP_FAIL;
-    }
-
-    const size_t written = strftime(out_name, out_name_len, "%Y-%m-%d_%H_%M_%S", &tm_now);
-    return (written > 0) ? ESP_OK : ESP_ERR_INVALID_SIZE;
-}
-
-static int l_status_set_rgb(lua_State *L)
-{
-    if (lua_gettop(L) != 3) {
-        return luaL_error(L, "status.set_rgb expects 3 arguments: r, g, b");
-    }
-
     lua_Integer r = luaL_checkinteger(L, 1);
     lua_Integer g = luaL_checkinteger(L, 2);
     lua_Integer b = luaL_checkinteger(L, 3);
 
-    if (r < 0 || r > UINT8_MAX) {
-        return luaL_error(L, "r must be in [0, 255]");
-    }
-    if (g < 0 || g > UINT8_MAX) {
-        return luaL_error(L, "g must be in [0, 255]");
-    }
-    if (b < 0 || b > UINT8_MAX) {
-        return luaL_error(L, "b must be in [0, 255]");
+    if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) {
+        return luaL_error(L, "RGB values must be in [0, 255]");
     }
 
-    esp_err_t err = ambyte_status_set_rgb((uint8_t)r, (uint8_t)g, (uint8_t)b);
-    if (err != ESP_OK) {
-        return luaL_error(L, "status.set_rgb failed: %s", esp_err_to_name(err));
+    cmd_result_t res = cmd_set_rgb((uint8_t)r, (uint8_t)g, (uint8_t)b);
+    if (res.status != ESP_OK) {
+        return luaL_error(L, "%s", res.message);
     }
     return 0;
 }
 
-static int l_status_sleep_ms(lua_State *L)
+static int l_device_read_rtc(lua_State *L)
+{
+    time_t t = 0;
+    cmd_result_t res = cmd_read_rtc(&t);
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    lua_pushinteger(L, (lua_Integer)t);
+    return 1;
+}
+
+static int l_device_status(lua_State *L)
+{
+    bool bme_ready = false;
+    bool rtc_ready = false;
+    time_t rtc_time = 0;
+    cmd_result_t res = cmd_device_status(&bme_ready, &rtc_ready, &rtc_time);
+
+    lua_newtable(L);
+    lua_pushboolean(L, bme_ready);
+    lua_setfield(L, -2, "bme280");
+    lua_pushboolean(L, rtc_ready);
+    lua_setfield(L, -2, "rtc");
+    if (rtc_ready) {
+        lua_pushinteger(L, (lua_Integer)rtc_time);
+        lua_setfield(L, -2, "rtc_time");
+    }
+    lua_pushstring(L, res.message);
+    lua_setfield(L, -2, "summary");
+    return 1;
+}
+
+static int l_device_read_env(lua_State *L)
+{
+    float temp = 0, hum = 0, pres = 0;
+    cmd_result_t res = cmd_read_env(&temp, &hum, &pres);
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+
+    lua_newtable(L);
+    lua_pushnumber(L, (lua_Number)temp);
+    lua_setfield(L, -2, "temperature_c");
+    lua_pushnumber(L, (lua_Number)hum);
+    lua_setfield(L, -2, "humidity_pct");
+    lua_pushnumber(L, (lua_Number)pres);
+    lua_setfield(L, -2, "pressure_pa");
+    return 1;
+}
+
+static int l_device_sleep_ms(lua_State *L)
 {
     lua_Integer ms = luaL_checkinteger(L, 1);
     if (ms < 0 || ms > INT_MAX) {
         return luaL_error(L, "ms must be in [0, INT_MAX]");
     }
-
-    vTaskDelay(pdMS_TO_TICKS((TickType_t)ms));
+    cmd_sleep_ms((uint32_t)ms);
     return 0;
 }
 
-static int l_status_log(lua_State *L)
+static int l_device_log(lua_State *L)
 {
-    if (lua_gettop(L) != 1) {
-        return luaL_error(L, "status.log expects exactly 1 string argument");
-    }
-
-    size_t len = 0;
-    const char *msg = luaL_checklstring(L, 1, &len);
-    if (msg == NULL || len == 0) {
-        return luaL_error(L, "status.log expects a non-empty string");
-    }
-
-    ESP_LOGI(LUA_RUNNER_TAG, "%s", msg);
+    const char *msg = luaL_checkstring(L, 1);
+    cmd_log(msg);
     return 0;
 }
 
-static int l_status_stop(lua_State *L)
+/* ── db.* bindings ───────────────────────────────────────────────────── */
+
+static int l_db_store(lua_State *L)
 {
-    (void)L;
-    return luaL_error(L, "status.stop() requested");
-}
-
-static int l_status_hello(lua_State *L)
-{
-    lua_pushstring(L, "hello world");
-    return 1;
-}
-
-static int l_sd_create_log_file(lua_State *L)
-{
-    const int argc = lua_gettop(L);
-    if (argc > 1) {
-        return lua_push_nil_reason(L, "sd.create_log_file expects zero or one string argument");
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int n = (int)luaL_len(L, 1);
+    if (n <= 0) {
+        return lua_push_nil_reason(L, "records array is empty");
     }
 
-    char generated_name[32];
-    const char *filename = NULL;
+    measurement_record_t *records = malloc((size_t)n * sizeof(measurement_record_t));
+    if (records == NULL) {
+        return lua_push_nil_reason(L, "out of memory");
+    }
 
-    if (argc == 1) {
-        if (lua_type(L, 1) != LUA_TSTRING) {
-            return lua_push_nil_reason(L, "sd.create_log_file expects a string filename");
+    for (int i = 1; i <= n; i++) {
+        lua_rawgeti(L, 1, i);
+        if (!lua_istable(L, -1)) {
+            free(records);
+            return lua_push_nil_reason(L, "each record must be a table");
         }
+        measurement_record_t *r = &records[i - 1];
+        memset(r, 0, sizeof(*r));
 
-        size_t filename_len = 0;
-        filename = lua_tolstring(L, 1, &filename_len);
-        if ((filename_len == 0) || lua_string_has_embedded_nul(filename, filename_len)) {
-            return lua_push_nil_reason(L, "sd.create_log_file filename must be a non-empty text string");
-        }
-    } else {
-        const esp_err_t err = lua_sd_make_default_name(generated_name, sizeof(generated_name));
-        if (err == ESP_ERR_INVALID_STATE) {
-            return lua_push_nil_reason(L, "rtc not ready");
-        }
-        if (err != ESP_OK) {
-            return lua_push_esp_err_reason(L, "sd.create_log_file failed to build timestamp name", err);
-        }
-        filename = generated_name;
+        lua_getfield(L, -1, "sensor_id");
+        r->sensor_id = (int64_t)luaL_checkinteger(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "measure_id");
+        r->measure_id = (int64_t)luaL_checkinteger(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "measure_type");
+        const char *mt = luaL_checkstring(L, -1);
+        strncpy(r->measure_type, mt, sizeof(r->measure_type) - 1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "timestamp");
+        r->timestamp = (time_t)luaL_checkinteger(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "data_type");
+        const char *dt = luaL_checkstring(L, -1);
+        strncpy(r->data_type, dt, sizeof(r->data_type) - 1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "value");
+        r->value = (float)luaL_checknumber(L, -1);
+        lua_pop(L, 1);
+
+        r->synced = false;
+        lua_pop(L, 1); /* pop the record table */
     }
 
-    char resolved_path[SD_CARD_PATH_MAX];
-    const esp_err_t err = sdcard_ensure_file(filename, resolved_path, sizeof(resolved_path));
-    if (err != ESP_OK) {
-        return lua_push_esp_err_reason(L, "sd.create_log_file failed", err);
-    }
+    cmd_result_t res = cmd_store_measurement(records, (size_t)n);
+    free(records);
 
-    lua_pushstring(L, resolved_path);
-    return 1;
-}
-
-static int l_sd_append(lua_State *L)
-{
-    if (lua_gettop(L) != 2) {
-        return lua_push_nil_reason(L, "sd.append expects exactly 2 string arguments");
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
     }
-
-    if (lua_type(L, 1) != LUA_TSTRING) {
-        return lua_push_nil_reason(L, "sd.append filename must be a string");
-    }
-    if (lua_type(L, 2) != LUA_TSTRING) {
-        return lua_push_nil_reason(L, "sd.append text must be a string");
-    }
-
-    size_t filename_len = 0;
-    const char *filename = lua_tolstring(L, 1, &filename_len);
-    if ((filename_len == 0) || lua_string_has_embedded_nul(filename, filename_len)) {
-        return lua_push_nil_reason(L, "sd.append filename must be a non-empty text string");
-    }
-
-    size_t text_len = 0;
-    const char *text = lua_tolstring(L, 2, &text_len);
-    if (lua_string_has_embedded_nul(text, text_len)) {
-        return lua_push_nil_reason(L, "sd.append text must not contain embedded NUL bytes");
-    }
-
-    const esp_err_t err = sdcard_append_line_exact(filename, text);
-    if (err != ESP_OK) {
-        return lua_push_esp_err_reason(L, "sd.append failed", err);
-    }
-
     lua_pushboolean(L, 1);
     return 1;
 }
 
-static void lua_register_status_module(lua_State *L)
+static void lua_push_record_table(lua_State *L, const measurement_record_t *r)
 {
-    static const luaL_Reg status_api[] = {
-        {"set_rgb", l_status_set_rgb},
-        {"sleep_ms", l_status_sleep_ms},
-        {"log", l_status_log},
-        {"stop", l_status_stop},
-        {"hello", l_status_hello},
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer)r->sensor_id);
+    lua_setfield(L, -2, "sensor_id");
+    lua_pushinteger(L, (lua_Integer)r->measure_id);
+    lua_setfield(L, -2, "measure_id");
+    lua_pushstring(L, r->measure_type);
+    lua_setfield(L, -2, "measure_type");
+    lua_pushinteger(L, (lua_Integer)r->timestamp);
+    lua_setfield(L, -2, "timestamp");
+    lua_pushstring(L, r->data_type);
+    lua_setfield(L, -2, "data_type");
+    lua_pushnumber(L, (lua_Number)r->value);
+    lua_setfield(L, -2, "value");
+    lua_pushboolean(L, r->synced);
+    lua_setfield(L, -2, "synced");
+}
+
+static int l_db_query(lua_State *L)
+{
+    const char *type = luaL_checkstring(L, 1);
+    lua_Integer from = luaL_checkinteger(L, 2);
+    lua_Integer to = luaL_checkinteger(L, 3);
+
+    measurement_record_t *out = malloc(LUA_QUERY_MAX_RECORDS * sizeof(measurement_record_t));
+    if (out == NULL) {
+        return lua_push_nil_reason(L, "out of memory");
+    }
+
+    size_t count = 0;
+    cmd_result_t res = cmd_query_measurements(type, (time_t)from, (time_t)to,
+                                              out, LUA_QUERY_MAX_RECORDS, &count);
+    if (res.status != ESP_OK) {
+        free(out);
+        return lua_push_nil_reason(L, res.message);
+    }
+
+    lua_newtable(L);
+    for (size_t i = 0; i < count; i++) {
+        lua_push_record_table(L, &out[i]);
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+
+    free(out);
+    return 1;
+}
+
+static int l_db_count(lua_State *L)
+{
+    const char *type = luaL_checkstring(L, 1);
+    size_t count = 0;
+    cmd_result_t res = cmd_measurement_count(type, &count);
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    lua_pushinteger(L, (lua_Integer)count);
+    return 1;
+}
+
+static int l_db_next_id(lua_State *L)
+{
+    int64_t id = 0;
+    cmd_result_t res = cmd_next_measure_id(&id);
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    lua_pushinteger(L, (lua_Integer)id);
+    return 1;
+}
+
+static int l_db_unsynced(lua_State *L)
+{
+    const char *type = luaL_checkstring(L, 1);
+
+    measurement_record_t *out = malloc(LUA_QUERY_MAX_RECORDS * sizeof(measurement_record_t));
+    if (out == NULL) {
+        return lua_push_nil_reason(L, "out of memory");
+    }
+
+    size_t count = 0;
+    cmd_result_t res = cmd_query_unsynced(type, out, LUA_QUERY_MAX_RECORDS, &count);
+    if (res.status != ESP_OK) {
+        free(out);
+        return lua_push_nil_reason(L, res.message);
+    }
+
+    lua_newtable(L);
+    for (size_t i = 0; i < count; i++) {
+        lua_push_record_table(L, &out[i]);
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+
+    free(out);
+    return 1;
+}
+
+static int l_db_mark_synced(lua_State *L)
+{
+    lua_Integer id = luaL_checkinteger(L, 1);
+    cmd_result_t res = cmd_mark_synced((int64_t)id);
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* ── module registration ─────────────────────────────────────────────── */
+
+static void lua_register_device_module(lua_State *L)
+{
+    static const luaL_Reg device_api[] = {
+        {"set_rgb",   l_device_set_rgb},
+        {"read_rtc",  l_device_read_rtc},
+        {"status",    l_device_status},
+        {"read_env",  l_device_read_env},
+        {"sleep_ms",  l_device_sleep_ms},
+        {"log",       l_device_log},
         {NULL, NULL},
     };
 
-    luaL_newlib(L, status_api);
-    lua_setglobal(L, "status");
+    luaL_newlib(L, device_api);
+    lua_setglobal(L, "device");
 }
 
-static void lua_register_sd_module(lua_State *L)
+static void lua_register_db_module(lua_State *L)
 {
-    static const luaL_Reg sd_api[] = {
-        {"create_log_file", l_sd_create_log_file},
-        {"append", l_sd_append},
+    static const luaL_Reg db_api[] = {
+        {"store",       l_db_store},
+        {"query",       l_db_query},
+        {"count",       l_db_count},
+        {"next_id",     l_db_next_id},
+        {"unsynced",    l_db_unsynced},
+        {"mark_synced", l_db_mark_synced},
         {NULL, NULL},
     };
 
-    luaL_newlib(L, sd_api);
-    lua_setglobal(L, "sd");
+    luaL_newlib(L, db_api);
+    lua_setglobal(L, "db");
 }
+
+/* ── task ────────────────────────────────────────────────────────────── */
 
 static void log_lua_error(lua_State *L, const char *phase)
 {
@@ -277,8 +351,9 @@ static void lua_runner_task(void *arg)
         return;
     }
 
-    lua_register_status_module(L);
-    lua_register_sd_module(L);
+    luaL_openlibs(L);
+    lua_register_device_module(L);
+    lua_register_db_module(L);
 
     const char *script = (const char *)s_lua_script_start;
     size_t script_len = g_lua_script_len;
@@ -293,6 +368,9 @@ static void lua_runner_task(void *arg)
     if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
         log_lua_error(L, "lua_pcall failed");
     }
+
+    ESP_LOGI(LUA_RUNNER_TAG, "Script finished, stack high water: %lu",
+             (unsigned long)uxTaskGetStackHighWaterMark(NULL));
 
     lua_close(L);
     s_lua_task_handle = NULL;

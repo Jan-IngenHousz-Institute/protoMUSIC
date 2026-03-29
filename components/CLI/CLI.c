@@ -9,15 +9,15 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 
-#include "ambyte_status.h"
-#include "bme280.h"
+#include "device_commands.h"
 #include "i2c_bus.h"
-#include "pcf2131tfy_rtc_api.h"
 
 static const char *TAG = "CLI";
 static const uint8_t CLI_I2C_SCAN_FIRST_ADDR = 0x08;
 static const uint8_t CLI_I2C_SCAN_LAST_ADDR = 0x77;
 static const uint8_t CLI_RTC_I2C_ADDR = (uint8_t)(0xA6 >> 1);
+static const uint8_t CLI_BME280_ADDR_PRIMARY = 0x77;
+static const uint8_t CLI_BME280_ADDR_SECONDARY = 0x76;
 static const TickType_t CLI_I2C_SCAN_TIMEOUT_TICKS = pdMS_TO_TICKS(50);
 static const TickType_t CLI_I2C_SCAN_LOCK_TIMEOUT_TICKS = pdMS_TO_TICKS(1000);
 static esp_console_repl_t *s_cli_repl = NULL;
@@ -44,65 +44,59 @@ static const char *cli_i2c_label_for_addr(uint8_t addr)
     switch (addr) {
         case CLI_RTC_I2C_ADDR:
             return "PCF2131 RTC";
-        case BME280_I2C_ADDR_PRIMARY:
+        case CLI_BME280_ADDR_PRIMARY:
             return "BME280 candidate (primary)";
-        case BME280_I2C_ADDR_SECONDARY:
+        case CLI_BME280_ADDR_SECONDARY:
             return "BME280 candidate (secondary)";
         default:
             return NULL;
     }
 }
+
 static int cli_cmd_status(int argc, char **argv)
 {
     (void)argv;
-
     if (argc != 1) {
         printf("Usage: status\r\n");
         return 1;
     }
 
-    const bool bme_ready = bme280_is_ready();
-    const bool rtc_ready = pcf2131tfy_rtc_is_ready();
+    bool bme_ready = false;
+    bool rtc_ready = false;
+    time_t rtc_time = 0;
+    cmd_result_t res = cmd_device_status(&bme_ready, &rtc_ready, &rtc_time);
     printf("CLI status:\r\n");
     printf(" - BME280 ready: %s\r\n", bme_ready ? "yes" : "no");
     printf(" - RTC ready: %s\r\n", rtc_ready ? "yes" : "no");
 
     if (rtc_ready) {
-        time_t now = 0;
         struct tm tm_now;
         char now_s[32] = {0};
-
-        if (pcf2131tfy_rtc_get_time(&now) == ESP_OK) {
-            localtime_r(&now, &tm_now);
-            strftime(now_s, sizeof(now_s), "%Y-%m-%d %H:%M:%S", &tm_now);
-            printf(" - RTC now: %s (%lld)\r\n", now_s, (long long)now);
-        } else {
-            printf(" - RTC now: read error\r\n");
-        }
+        localtime_r(&rtc_time, &tm_now);
+        strftime(now_s, sizeof(now_s), "%Y-%m-%d %H:%M:%S", &tm_now);
+        printf(" - RTC now: %s (%lld)\r\n", now_s, (long long)rtc_time);
     }
-
+    (void)res;
     return 0;
 }
 
 static int cli_cmd_rtc(int argc, char **argv)
 {
-    ESP_LOGI(TAG, "rtc command handler entered");
     (void)argv;
-
     if (argc != 1) {
         printf("Usage: rtc\r\n");
         return 1;
     }
 
     time_t now = 0;
-    struct tm tm_now;
-    char now_s[32] = {0};
-
-    if (pcf2131tfy_rtc_get_time(&now) != ESP_OK) {
-        printf("RTC read error\r\n");
+    cmd_result_t res = cmd_read_rtc(&now);
+    if (res.status != ESP_OK) {
+        printf("RTC read error: %s\r\n", res.message);
         return 1;
     }
 
+    struct tm tm_now;
+    char now_s[32] = {0};
     localtime_r(&now, &tm_now);
     strftime(now_s, sizeof(now_s), "%Y-%m-%d %H:%M:%S", &tm_now);
     printf("RTC: %s (%lld)\r\n", now_s, (long long)now);
@@ -111,27 +105,21 @@ static int cli_cmd_rtc(int argc, char **argv)
 
 static int cli_cmd_red(int argc, char **argv)
 {
-    ESP_LOGI(
-        TAG,
-        "red command handler entered: argc=%d argv0=%s argv1=%s",
-        argc,
-        ((argv != NULL) && (argc > 0) && (argv[0] != NULL)) ? argv[0] : "<null>",
-        ((argv != NULL) && (argc > 1) && (argv[1] != NULL)) ? argv[1] : "<null>");
     if (argc != 2) {
         printf("Usage: red <0|1>\r\n");
         return 1;
     }
 
-    esp_err_t err = ESP_ERR_INVALID_ARG;
+    cmd_result_t res;
     if (strcmp(argv[1], "0") == 0) {
-        err = ambyte_status_set_rgb(0, 0, 0);
-        if (err == ESP_OK) {
+        res = cmd_set_rgb(0, 0, 0);
+        if (res.status == ESP_OK) {
             printf("Red LED off\r\n");
             return 0;
         }
     } else if (strcmp(argv[1], "1") == 0) {
-        err = ambyte_status_set_rgb(5, 0, 0);
-        if (err == ESP_OK) {
+        res = cmd_set_rgb(5, 0, 0);
+        if (res.status == ESP_OK) {
             printf("Red LED on\r\n");
             return 0;
         }
@@ -140,30 +128,25 @@ static int cli_cmd_red(int argc, char **argv)
         return 1;
     }
 
-    printf("Status LED error: %s\r\n", esp_err_to_name(err));
+    printf("Status LED error: %s\r\n", res.message);
     return 1;
 }
 
-static int cli_cmd_exit(int argc, char **argv)
+static int cli_cmd_read_env(int argc, char **argv)
 {
-    (void)argc;
     (void)argv;
-
-    printf("Exit is not implemented in this firmware; use your monitor reset.\r\n");
-    return 0;
-}
-
-static int cli_cmd_ping(int argc, char **argv)
-{
-    ESP_LOGI(TAG, "ping command handler entered");
-    (void)argv;
-
     if (argc != 1) {
-        printf("Usage: ping\r\n");
+        printf("Usage: read_env\r\n");
         return 1;
     }
 
-    printf("pong\r\n");
+    float temp = 0, hum = 0, pres = 0;
+    cmd_result_t res = cmd_read_env(&temp, &hum, &pres);
+    if (res.status != ESP_OK) {
+        printf("read_env failed: %s\r\n", res.message);
+        return 1;
+    }
+    printf("T=%.2fC  H=%.1f%%  P=%.0fPa\r\n", temp, hum, pres);
     return 0;
 }
 
@@ -212,8 +195,8 @@ static int cli_cmd_i2cscan(int argc, char **argv)
 
             ++found_count;
             found_rtc = found_rtc || (addr == CLI_RTC_I2C_ADDR);
-            found_bme_primary = found_bme_primary || (addr == BME280_I2C_ADDR_PRIMARY);
-            found_bme_secondary = found_bme_secondary || (addr == BME280_I2C_ADDR_SECONDARY);
+            found_bme_primary = found_bme_primary || (addr == CLI_BME280_ADDR_PRIMARY);
+            found_bme_secondary = found_bme_secondary || (addr == CLI_BME280_ADDR_SECONDARY);
             continue;
         }
 
@@ -243,9 +226,9 @@ static int cli_cmd_i2cscan(int argc, char **argv)
     printf(
         "Summary: RTC=%s  0x%02X=%s  0x%02X=%s\r\n",
         found_rtc ? "yes" : "no",
-        BME280_I2C_ADDR_SECONDARY,
+        CLI_BME280_ADDR_SECONDARY,
         found_bme_secondary ? "yes" : "no",
-        BME280_I2C_ADDR_PRIMARY,
+        CLI_BME280_ADDR_PRIMARY,
         found_bme_primary ? "yes" : "no");
     return 0;
 }
@@ -271,15 +254,10 @@ static esp_err_t cli_register_commands(void)
         .help = "red <0|1>  turn red LED off/on",
         .func = cli_cmd_red,
     };
-    static const esp_console_cmd_t exit_cmd = {
-        .command = "exit",
-        .help = "reserved shell compatibility command",
-        .func = cli_cmd_exit,
-    };
-    static const esp_console_cmd_t ping_cmd = {
-        .command = "ping",
-        .help = "print a simple command-dispatch response",
-        .func = cli_cmd_ping,
+    static const esp_console_cmd_t read_env_cmd = {
+        .command = "read_env",
+        .help = "read BME280 temperature, humidity, pressure",
+        .func = cli_cmd_read_env,
     };
     static const esp_console_cmd_t i2cscan_cmd = {
         .command = "i2cscan",
@@ -302,12 +280,7 @@ static esp_err_t cli_register_commands(void)
         return err;
     }
 
-    err = esp_console_cmd_register(&exit_cmd);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = esp_console_cmd_register(&ping_cmd);
+    err = esp_console_cmd_register(&read_env_cmd);
     if (err != ESP_OK) {
         return err;
     }

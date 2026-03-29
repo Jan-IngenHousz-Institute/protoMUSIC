@@ -12,10 +12,8 @@ if (HAVE_LOCAL_LUA)
         INCLUDE_DIRS
             "include"
         REQUIRES
-            ambyte_status
-            pcf2131tfy_rtc
+            device_commands
             lua
-            sd_card
     )
 else()
     set(LUA_DEP_PACKAGES "${CMAKE_SOURCE_DIR}/.pio/libdeps/*/lua")
@@ -38,9 +36,7 @@ else()
         INCLUDE_DIRS
             "include"
         REQUIRES
-            ambyte_status
-            pcf2131tfy_rtc
-            sd_card
+            device_commands
     )
 
     target_include_directories(${COMPONENT_LIB} PRIVATE ${LUA_INCLUDE_DIRS})
