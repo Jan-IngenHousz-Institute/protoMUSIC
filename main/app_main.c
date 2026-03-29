@@ -14,6 +14,9 @@
 #include "nvs_flash.h"
 #include "pcf2131tfy_rtc_api.h"
 #include "wifi_manager.h"
+#include "sd_card.h"
+#include "esp_littlefs.h"
+#include "pending_store.h"
 
 #define APP_TAG "APP_MAIN"
 
@@ -100,6 +103,97 @@ static esp_err_t app_init_i2c_and_sensors(void)
     return ESP_OK;
 }
 
+static esp_err_t app_init_sdcard(void)
+{
+    esp_err_t err;
+
+    err = sdcard_init_default();
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "SD card initialization failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(APP_TAG, "SD card initialized");
+
+    err = sdcard_mount();
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "SD card mount failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(APP_TAG, "SD card mounted");
+
+    return ESP_OK;
+}
+
+static esp_err_t app_test_littlefs_and_pending(void)
+{
+    /* 1. Mount LittleFS */
+    esp_vfs_littlefs_conf_t lfs_conf = {
+        .base_path = "/littlefs",
+        .partition_label = "littlefs",
+        .format_if_mount_failed = true,
+        .grow_on_mount = true,
+    };
+
+    esp_err_t err = esp_vfs_littlefs_register(&lfs_conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "LittleFS mount failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(APP_TAG, "LittleFS mounted at /littlefs");
+
+    /* 2. Init pending store */
+    err = pending_store_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "Pending store init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(APP_TAG, "Pending store initialized, count=%u", (unsigned)pending_store_count());
+
+    /* 3. Write a test record */
+    int64_t test_id = 0;
+    pending_store_next_id(&test_id);
+
+    measurement_record_t rec = {
+        .sensor_id = 1,
+        .measure_id = test_id,
+        .measure_type = "test",
+        .timestamp = 1711670400,
+        .data_type = "temperature_c",
+        .value = 23.5f,
+        .synced = false,
+    };
+
+    err = pending_store_append(&rec, 1);
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "Pending store append failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(APP_TAG, "Appended 1 record, count=%u", (unsigned)pending_store_count());
+
+    /* 4. Read it back */
+    pending_entry_t entry = {0};
+    size_t read_count = 0;
+    err = pending_store_read(&entry, 1, &read_count);
+    if (err != ESP_OK || read_count != 1) {
+        ESP_LOGE(APP_TAG, "Pending store read failed: err=%s count=%u",
+                 esp_err_to_name(err), (unsigned)read_count);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(APP_TAG, "Read back: type=%s data=%s value=%.1f id=%lld",
+             entry.record.measure_type, entry.record.data_type,
+             entry.record.value, (long long)entry.record.measure_id);
+
+    /* 5. Remove it */
+    err = pending_store_remove(1);
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "Pending store remove failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(APP_TAG, "Removed 1 record, count=%u", (unsigned)pending_store_count());
+
+    return ESP_OK;
+}
+
 static void app_start_lua_runner(void)
 {
     const esp_err_t err = lua_runner_start();
@@ -124,6 +218,9 @@ static void app_start_cli(void)
 
 void app_main(void)
 {
+    
+    vTaskDelay(pdMS_TO_TICKS(2000));   // wait 2000 ms
+
     ESP_LOGI(APP_TAG, "app_main entered");
 
     esp_err_t err = app_init_nvs();
@@ -150,6 +247,21 @@ void app_main(void)
         ESP_LOGW(APP_TAG, "Status LED init failed: %s", esp_err_to_name(err));
     } else {
         ESP_LOGI(APP_TAG, "Status LED initialized");
+    }
+
+    err = app_init_sdcard();
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "SD card startup failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(APP_TAG, "SD card ready");
+    }
+
+    /* Temporary test — remove after hardware validation */
+    err = app_test_littlefs_and_pending();
+    if (err != ESP_OK) {
+        ESP_LOGE(APP_TAG, "LittleFS/pending test FAILED");
+    } else {
+        ESP_LOGI(APP_TAG, "LittleFS/pending test PASSED");
     }
 
     app_start_lua_runner();
