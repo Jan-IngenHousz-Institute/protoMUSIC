@@ -11,14 +11,22 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "wifi_provisioning/manager.h"
+#include "wifi_provisioning/scheme_ble.h"
 
 #include "wifi_manager.h"
 
 #define WIFI_MANAGER_CONNECTED_BIT BIT0
 #define WIFI_MANAGER_FAILED_BIT BIT1
+#define WIFI_MANAGER_PROV_DONE_BIT BIT2
 #define WIFI_MANAGER_INITIAL_CONNECT_TIMEOUT_MS 10000
+#define WIFI_MANAGER_PROV_TIMEOUT_MS 300000
 #define WIFI_MANAGER_STA_IFKEY "WIFI_STA_DEF"
 #define WIFI_MANAGER_UNPROVISIONED_PLACEHOLDER "__UNPROVISIONED__"
+#define WIFI_MANAGER_PROV_NVS_NAMESPACE "wifi_prov"
+#define WIFI_MANAGER_PROV_NVS_KEY "provisioned"
 
 typedef struct {
     EventGroupHandle_t event_group;
@@ -266,11 +274,6 @@ esp_err_t wifi_manager_init(void)
         return err;
     }
 
-    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    if (err != ESP_OK) {
-        return err;
-    }
-
     if (!s_wifi.handlers_registered) {
         err = esp_event_handler_instance_register(
             WIFI_EVENT,
@@ -393,6 +396,46 @@ esp_err_t wifi_manager_connect_configured(void)
     return wifi_manager_connect(CONFIG_AMBYTE_WIFI_SSID, CONFIG_AMBYTE_WIFI_PASSWORD);
 }
 
+esp_err_t wifi_manager_connect_stored(void)
+{
+    if (!s_wifi.initialized || !s_wifi.started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = wifi_manager_ensure_event_group();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    s_wifi.reconnect_count = 0;
+    xEventGroupClearBits(s_wifi.event_group,
+                         WIFI_MANAGER_CONNECTED_BIT | WIFI_MANAGER_FAILED_BIT);
+    s_wifi.connect_requested = true;
+
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        s_wifi.connect_requested = false;
+        return err;
+    }
+
+    const EventBits_t bits = xEventGroupWaitBits(
+        s_wifi.event_group,
+        WIFI_MANAGER_CONNECTED_BIT | WIFI_MANAGER_FAILED_BIT,
+        pdFALSE,
+        pdFALSE,
+        pdMS_TO_TICKS(WIFI_MANAGER_INITIAL_CONNECT_TIMEOUT_MS));
+
+    if ((bits & WIFI_MANAGER_CONNECTED_BIT) != 0) {
+        return ESP_OK;
+    }
+
+    if ((bits & WIFI_MANAGER_FAILED_BIT) != 0) {
+        return ESP_FAIL;
+    }
+
+    return ESP_ERR_TIMEOUT;
+}
+
 bool wifi_manager_is_connected(void)
 {
     if (s_wifi.event_group == NULL) {
@@ -400,4 +443,177 @@ bool wifi_manager_is_connected(void)
     }
 
     return (xEventGroupGetBits(s_wifi.event_group) & WIFI_MANAGER_CONNECTED_BIT) != 0;
+}
+
+/* ── Provisioning ────────────────────────────────────────────────────── */
+
+static void wifi_prov_event_handler(
+    void *arg,
+    esp_event_base_t event_base,
+    int32_t event_id,
+    void *event_data)
+{
+    (void)arg;
+
+    if (event_base == WIFI_PROV_EVENT) {
+        switch (event_id) {
+            case WIFI_PROV_START:
+                ESP_LOGI(TAG, "Provisioning started — waiting for BLE client");
+                break;
+
+            case WIFI_PROV_CRED_RECV: {
+                const wifi_sta_config_t *cfg = (const wifi_sta_config_t *)event_data;
+                ESP_LOGI(TAG, "Received credentials for SSID: %s", (const char *)cfg->ssid);
+                break;
+            }
+
+            case WIFI_PROV_CRED_FAIL: {
+                const wifi_prov_sta_fail_reason_t *reason =
+                    (const wifi_prov_sta_fail_reason_t *)event_data;
+                ESP_LOGE(TAG, "Provisioning credential failure: %d",
+                         reason ? (int)*reason : -1);
+                break;
+            }
+
+            case WIFI_PROV_CRED_SUCCESS:
+                ESP_LOGI(TAG, "Provisioning credential success");
+                break;
+
+            case WIFI_PROV_END:
+                ESP_LOGI(TAG, "Provisioning ended");
+                if (s_wifi.event_group != NULL) {
+                    xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_PROV_DONE_BIT);
+                }
+                break;
+
+            default:
+                break;
+        }
+    }
+}
+
+esp_err_t wifi_manager_is_provisioned(bool *out_provisioned)
+{
+    if (out_provisioned == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_provisioned = false;
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(WIFI_MANAGER_PROV_NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint8_t val = 0;
+    err = nvs_get_u8(nvs, WIFI_MANAGER_PROV_NVS_KEY, &val);
+    nvs_close(nvs);
+
+    if (err == ESP_OK && val == 1) {
+        *out_provisioned = true;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t wifi_manager_mark_provisioned(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(WIFI_MANAGER_PROV_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_u8(nvs, WIFI_MANAGER_PROV_NVS_KEY, 1);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+esp_err_t wifi_manager_start_provisioning(const char *device_name, const char *pop)
+{
+    if (device_name == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = wifi_manager_ensure_event_group();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_event_handler_register(
+        WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
+        &wifi_prov_event_handler, NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    wifi_prov_mgr_config_t prov_cfg = {
+        .scheme = wifi_prov_scheme_ble,
+        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE,
+    };
+
+    err = wifi_prov_mgr_init(prov_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_prov_mgr_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
+    const char *service_key = NULL;
+
+    xEventGroupClearBits(s_wifi.event_group,
+                         WIFI_MANAGER_CONNECTED_BIT |
+                         WIFI_MANAGER_FAILED_BIT |
+                         WIFI_MANAGER_PROV_DONE_BIT);
+
+    err = wifi_prov_mgr_start_provisioning(security, pop, device_name, service_key);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_prov_mgr_start_provisioning failed: %s", esp_err_to_name(err));
+        wifi_prov_mgr_deinit();
+        return err;
+    }
+
+    ESP_LOGI(TAG, "BLE provisioning started as \"%s\"", device_name);
+
+    const EventBits_t bits = xEventGroupWaitBits(
+        s_wifi.event_group,
+        WIFI_MANAGER_PROV_DONE_BIT,
+        pdTRUE,
+        pdFALSE,
+        pdMS_TO_TICKS(WIFI_MANAGER_PROV_TIMEOUT_MS));
+
+    if ((bits & WIFI_MANAGER_PROV_DONE_BIT) == 0) {
+        ESP_LOGW(TAG, "Provisioning timed out after %d ms", WIFI_MANAGER_PROV_TIMEOUT_MS);
+        wifi_prov_mgr_stop_provisioning();
+        wifi_prov_mgr_deinit();
+        return ESP_ERR_TIMEOUT;
+    }
+
+    wifi_prov_mgr_deinit();
+
+    wifi_manager_mark_provisioned();
+
+    ESP_LOGI(TAG, "Provisioning complete, waiting for WiFi connection...");
+
+    const EventBits_t conn_bits = xEventGroupWaitBits(
+        s_wifi.event_group,
+        WIFI_MANAGER_CONNECTED_BIT | WIFI_MANAGER_FAILED_BIT,
+        pdFALSE,
+        pdFALSE,
+        pdMS_TO_TICKS(WIFI_MANAGER_INITIAL_CONNECT_TIMEOUT_MS));
+
+    if ((conn_bits & WIFI_MANAGER_CONNECTED_BIT) != 0) {
+        ESP_LOGI(TAG, "WiFi connected after provisioning");
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "WiFi connection after provisioning did not complete in time");
+    return ESP_ERR_TIMEOUT;
 }

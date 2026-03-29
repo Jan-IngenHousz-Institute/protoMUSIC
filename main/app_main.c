@@ -56,11 +56,31 @@ static esp_err_t app_start_wifi(void)
     }
     ESP_LOGI(APP_TAG, "Wi-Fi station started");
 
-    err = wifi_manager_connect_configured();
+    /* ── Check provisioning state ─────────────────────────────────── */
+    bool provisioned = false;
+    err = wifi_manager_is_provisioned(&provisioned);
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "Provisioning check failed: %s", esp_err_to_name(err));
+    }
+
+    if (!provisioned) {
+        ESP_LOGI(APP_TAG, "Device not provisioned — starting BLE provisioning");
+        err = wifi_manager_start_provisioning("AMBYTE", "ambyte123");
+        if (err == ESP_OK) {
+            ESP_LOGI(APP_TAG, "WiFi provisioned and connected via BLE");
+            return ESP_OK;
+        } else if (err == ESP_ERR_TIMEOUT) {
+            ESP_LOGW(APP_TAG, "BLE provisioning timed out; continuing without WiFi");
+        } else {
+            ESP_LOGW(APP_TAG, "BLE provisioning failed: %s", esp_err_to_name(err));
+        }
+        return ESP_OK;
+    }
+
+    /* ── Already provisioned — connect with NVS-stored credentials ─ */
+    err = wifi_manager_connect_stored();
     if (err == ESP_OK) {
         ESP_LOGI(APP_TAG, "Wi-Fi connected");
-    } else if (err == ESP_ERR_NOT_FOUND) {
-        ESP_LOGW(APP_TAG, "Wi-Fi credentials not provisioned; skipping configured connect");
     } else if (err == ESP_ERR_TIMEOUT) {
         ESP_LOGW(APP_TAG, "Wi-Fi initial connect timed out; reconnect continues in background");
     } else {
@@ -168,7 +188,7 @@ static void app_start_cli(void)
 
 void app_main(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(2000));   // wait 2000 ms
+    vTaskDelay(pdMS_TO_TICKS(5000));   // wait 2000 ms
     ESP_LOGI(APP_TAG, "app_main entered");
 
     /* ── NVS ──────────────────────────────────────────────────────── */
