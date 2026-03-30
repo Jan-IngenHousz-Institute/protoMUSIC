@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "certs.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
@@ -214,18 +213,20 @@ esp_err_t mqtt_client_init(const mqtt_client_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
 
-    bool certs_ok = certs_are_provisioned();
+    bool tls_ok = cfg->ca_cert_pem     != NULL && cfg->ca_cert_pem[0]     != '\0' &&
+                  cfg->device_cert_pem != NULL && cfg->device_cert_pem[0] != '\0' &&
+                  cfg->device_key_pem  != NULL && cfg->device_key_pem[0]  != '\0';
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker = {
             .address.uri              = cfg->broker_uri,
-            .verification.certificate = certs_ok ? aws_root_ca_pem : NULL,
+            .verification.certificate = tls_ok ? cfg->ca_cert_pem : NULL,
         },
         .credentials = {
             .client_id = cfg->client_id,
             .authentication = {
-                .certificate = certs_ok ? aws_device_cert_pem        : NULL,
-                .key         = certs_ok ? aws_device_private_key_pem : NULL,
+                .certificate = tls_ok ? cfg->device_cert_pem : NULL,
+                .key         = tls_ok ? cfg->device_key_pem  : NULL,
             },
         },
     };
@@ -243,7 +244,7 @@ esp_err_t mqtt_client_init(const mqtt_client_config_t *cfg)
         return err;
     }
 
-    ESP_LOGI(TAG, "MQTT client initialised (TLS=%s)", certs_ok ? "yes" : "no");
+    ESP_LOGI(TAG, "MQTT client initialised (TLS=%s)", tls_ok ? "yes" : "no");
     return ESP_OK;
 }
 

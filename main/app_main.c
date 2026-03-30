@@ -1,12 +1,15 @@
 #include <stdbool.h>
+#include <string.h>
 #include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "cJSON.h"
 #include "CLI.h"
 #include "ambyte_mqtt_client.h"
 #include "ambyte_status.h"
+#include "certs.h"
 #include "device_config.h"
 #include "bme280.h"
 #include "device_commands.h"
@@ -47,6 +50,151 @@ static esp_err_t app_init_nvs(void)
     return err;
 }
 
+/* ── BLE provisioning endpoint: chunked cert upload ──────────────── */
+
+#define CERT_PROV_MAX_PAYLOAD 8192  /* 3 PEM blobs + JSON overhead */
+
+typedef enum { CERT_PROV_IDLE, CERT_PROV_RECEIVING } cert_prov_state_t;
+
+static cert_prov_state_t s_cert_state = CERT_PROV_IDLE;
+static char             *s_cert_buf   = NULL;
+static size_t            s_cert_cap   = 0;
+static size_t            s_cert_fill  = 0;
+
+static esp_err_t cert_prov_respond(uint8_t **outbuf, ssize_t *outlen, const char *json)
+{
+    size_t len = strlen(json);
+    *outbuf = (uint8_t *)malloc(len + 1);
+    if (*outbuf == NULL) {
+        *outlen = 0;
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(*outbuf, json, len + 1);
+    *outlen = (ssize_t)len;
+    return ESP_OK;
+}
+
+void cert_prov_handler_reset(void)
+{
+    free(s_cert_buf);
+    s_cert_buf   = NULL;
+    s_cert_cap   = 0;
+    s_cert_fill  = 0;
+    s_cert_state = CERT_PROV_IDLE;
+}
+
+static esp_err_t cert_prov_handler(uint32_t session_id,
+                                    const uint8_t *inbuf, ssize_t inlen,
+                                    uint8_t **outbuf, ssize_t *outlen,
+                                    void *priv_data)
+{
+    (void)session_id;
+
+    if (s_cert_state == CERT_PROV_IDLE) {
+        /* First chunk: 4-byte big-endian total_len header */
+        if (inlen < 4) {
+            return cert_prov_respond(outbuf, outlen, "{\"error\":\"short header\"}");
+        }
+        uint32_t total_len = ((uint32_t)inbuf[0] << 24) |
+                             ((uint32_t)inbuf[1] << 16) |
+                             ((uint32_t)inbuf[2] <<  8) |
+                             ((uint32_t)inbuf[3]);
+        if (total_len == 0 || total_len > CERT_PROV_MAX_PAYLOAD) {
+            return cert_prov_respond(outbuf, outlen, "{\"error\":\"invalid length\"}");
+        }
+        s_cert_buf = malloc(total_len + 1);
+        if (s_cert_buf == NULL) {
+            return cert_prov_respond(outbuf, outlen, "{\"error\":\"OOM\"}");
+        }
+        s_cert_cap   = total_len;
+        s_cert_fill  = 0;
+        s_cert_state = CERT_PROV_RECEIVING;
+        inbuf += 4;
+        inlen -= 4;
+    }
+
+    /* Append chunk (clamp to avoid overrun on broker misbehaviour) */
+    size_t chunk = (size_t)(inlen > 0 ? inlen : 0);
+    if (s_cert_fill + chunk > s_cert_cap) {
+        chunk = s_cert_cap - s_cert_fill;
+    }
+    if (chunk > 0) {
+        memcpy(s_cert_buf + s_cert_fill, inbuf, chunk);
+        s_cert_fill += chunk;
+    }
+
+    if (s_cert_fill < s_cert_cap) {
+        return cert_prov_respond(outbuf, outlen, "{\"complete\":false}");
+    }
+
+    /* All data received — parse and store */
+    s_cert_buf[s_cert_fill] = '\0';
+    cJSON *root = cJSON_Parse(s_cert_buf);
+    cert_prov_handler_reset();
+
+    if (root == NULL) {
+        return cert_prov_respond(outbuf, outlen, "{\"ok\":false,\"error\":\"JSON parse failed\"}");
+    }
+
+    cJSON *ca   = cJSON_GetObjectItemCaseSensitive(root, "ca_cert");
+    cJSON *cert = cJSON_GetObjectItemCaseSensitive(root, "dev_cert");
+    cJSON *key  = cJSON_GetObjectItemCaseSensitive(root, "dev_key");
+
+    esp_err_t err = ESP_OK;
+    if (cJSON_IsString(ca)   && ca->valuestring   != NULL) {
+        err = certs_set_ca_cert(ca->valuestring);
+    }
+    if (err == ESP_OK && cJSON_IsString(cert) && cert->valuestring != NULL) {
+        err = certs_set_device_cert(cert->valuestring);
+    }
+    if (err == ESP_OK && cJSON_IsString(key)  && key->valuestring  != NULL) {
+        err = certs_set_device_key(key->valuestring);
+    }
+
+    cJSON_Delete(root);
+
+    if (err != ESP_OK) {
+        return cert_prov_respond(outbuf, outlen, "{\"ok\":false,\"error\":\"NVS write failed\"}");
+    }
+    if (priv_data != NULL) {
+        *(bool *)priv_data = true;
+    }
+    return cert_prov_respond(outbuf, outlen, "{\"ok\":true}");
+}
+
+/* ── BLE provisioning endpoint: device config ────────────────────── */
+
+static esp_err_t dev_cfg_prov_handler(uint32_t session_id,
+                                       const uint8_t *inbuf, ssize_t inlen,
+                                       uint8_t **outbuf, ssize_t *outlen,
+                                       void *priv_data)
+{
+    (void)session_id;
+
+    cJSON *root = cJSON_ParseWithLength((const char *)inbuf, (size_t)inlen);
+    if (root == NULL) {
+        return cert_prov_respond(outbuf, outlen, "{\"ok\":false,\"error\":\"JSON parse failed\"}");
+    }
+
+    cJSON *uri    = cJSON_GetObjectItemCaseSensitive(root, "mqtt_uri");
+    cJSON *cid    = cJSON_GetObjectItemCaseSensitive(root, "mqtt_client_id");
+    cJSON *topic  = cJSON_GetObjectItemCaseSensitive(root, "mqtt_topic_root");
+    cJSON *dev_id = cJSON_GetObjectItemCaseSensitive(root, "device_id");
+
+    if (cJSON_IsString(uri)    && uri->valuestring)    device_config_set_mqtt_uri(uri->valuestring);
+    if (cJSON_IsString(cid)    && cid->valuestring)    device_config_set_mqtt_client_id(cid->valuestring);
+    if (cJSON_IsString(topic)  && topic->valuestring)  device_config_set_mqtt_topic_root(topic->valuestring);
+    if (cJSON_IsString(dev_id) && dev_id->valuestring) device_config_set_device_id(dev_id->valuestring);
+
+    cJSON_Delete(root);
+    if (priv_data != NULL) {
+        *(bool *)priv_data = true;
+    }
+    return cert_prov_respond(outbuf, outlen, "{\"ok\":true}");
+}
+
+/* ── Wi-Fi init + start (provisioning/connect logic in app_main) ─── */
+
 static esp_err_t app_start_wifi(void)
 {
     esp_err_t err = wifi_manager_init();
@@ -60,38 +208,6 @@ static esp_err_t app_start_wifi(void)
         return err;
     }
     ESP_LOGI(APP_TAG, "Wi-Fi station started");
-
-    /* ── Check provisioning state ─────────────────────────────────── */
-    bool provisioned = false;
-    err = wifi_manager_is_provisioned(&provisioned);
-    if (err != ESP_OK) {
-        ESP_LOGW(APP_TAG, "Provisioning check failed: %s", esp_err_to_name(err));
-    }
-
-    if (!provisioned) {
-        ESP_LOGI(APP_TAG, "Device not provisioned — starting BLE provisioning");
-        err = wifi_manager_start_provisioning("AMBYTE", "ambyte123");
-        if (err == ESP_OK) {
-            ESP_LOGI(APP_TAG, "WiFi provisioned and connected via BLE");
-            return ESP_OK;
-        } else if (err == ESP_ERR_TIMEOUT) {
-            ESP_LOGW(APP_TAG, "BLE provisioning timed out; continuing without WiFi");
-        } else {
-            ESP_LOGW(APP_TAG, "BLE provisioning failed: %s", esp_err_to_name(err));
-        }
-        return ESP_OK;
-    }
-
-    /* ── Already provisioned — connect with NVS-stored credentials ─ */
-    err = wifi_manager_connect_stored();
-    if (err == ESP_OK) {
-        ESP_LOGI(APP_TAG, "Wi-Fi connected");
-    } else if (err == ESP_ERR_TIMEOUT) {
-        ESP_LOGW(APP_TAG, "Wi-Fi initial connect timed out; reconnect continues in background");
-    } else {
-        ESP_LOGW(APP_TAG, "Wi-Fi connect failed: %s", esp_err_to_name(err));
-    }
-
     return ESP_OK;
 }
 
@@ -210,7 +326,7 @@ static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, voi
 
 void app_main(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(5000));   // wait 2000 ms
+    vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(APP_TAG, "app_main entered");
 
     /* ── NVS ──────────────────────────────────────────────────────── */
@@ -222,15 +338,21 @@ void app_main(void)
     ESP_LOGI(APP_TAG, "NVS initialized");
     ESP_LOGI(APP_TAG, "Free heap after NVS: %lu", (unsigned long)esp_get_free_heap_size());
 
-    /* ── Runtime device config (NVS) ─────────────────────────────────── */
+    /* ── Certs (NVS-backed) ──────────────────────────────────────── */
+    err = certs_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "certs_init failed: %s — TLS disabled", esp_err_to_name(err));
+    }
+
+    /* ── Runtime device config (NVS) ─────────────────────────────── */
     err = device_config_init();
     if (err != ESP_OK) {
         ESP_LOGW(APP_TAG, "device_config init failed: %s — using compile-time defaults",
                  esp_err_to_name(err));
     }
 
-    /* ── MQTT Client — runtime config first, Kconfig fallback ──────── */
-    char mqtt_uri[256], mqtt_client_id[64];
+    /* ── Resolve config: NVS first, Kconfig fallback ─────────────── */
+    char mqtt_uri[256], mqtt_client_id[64], topic_root[128], device_id[64];
     if (device_config_get_mqtt_uri(mqtt_uri, sizeof(mqtt_uri)) != ESP_OK) {
         strncpy(mqtt_uri, CONFIG_AMBYTE_MQTT_URI, sizeof(mqtt_uri) - 1);
         mqtt_uri[sizeof(mqtt_uri) - 1] = '\0';
@@ -239,22 +361,84 @@ void app_main(void)
         strncpy(mqtt_client_id, CONFIG_AMBYTE_MQTT_CLIENT_ID, sizeof(mqtt_client_id) - 1);
         mqtt_client_id[sizeof(mqtt_client_id) - 1] = '\0';
     }
+    if (device_config_get_mqtt_topic_root(topic_root, sizeof(topic_root)) != ESP_OK) {
+        strncpy(topic_root, CONFIG_AMBYTE_MQTT_TOPIC_ROOT, sizeof(topic_root) - 1);
+        topic_root[sizeof(topic_root) - 1] = '\0';
+    }
+    if (device_config_get_device_id(device_id, sizeof(device_id)) != ESP_OK) {
+        strncpy(device_id, CONFIG_AMBYTE_DEVICE_ID, sizeof(device_id) - 1);
+        device_id[sizeof(device_id) - 1] = '\0';
+    }
+
+    /* ── MQTT Client ─────────────────────────────────────────────── */
+    bool certs_ok = certs_are_provisioned();
     mqtt_client_config_t mqtt_cfg = {
-        .broker_uri = mqtt_uri,
-        .client_id  = mqtt_client_id,
+        .broker_uri      = mqtt_uri,
+        .client_id       = mqtt_client_id,
+        .ca_cert_pem     = certs_ok ? certs_get_ca_cert()     : NULL,
+        .device_cert_pem = certs_ok ? certs_get_device_cert() : NULL,
+        .device_key_pem  = certs_ok ? certs_get_device_key()  : NULL,
     };
     err = mqtt_client_init(&mqtt_cfg);
     if (err != ESP_OK) {
         ESP_LOGW(APP_TAG, "MQTT client init failed: %s — MQTT disabled", esp_err_to_name(err));
     }
 
-    /* ── WiFi ─────────────────────────────────────────────────────── */
+    /* ── Wi-Fi init + start ───────────────────────────────────────── */
     err = app_start_wifi();
     if (err != ESP_OK) {
         ESP_LOGE(APP_TAG, "Wi-Fi startup failed: %s", esp_err_to_name(err));
         return;
     }
     ESP_LOGI(APP_TAG, "Free heap after WiFi: %lu", (unsigned long)esp_get_free_heap_size());
+
+    /* ── Provisioning or connect ─────────────────────────────────── */
+    bool provisioned = false;
+    err = wifi_manager_is_provisioned(&provisioned);
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "Provisioning check failed: %s", esp_err_to_name(err));
+    }
+
+    if (!provisioned) {
+        ESP_LOGI(APP_TAG, "Device not provisioned — starting BLE provisioning");
+        static bool s_certs_written  = false;
+        static bool s_config_written = false;
+        wifi_prov_extra_endpoint_t endpoints[] = {
+            { "cert-prov", cert_prov_handler,    &s_certs_written  },
+            { "dev-cfg",   dev_cfg_prov_handler, &s_config_written },
+        };
+        esp_err_t prov_err = wifi_manager_start_provisioning("AMBYTE", "ambyte123",
+                                                              endpoints, 2);
+        cert_prov_handler_reset();  /* free any partial cert buffer */
+        bool any_write = s_certs_written || s_config_written;
+        bool prov_ok   = (prov_err == ESP_OK);
+        if (prov_ok || any_write) {
+            ESP_LOGI(APP_TAG, "Provisioning complete — rebooting to apply");
+            esp_restart();
+        }
+        ESP_LOGW(APP_TAG, "BLE provisioning timed out with no writes — continuing");
+    } else {
+        err = wifi_manager_connect_stored();
+        if (err == ESP_OK) {
+            ESP_LOGI(APP_TAG, "Wi-Fi connected");
+        } else if (err == ESP_ERR_TIMEOUT) {
+            ESP_LOGW(APP_TAG, "Wi-Fi initial connect timed out; reconnect continues in background");
+        } else {
+            ESP_LOGW(APP_TAG, "Wi-Fi connect failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    /* ── Wi-Fi → MQTT lifecycle event handlers ────────────────────── */
+    /* Registered after the provisioning/connect block so they cannot fire
+     * during provisioning and trigger an MQTT start mid-session. */
+    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP,         on_got_ip,          NULL);
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,  on_wifi_disconnect, NULL);
+
+    /* Start MQTT now if WiFi was already connected during the connect block */
+    if (wifi_manager_is_connected()) {
+        ESP_LOGI(APP_TAG, "WiFi already up — starting MQTT");
+        mqtt_client_start();
+    }
 
     /* ── I2C + Sensors ────────────────────────────────────────────── */
     err = app_init_i2c_and_sensors();
@@ -289,7 +473,7 @@ void app_main(void)
         ESP_LOGE(APP_TAG, "LittleFS unavailable, persistence disabled");
     }
 
-    /* ── Persistence (SQLite + pending store) ─────────────────────── */
+    /* ── Persistence (SQLite) ─────────────────────────────────────── */
     bool persistence_available = false;
     if (lfs_available) {
         err = sqlite_persistence_init();
@@ -302,7 +486,7 @@ void app_main(void)
     }
     ESP_LOGI(APP_TAG, "Free heap after persistence: %lu", (unsigned long)esp_get_free_heap_size());
 
-    /* ── Hardware inventory ────────────────────────────────────────── */
+    /* ── Hardware inventory ───────────────────────────────────────── */
     ESP_LOGI(APP_TAG, "BOOT: BME280=%s RTC=%s SD=%s LFS=%s DB=%s",
              bme280_is_ready() ? "OK" : "ABSENT",
              pcf2131tfy_rtc_is_ready() ? "OK" : "ABSENT",
@@ -325,23 +509,16 @@ void app_main(void)
         .mark_pending           = persistence_available ? sqlite_persistence_get_mark_pending_fn()       : NULL,
         .query_by_id            = persistence_available ? sqlite_persistence_get_query_by_id_fn()        : NULL,
         .claim_next_pending     = persistence_available ? sqlite_persistence_get_claim_next_pending_fn() : NULL,
-        .publish                 = mqtt_client_get_publish_fn(),
-        .message_is_connected    = mqtt_client_get_is_connected_fn(),
+        .publish                = mqtt_client_get_publish_fn(),
+        .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),
-        .subscribe               = mqtt_client_get_subscribe_fn(),
+        .subscribe              = mqtt_client_get_subscribe_fn(),
+        .topic_root             = topic_root,
+        .device_id              = device_id,
+        .certs_status           = certs_are_provisioned,
     };
     device_commands_init(&cmd_cfg);
     device_commands_subscribe_inbound();
-
-    /* ── Wi-Fi → MQTT lifecycle event handlers ────────────────────── */
-    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP,          on_got_ip,         NULL);
-    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,   on_wifi_disconnect, NULL);
-
-    /* Start MQTT now if WiFi was already connected during app_start_wifi */
-    if (wifi_manager_is_connected()) {
-        ESP_LOGI(APP_TAG, "WiFi already up — starting MQTT");
-        mqtt_client_start();
-    }
 
     /* ── Start application tasks ──────────────────────────────────── */
     app_start_lua_runner();

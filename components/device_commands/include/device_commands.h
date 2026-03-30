@@ -21,6 +21,8 @@ typedef struct {
     char message[256];
 } cmd_result_t;
 
+typedef bool (*certs_status_fn)(void);
+
 typedef struct {
     /* Sensing ports */
     sensor_read_fn              read_env;
@@ -48,6 +50,13 @@ typedef struct {
 
     /* Inbound subscribe port (Phase 6B) */
     message_subscribe_fn                subscribe;
+
+    /* Topic config (Phase 6A) */
+    const char                         *topic_root;
+    const char                         *device_id;
+
+    /* Cert status (Phase 6C) */
+    certs_status_fn                     certs_status;
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);
@@ -71,6 +80,9 @@ cmd_result_t cmd_mqtt_publish(const char *topic, const char *payload);
 cmd_result_t cmd_mqtt_publish_measurement(int64_t measure_id);
 cmd_result_t cmd_mqtt_publish_unsynced(const char *measure_type);
 cmd_result_t cmd_mqtt_status(void);
+
+/* Cert status (Phase 6C) */
+cmd_result_t cmd_cert_status(void);
 
 /* Call from the Wi-Fi disconnect event handler to clear any in-flight publish slot */
 void device_commands_on_mqtt_disconnect(void);

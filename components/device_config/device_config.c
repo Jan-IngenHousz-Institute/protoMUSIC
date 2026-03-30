@@ -11,6 +11,7 @@
 #define KEY_MQTT_URI        "mqtt_uri"
 #define KEY_MQTT_CLIENT_ID  "mqtt_client_id"
 #define KEY_MQTT_TOPIC_ROOT "mqtt_topic_root"
+#define KEY_DEVICE_ID       "device_id"
 
 static nvs_handle_t s_handle    = 0;
 static bool         s_initialized = false;
@@ -70,4 +71,14 @@ esp_err_t device_config_set_mqtt_client_id(const char *val)
 esp_err_t device_config_set_mqtt_topic_root(const char *val)
 {
     return cfg_set(KEY_MQTT_TOPIC_ROOT, val);
+}
+
+esp_err_t device_config_get_device_id(char *buf, size_t len)
+{
+    return cfg_get(KEY_DEVICE_ID, buf, len);
+}
+
+esp_err_t device_config_set_device_id(const char *val)
+{
+    return cfg_set(KEY_DEVICE_ID, val);
 }

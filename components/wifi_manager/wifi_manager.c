@@ -536,7 +536,10 @@ static esp_err_t wifi_manager_mark_provisioned(void)
     return err;
 }
 
-esp_err_t wifi_manager_start_provisioning(const char *device_name, const char *pop)
+esp_err_t wifi_manager_start_provisioning(
+    const char *device_name, const char *pop,
+    const wifi_prov_extra_endpoint_t *extra_endpoints,
+    size_t num_extra_endpoints)
 {
     if (device_name == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -565,6 +568,13 @@ esp_err_t wifi_manager_start_provisioning(const char *device_name, const char *p
         return err;
     }
 
+    /* Register custom endpoint names before start (protocomm requires this order) */
+    for (size_t i = 0; i < num_extra_endpoints; i++) {
+        if (extra_endpoints[i].name != NULL) {
+            wifi_prov_mgr_endpoint_create(extra_endpoints[i].name);
+        }
+    }
+
     wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
     const char *service_key = NULL;
 
@@ -578,6 +588,15 @@ esp_err_t wifi_manager_start_provisioning(const char *device_name, const char *p
         ESP_LOGE(TAG, "wifi_prov_mgr_start_provisioning failed: %s", esp_err_to_name(err));
         wifi_prov_mgr_deinit();
         return err;
+    }
+
+    /* Register handlers after start (protocomm session is now live) */
+    for (size_t i = 0; i < num_extra_endpoints; i++) {
+        if (extra_endpoints[i].name != NULL && extra_endpoints[i].handler != NULL) {
+            wifi_prov_mgr_endpoint_register(extra_endpoints[i].name,
+                                            extra_endpoints[i].handler,
+                                            extra_endpoints[i].ctx);
+        }
     }
 
     ESP_LOGI(TAG, "BLE provisioning started as \"%s\"", device_name);

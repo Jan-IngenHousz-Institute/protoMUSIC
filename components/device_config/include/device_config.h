@@ -20,11 +20,13 @@ esp_err_t device_config_init(void);
 esp_err_t device_config_get_mqtt_uri(char *buf, size_t len);
 esp_err_t device_config_get_mqtt_client_id(char *buf, size_t len);
 esp_err_t device_config_get_mqtt_topic_root(char *buf, size_t len);
+esp_err_t device_config_get_device_id(char *buf, size_t len);
 
 /* Setters — persist immediately via nvs_commit */
 esp_err_t device_config_set_mqtt_uri(const char *val);
 esp_err_t device_config_set_mqtt_client_id(const char *val);
 esp_err_t device_config_set_mqtt_topic_root(const char *val);
+esp_err_t device_config_set_device_id(const char *val);
 
 #ifdef __cplusplus
 }

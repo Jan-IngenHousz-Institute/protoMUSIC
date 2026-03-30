@@ -10,6 +10,11 @@ extern "C" {
 typedef struct {
     const char *broker_uri;
     const char *client_id;
+    /* TLS credentials — all three must be non-NULL and non-empty to enable TLS.
+     * Pass NULL (or empty strings) to connect without TLS. */
+    const char *ca_cert_pem;
+    const char *device_cert_pem;
+    const char *device_key_pem;
 } mqtt_client_config_t;
 
 esp_err_t mqtt_client_init(const mqtt_client_config_t *cfg);

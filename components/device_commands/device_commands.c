@@ -5,7 +5,6 @@
 #include <stdarg.h>
 #include <string.h>
 
-#include "sdkconfig.h"
 #include "cJSON.h"
 
 #include "esp_log.h"
@@ -274,8 +273,8 @@ static cmd_result_t build_and_publish(int64_t measure_id)
     /* Build topic: <root>/<device_id>/<measure_type>/<measure_id> */
     char topic[MQTT_TOPIC_MAX];
     snprintf(topic, sizeof(topic), "%s/%s/%s/%lld",
-             CONFIG_AMBYTE_MQTT_TOPIC_ROOT,
-             CONFIG_AMBYTE_DEVICE_ID,
+             s_cfg.topic_root ? s_cfg.topic_root : "",
+             s_cfg.device_id  ? s_cfg.device_id  : "",
              records[0].measure_type,
              (long long)measure_id);
 
@@ -381,6 +380,15 @@ void device_commands_on_mqtt_disconnect(void)
     }
 }
 
+cmd_result_t cmd_cert_status(void)
+{
+    if (!s_initialized || s_cfg.certs_status == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "cert status not available");
+    }
+    bool ok = s_cfg.certs_status();
+    return make_result(ESP_OK, "certs: %s", ok ? "provisioned" : "not provisioned");
+}
+
 /* ── inbound command dispatch ────────────────────────────────────── */
 
 cmd_result_t cmd_dispatch_json(const char *json, size_t len)
@@ -434,6 +442,9 @@ cmd_result_t cmd_dispatch_json(const char *json, size_t len)
         } else if (strcmp(cmd, "mqtt_status") == 0) {
             res = cmd_mqtt_status();
 
+        } else if (strcmp(cmd, "cert_status") == 0) {
+            res = cmd_cert_status();
+
         } else if (strcmp(cmd, "sleep_ms") == 0) {
             cJSON *ms_field = cJSON_GetObjectItemCaseSensitive(root, "ms");
             if (!cJSON_IsNumber(ms_field)) {
@@ -476,8 +487,8 @@ void device_commands_subscribe_inbound(void)
 
     char topic[128];
     snprintf(topic, sizeof(topic), "%s/%s/cmd",
-             CONFIG_AMBYTE_MQTT_TOPIC_ROOT,
-             CONFIG_AMBYTE_DEVICE_ID);
+             s_cfg.topic_root ? s_cfg.topic_root : "",
+             s_cfg.device_id  ? s_cfg.device_id  : "");
 
     esp_err_t err = s_cfg.subscribe(topic, on_inbound_command);
     if (err != ESP_OK) {
