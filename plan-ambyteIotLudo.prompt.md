@@ -647,8 +647,8 @@ Add outbound MQTT telemetry only. MQTT v5 is already enabled in sdkconfig (`CONF
     - `CONFIG_AMBYTE_MQTT_URI`
     - `CONFIG_AMBYTE_MQTT_CLIENT_ID`
     - `CONFIG_AMBYTE_MQTT_TOPIC_ROOT`
-  - `typedef struct { const char *broker_uri; const char *client_id; const char *device_id; const char *topic_root; } mqtt_client_config_t;`
-  - `mqtt_client_init(const mqtt_client_config_t *cfg)` takes config built by `app_main` from the compile-time carrier above; 6A does **not** read NVS or `device_config`
+  - `typedef struct { const char *broker_uri; const char *client_id; } mqtt_client_config_t;` — `device_id` and `topic_root` are accessed via `CONFIG_AMBYTE_DEVICE_ID` / `CONFIG_AMBYTE_MQTT_TOPIC_ROOT` Kconfig macros directly in `device_commands.c`; they are not passed through `mqtt_client_config_t`
+  - `mqtt_client_init(const mqtt_client_config_t *cfg)` takes config built by `app_main` from NVS first, falling back to `CONFIG_AMBYTE_*` Kconfig symbols; `device_config_init()` must be called before `mqtt_client_init()`
   - `mqtt_client_start()` / `mqtt_client_stop()`
   - Implements `message_publish_fn`, `message_is_connected_fn`, and `message_set_publish_ack_handler_fn`
   - Uses QoS 1 for telemetry publishes
@@ -686,24 +686,22 @@ Add outbound MQTT telemetry only. MQTT v5 is already enabled in sdkconfig (`CONF
 
 6A.4. Define the telemetry wire contract explicitly:
   - One MQTT payload represents one logical measurement group (`measure_id`)
-  - JSON payload contains:
-    - device identifier (`CONFIG_AMBYTE_DEVICE_ID`)
-    - `measure_id`
-    - `measure_type`
-    - timestamp
-    - array of `{ data_type, value }`
-  - Topic format comes from `CONFIG_AMBYTE_MQTT_TOPIC_ROOT`, for example:
-    - `<CONFIG_AMBYTE_MQTT_TOPIC_ROOT>/<CONFIG_AMBYTE_DEVICE_ID>/<measure_type>/<measure_id>`
+  - JSON payload structure:
+    ```json
+    {"measure_id":1,"sensor_id":1,"measure_type":"env","timestamp":1700000000,"values":{"temperature":25.1,"humidity":60.0,"pressure":101325}}
+    ```
+    - `values` is a **JSON object** keyed by `data_type` (not an array)
+    - device identifier embedded in the topic, not the payload
+  - Topic format: `<CONFIG_AMBYTE_MQTT_TOPIC_ROOT>/<CONFIG_AMBYTE_DEVICE_ID>/<measure_type>/<measure_id>`
   - Measurement-oriented MQTT commands use this topic format only; they do not accept caller-provided topic overrides
 
-6A.5. Wire in `app_main.c`:
-  - `app_main` subscribes directly to `IP_EVENT_STA_GOT_IP` and `WIFI_EVENT_STA_DISCONNECTED`
-  - Wi-Fi event handlers do not call MQTT APIs directly; they only notify a small MQTT supervisor task owned by `app_main`
-  - The MQTT supervisor task owns a small state machine, for example `STOPPED`, `STARTING`, `RUNNING`
-  - On `IP_EVENT_STA_GOT_IP`: the handler posts `WIFI_UP`; the supervisor builds `mqtt_client_config_t` from `CONFIG_AMBYTE_*`, initializes if needed, and starts MQTT
-  - On `WIFI_EVENT_STA_DISCONNECTED`: the handler posts `WIFI_DOWN`; the supervisor stops MQTT, clears the in-memory pending measurement publish slot, and returns any still-inflight measurement headers to `PENDING`
-  - Pass `publish`, `message_is_connected`, and `set_publish_ack_handler` into `device_commands_init()`
-  - Do **not** subscribe to remote command topics yet
+6A.5. Wire in `app_main.c` — **DONE** (direct event handlers, no supervisor task):
+  - `app_main` registers static event handlers directly: `on_got_ip` → `mqtt_client_start()`; `on_wifi_disconnect` → `mqtt_client_stop()` + `device_commands_on_mqtt_disconnect()`
+  - No MQTT supervisor task — handlers call MQTT APIs directly; this is simpler and sufficient given the single-threaded event loop
+  - `device_config_init()` called after NVS init; MQTT config built from NVS first, `CONFIG_AMBYTE_*` Kconfig fallback
+  - All 17 `device_commands_config_t` fields wired including all persistence sync-state fns and messaging fns
+  - `if (wifi_manager_is_connected()) mqtt_client_start()` called after event handler registration to handle the case where WiFi connected during `app_start_wifi()` before handlers were registered
+  - `device_commands_subscribe_inbound()` called after `device_commands_init()`
 
 6A.6. Provision certs pragmatically for the first milestone:
   - First implementation uses compile-time embedded PEMs via `components/certs/certs.c`
@@ -747,13 +745,13 @@ Add inbound MQTT command handling and runtime device configuration only after 6A
   - Supported commands: `set_rgb`, `read_env`, `status`, `publish_unsynced`, `mqtt_status`, `sleep_ms`, `log`
   - Command parsing lives in `device_commands`, not in `mqtt_client` plumbing
 
-6B.5. Add BLE `device-config` provisioning endpoint (deferred — requires 6B.3 stable):
-  - Advertise a custom GATT characteristic allowing writes to `device_config` fields over BLE
+6B.5. Add BLE `device-config` provisioning endpoint (deferred — superseded by 6C.4):
+  - Implemented as a `protocomm` endpoint `"dev-cfg"` registered via `wifi_manager_start_provisioning` extra-endpoint API (see 6C.2)
   - Accepted JSON payload: `{"mqtt_uri":"…","mqtt_client_id":"…","mqtt_topic_root":"…"}`
   - Persist each present field to NVS via `device_config_set_*`; absent fields are left unchanged
-  - **Timeout: stop BLE advertising after 60 seconds** if no write is received; device proceeds with existing NVS values or Kconfig defaults
-  - Reboot after a successful config write so the new broker URI/client-ID take effect
-  - Per ESP-IDF provisioning requirements, `device-config` endpoint is advertised before the Wi-Fi credentials endpoint when both are active
+  - **Timeout: 120 seconds, session-scoped** (shared with Wi-Fi and cert provisioning — see 6C constraints)
+  - Reboot is deferred to session end alongside cert and Wi-Fi credential writes — single reboot covers all (see 6C.6)
+  - `dev_cfg_prov_handler` is a thin wrapper in `app_main.c`; sets `s_config_written = true` on success via `priv_data`
 
 **Verification:** Publish a fragmented test command payload; verify `mqtt_client` reassembles it once, command dispatch runs once, and OOM on oversize payload logs error without crashing.
 
