@@ -174,7 +174,7 @@ static int l_db_store(lua_State *L)
         r->value = (float)luaL_checknumber(L, -1);
         lua_pop(L, 1);
 
-        r->synced = false;
+        r->sync_state = MEASUREMENT_SYNC_PENDING;
         lua_pop(L, 1); /* pop the record table */
     }
 
@@ -203,8 +203,8 @@ static void lua_push_record_table(lua_State *L, const measurement_record_t *r)
     lua_setfield(L, -2, "data_type");
     lua_pushnumber(L, (lua_Number)r->value);
     lua_setfield(L, -2, "value");
-    lua_pushboolean(L, r->synced);
-    lua_setfield(L, -2, "synced");
+    lua_pushinteger(L, (lua_Integer)r->sync_state);
+    lua_setfield(L, -2, "sync_state");
 }
 
 static int l_db_query(lua_State *L)
@@ -285,10 +285,37 @@ static int l_db_unsynced(lua_State *L)
     return 1;
 }
 
-static int l_db_mark_synced(lua_State *L)
+/* ── mqtt.* bindings ─────────────────────────────────────────────────── */
+
+static int l_mqtt_status(lua_State *L)
+{
+    cmd_result_t res = cmd_mqtt_status();
+    /* ESP_ERR_NOT_SUPPORTED → not wired; "MQTT: connected" / "MQTT: disconnected" otherwise */
+    lua_pushboolean(L, res.status == ESP_OK &&
+                       strstr(res.message, "disconnected") == NULL);
+    return 1;
+}
+
+static int l_mqtt_publish_measurement(lua_State *L)
 {
     lua_Integer id = luaL_checkinteger(L, 1);
-    cmd_result_t res = cmd_mark_synced((int64_t)id);
+    cmd_result_t res = cmd_mqtt_publish_measurement((int64_t)id);
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_mqtt_publish_unsynced(lua_State *L)
+{
+    const char *type = luaL_checkstring(L, 1);
+    cmd_result_t res = cmd_mqtt_publish_unsynced(type);
+    if (res.status == ESP_ERR_NOT_FOUND) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "no pending");
+        return 2;
+    }
     if (res.status != ESP_OK) {
         return lua_push_nil_reason(L, res.message);
     }
@@ -317,17 +344,29 @@ static void lua_register_device_module(lua_State *L)
 static void lua_register_db_module(lua_State *L)
 {
     static const luaL_Reg db_api[] = {
-        {"store",       l_db_store},
-        {"query",       l_db_query},
-        {"count",       l_db_count},
-        {"next_id",     l_db_next_id},
-        {"unsynced",    l_db_unsynced},
-        {"mark_synced", l_db_mark_synced},
+        {"store",    l_db_store},
+        {"query",    l_db_query},
+        {"count",    l_db_count},
+        {"next_id",  l_db_next_id},
+        {"unsynced", l_db_unsynced},
         {NULL, NULL},
     };
 
     luaL_newlib(L, db_api);
     lua_setglobal(L, "db");
+}
+
+static void lua_register_mqtt_module(lua_State *L)
+{
+    static const luaL_Reg mqtt_api[] = {
+        {"status",              l_mqtt_status},
+        {"publish_measurement", l_mqtt_publish_measurement},
+        {"publish_unsynced",    l_mqtt_publish_unsynced},
+        {NULL, NULL},
+    };
+
+    luaL_newlib(L, mqtt_api);
+    lua_setglobal(L, "mqtt");
 }
 
 /* ── task ────────────────────────────────────────────────────────────── */
@@ -354,6 +393,7 @@ static void lua_runner_task(void *arg)
     luaL_openlibs(L);
     lua_register_device_module(L);
     lua_register_db_module(L);
+    lua_register_mqtt_module(L);
 
     const char *script = (const char *)s_lua_script_start;
     size_t script_len = g_lua_script_len;

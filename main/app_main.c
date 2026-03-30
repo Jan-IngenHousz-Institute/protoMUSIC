@@ -5,12 +5,17 @@
 #include "freertos/task.h"
 
 #include "CLI.h"
+#include "ambyte_mqtt_client.h"
 #include "ambyte_status.h"
+#include "device_config.h"
 #include "bme280.h"
 #include "device_commands.h"
 #include "esp_err.h"
+#include "esp_event.h"
 #include "esp_littlefs.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
 #include "i2c_bus.h"
 #include "lua_runner.h"
 #include "nvs_flash.h"
@@ -186,6 +191,23 @@ static void app_start_cli(void)
     ESP_LOGI(APP_TAG, "CLI started");
 }
 
+/* ── Wi-Fi → MQTT lifecycle handlers ─────────────────────────────── */
+
+static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)base; (void)id; (void)data;
+    ESP_LOGI(APP_TAG, "IP acquired — starting MQTT");
+    mqtt_client_start();
+}
+
+static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)base; (void)id; (void)data;
+    ESP_LOGW(APP_TAG, "Wi-Fi disconnected — stopping MQTT");
+    mqtt_client_stop();
+    device_commands_on_mqtt_disconnect();
+}
+
 void app_main(void)
 {
     vTaskDelay(pdMS_TO_TICKS(5000));   // wait 2000 ms
@@ -199,6 +221,32 @@ void app_main(void)
     }
     ESP_LOGI(APP_TAG, "NVS initialized");
     ESP_LOGI(APP_TAG, "Free heap after NVS: %lu", (unsigned long)esp_get_free_heap_size());
+
+    /* ── Runtime device config (NVS) ─────────────────────────────────── */
+    err = device_config_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "device_config init failed: %s — using compile-time defaults",
+                 esp_err_to_name(err));
+    }
+
+    /* ── MQTT Client — runtime config first, Kconfig fallback ──────── */
+    char mqtt_uri[256], mqtt_client_id[64];
+    if (device_config_get_mqtt_uri(mqtt_uri, sizeof(mqtt_uri)) != ESP_OK) {
+        strncpy(mqtt_uri, CONFIG_AMBYTE_MQTT_URI, sizeof(mqtt_uri) - 1);
+        mqtt_uri[sizeof(mqtt_uri) - 1] = '\0';
+    }
+    if (device_config_get_mqtt_client_id(mqtt_client_id, sizeof(mqtt_client_id)) != ESP_OK) {
+        strncpy(mqtt_client_id, CONFIG_AMBYTE_MQTT_CLIENT_ID, sizeof(mqtt_client_id) - 1);
+        mqtt_client_id[sizeof(mqtt_client_id) - 1] = '\0';
+    }
+    mqtt_client_config_t mqtt_cfg = {
+        .broker_uri = mqtt_uri,
+        .client_id  = mqtt_client_id,
+    };
+    err = mqtt_client_init(&mqtt_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "MQTT client init failed: %s — MQTT disabled", esp_err_to_name(err));
+    }
 
     /* ── WiFi ─────────────────────────────────────────────────────── */
     err = app_start_wifi();
@@ -264,17 +312,36 @@ void app_main(void)
 
     /* ── Compose device_commands (DDD composition root) ───────────── */
     device_commands_config_t cmd_cfg = {
-        .read_env       = bme280_get_sensor_read_fn(),
-        .read_clock     = pcf2131tfy_rtc_get_clock_read_fn(),
-        .set_status     = ambyte_status_get_set_fn(),
-        .store          = persistence_available ? sqlite_persistence_get_store_fn() : NULL,
-        .query          = persistence_available ? sqlite_persistence_get_query_fn() : NULL,
-        .count          = persistence_available ? sqlite_persistence_get_count_fn() : NULL,
-        .next_id        = persistence_available ? sqlite_persistence_get_next_id_fn() : NULL,
-        .query_unsynced = persistence_available ? sqlite_persistence_get_query_unsynced_fn() : NULL,
-        .mark_synced    = persistence_available ? sqlite_persistence_get_mark_synced_fn() : NULL,
+        .read_env               = bme280_get_sensor_read_fn(),
+        .read_clock             = pcf2131tfy_rtc_get_clock_read_fn(),
+        .set_status             = ambyte_status_get_set_fn(),
+        .store                  = persistence_available ? sqlite_persistence_get_store_fn()              : NULL,
+        .query                  = persistence_available ? sqlite_persistence_get_query_fn()              : NULL,
+        .count                  = persistence_available ? sqlite_persistence_get_count_fn()              : NULL,
+        .next_id                = persistence_available ? sqlite_persistence_get_next_id_fn()            : NULL,
+        .query_unsynced         = persistence_available ? sqlite_persistence_get_query_unsynced_fn()     : NULL,
+        .mark_synced            = persistence_available ? sqlite_persistence_get_mark_synced_fn()        : NULL,
+        .mark_inflight          = persistence_available ? sqlite_persistence_get_mark_inflight_fn()      : NULL,
+        .mark_pending           = persistence_available ? sqlite_persistence_get_mark_pending_fn()       : NULL,
+        .query_by_id            = persistence_available ? sqlite_persistence_get_query_by_id_fn()        : NULL,
+        .claim_next_pending     = persistence_available ? sqlite_persistence_get_claim_next_pending_fn() : NULL,
+        .publish                 = mqtt_client_get_publish_fn(),
+        .message_is_connected    = mqtt_client_get_is_connected_fn(),
+        .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),
+        .subscribe               = mqtt_client_get_subscribe_fn(),
     };
     device_commands_init(&cmd_cfg);
+    device_commands_subscribe_inbound();
+
+    /* ── Wi-Fi → MQTT lifecycle event handlers ────────────────────── */
+    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP,          on_got_ip,         NULL);
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,   on_wifi_disconnect, NULL);
+
+    /* Start MQTT now if WiFi was already connected during app_start_wifi */
+    if (wifi_manager_is_connected()) {
+        ESP_LOGI(APP_TAG, "WiFi already up — starting MQTT");
+        mqtt_client_start();
+    }
 
     /* ── Start application tasks ──────────────────────────────────── */
     app_start_lua_runner();

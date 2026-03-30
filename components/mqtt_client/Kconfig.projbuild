@@ -1,0 +1,30 @@
+menu "Ambyte MQTT Client"
+
+    config AMBYTE_DEVICE_ID
+        string "Device ID"
+        default "1"
+        help
+            Canonical device identity used in MQTT topics and as the measure_id prefix.
+            measure_id = DEVICE_ID * 1000000 + sequence (e.g. device "1" → 1000001, 1000002…).
+            Must be a numeric ASCII string to double as the persisted prefix.
+
+    config AMBYTE_MQTT_URI
+        string "MQTT Broker URI"
+        default "mqtts://localhost:8883"
+        help
+            Full broker URI, e.g. mqtts://xxxxxx.iot.us-east-1.amazonaws.com:8883
+
+    config AMBYTE_MQTT_CLIENT_ID
+        string "MQTT Client ID"
+        default "ambyte_device_1"
+        help
+            Unique client identifier presented to the broker. Must differ between devices.
+
+    config AMBYTE_MQTT_TOPIC_ROOT
+        string "MQTT Topic Root"
+        default "ambyte"
+        help
+            Root prefix for all telemetry topics.
+            Full topic: <root>/<device_id>/<measure_type>/<measure_id>
+
+endmenu

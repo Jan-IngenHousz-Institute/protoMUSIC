@@ -62,6 +62,41 @@ static int integrity_callback(void *arg, int ncols, char **values, char **names)
     return 0;
 }
 
+/* Rename legacy 'synced' column to 'syncState' if the old schema is present */
+static void migrate_schema(void)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(s_db, "PRAGMA table_info(measurements);", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return;
+    }
+
+    bool needs_rename = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *col = (const char *)sqlite3_column_text(stmt, 1);
+        if (col && strcmp(col, "synced") == 0) {
+            needs_rename = true;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    if (!needs_rename) {
+        return;
+    }
+
+    char *err = NULL;
+    rc = sqlite3_exec(s_db,
+                      "ALTER TABLE measurements RENAME COLUMN synced TO syncState;",
+                      NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        ESP_LOGE(TAG, "Schema migration failed: %s", err ? err : "");
+    } else {
+        ESP_LOGI(TAG, "Migrated schema: column 'synced' -> 'syncState'");
+    }
+    sqlite3_free(err);
+}
+
 static esp_err_t db_open_and_configure(void)
 {
     int rc = sqlite3_open(DB_PATH, &s_db);
@@ -115,7 +150,7 @@ static esp_err_t db_open_and_configure(void)
         "timestamp INTEGER NOT NULL, "
         "dataType TEXT NOT NULL, "
         "dataValue REAL, "
-        "synced INTEGER NOT NULL DEFAULT 0, "
+        "syncState INTEGER NOT NULL DEFAULT 0, "
         "PRIMARY KEY (measureID, dataType));";
 
     rc = sqlite3_exec(s_db, create_table, NULL, NULL, &err_msg);
@@ -127,9 +162,24 @@ static esp_err_t db_open_and_configure(void)
         return ESP_FAIL;
     }
 
-    const char *create_index =
+    const char *create_idx_type_ts =
         "CREATE INDEX IF NOT EXISTS idx_type_ts ON measurements (measureType, timestamp);";
-    rc = sqlite3_exec(s_db, create_index, NULL, NULL, &err_msg);
+    rc = sqlite3_exec(s_db, create_idx_type_ts, NULL, NULL, &err_msg);
+    sqlite3_free(err_msg);
+
+    const char *create_idx_sync =
+        "CREATE INDEX IF NOT EXISTS idx_sync_type "
+        "ON measurements (syncState, measureType, timestamp);";
+    rc = sqlite3_exec(s_db, create_idx_sync, NULL, NULL, &err_msg);
+    sqlite3_free(err_msg);
+
+    /* Migrate old 'synced' column if present from a previous schema version */
+    migrate_schema();
+
+    /* Reset stale INFLIGHT rows left by a previous interrupted session */
+    rc = sqlite3_exec(s_db,
+                      "UPDATE measurements SET syncState = 0 WHERE syncState = 1;",
+                      NULL, NULL, &err_msg);
     sqlite3_free(err_msg);
 
     return ESP_OK;
@@ -173,7 +223,7 @@ static esp_err_t flush_batch_to_sqlite(const pending_entry_t *entries, size_t co
 
     const char *insert_sql =
         "INSERT OR REPLACE INTO measurements "
-        "(sensorID, measureID, measureType, timestamp, dataType, dataValue, synced) "
+        "(sensorID, measureID, measureType, timestamp, dataType, dataValue, syncState) "
         "VALUES (?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt = NULL;
@@ -192,7 +242,7 @@ static esp_err_t flush_batch_to_sqlite(const pending_entry_t *entries, size_t co
         sqlite3_bind_int64(stmt, 4, (int64_t)r->timestamp);
         sqlite3_bind_text(stmt, 5, r->data_type, -1, SQLITE_STATIC);
         sqlite3_bind_double(stmt, 6, (double)r->value);
-        sqlite3_bind_int(stmt, 7, r->synced ? 1 : 0);
+        sqlite3_bind_int(stmt, 7, (int)r->sync_state);
 
         rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE) {
@@ -330,7 +380,7 @@ esp_err_t sqlite_persistence_query(const char *measure_type, time_t from, time_t
     }
 
     const char *sql =
-        "SELECT sensorID, measureID, measureType, timestamp, dataType, dataValue, synced "
+        "SELECT sensorID, measureID, measureType, timestamp, dataType, dataValue, syncState "
         "FROM measurements WHERE measureType = ? AND timestamp BETWEEN ? AND ? "
         "ORDER BY measureID, dataType;";
 
@@ -358,7 +408,7 @@ esp_err_t sqlite_persistence_query(const char *measure_type, time_t from, time_t
                 sizeof(r->data_type) - 1);
         r->data_type[sizeof(r->data_type) - 1] = '\0';
         r->value = (float)sqlite3_column_double(stmt, 5);
-        r->synced = (sqlite3_column_int(stmt, 6) != 0);
+        r->sync_state = (measurement_sync_state_t)sqlite3_column_int(stmt, 6);
         n++;
     }
 
@@ -426,8 +476,8 @@ esp_err_t sqlite_persistence_query_unsynced(const char *measure_type,
     }
 
     const char *sql =
-        "SELECT sensorID, measureID, measureType, timestamp, dataType, dataValue, synced "
-        "FROM measurements WHERE measureType = ? AND synced = 0 "
+        "SELECT sensorID, measureID, measureType, timestamp, dataType, dataValue, syncState "
+        "FROM measurements WHERE measureType = ? AND syncState = 0 "
         "ORDER BY measureID, dataType;";
 
     sqlite3_stmt *stmt = NULL;
@@ -452,7 +502,7 @@ esp_err_t sqlite_persistence_query_unsynced(const char *measure_type,
                 sizeof(r->data_type) - 1);
         r->data_type[sizeof(r->data_type) - 1] = '\0';
         r->value = (float)sqlite3_column_double(stmt, 5);
-        r->synced = (sqlite3_column_int(stmt, 6) != 0);
+        r->sync_state = (measurement_sync_state_t)sqlite3_column_int(stmt, 6);
         n++;
     }
 
@@ -472,7 +522,8 @@ esp_err_t sqlite_persistence_mark_synced(int64_t measure_id)
         return ESP_ERR_TIMEOUT;
     }
 
-    const char *sql = "UPDATE measurements SET synced = 1 WHERE measureID = ?;";
+    const char *sql =
+        "UPDATE measurements SET syncState = 2 WHERE measureID = ? AND syncState = 1;";
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -486,6 +537,190 @@ esp_err_t sqlite_persistence_mark_synced(int64_t measure_id)
     xSemaphoreGive(s_sqlite_mutex);
 
     return (rc == SQLITE_DONE) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t sqlite_persistence_mark_inflight(int64_t measure_id)
+{
+    if (!s_db_available) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const char *sql =
+        "UPDATE measurements SET syncState = 1 WHERE measureID = ? AND syncState = 0;";
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_FAIL;
+    }
+
+    sqlite3_bind_int64(stmt, 1, measure_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    xSemaphoreGive(s_sqlite_mutex);
+
+    return (rc == SQLITE_DONE) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t sqlite_persistence_mark_pending(int64_t measure_id)
+{
+    if (!s_db_available) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const char *sql =
+        "UPDATE measurements SET syncState = 0 WHERE measureID = ? AND syncState = 1;";
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_FAIL;
+    }
+
+    sqlite3_bind_int64(stmt, 1, measure_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    xSemaphoreGive(s_sqlite_mutex);
+
+    return (rc == SQLITE_DONE) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t sqlite_persistence_query_by_id(int64_t measure_id,
+                                          measurement_record_t *out, size_t max,
+                                          size_t *count)
+{
+    if (out == NULL || count == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_db_available) {
+        *count = 0;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const char *sql =
+        "SELECT sensorID, measureID, measureType, timestamp, dataType, dataValue, syncState "
+        "FROM measurements WHERE measureID = ? ORDER BY dataType;";
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_FAIL;
+    }
+
+    sqlite3_bind_int64(stmt, 1, measure_id);
+
+    size_t n = 0;
+    while (n < max && sqlite3_step(stmt) == SQLITE_ROW) {
+        measurement_record_t *r = &out[n];
+        r->sensor_id = sqlite3_column_int64(stmt, 0);
+        r->measure_id = sqlite3_column_int64(stmt, 1);
+        strncpy(r->measure_type, (const char *)sqlite3_column_text(stmt, 2),
+                sizeof(r->measure_type) - 1);
+        r->measure_type[sizeof(r->measure_type) - 1] = '\0';
+        r->timestamp = (time_t)sqlite3_column_int64(stmt, 3);
+        strncpy(r->data_type, (const char *)sqlite3_column_text(stmt, 4),
+                sizeof(r->data_type) - 1);
+        r->data_type[sizeof(r->data_type) - 1] = '\0';
+        r->value = (float)sqlite3_column_double(stmt, 5);
+        r->sync_state = (measurement_sync_state_t)sqlite3_column_int(stmt, 6);
+        n++;
+    }
+
+    sqlite3_finalize(stmt);
+    *count = n;
+    xSemaphoreGive(s_sqlite_mutex);
+    return ESP_OK;
+}
+
+esp_err_t sqlite_persistence_claim_next_pending(const char *measure_type,
+                                                  int64_t *out_measure_id)
+{
+    if (measure_type == NULL || out_measure_id == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_db_available) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    char *err = NULL;
+    int rc = sqlite3_exec(s_db, "BEGIN IMMEDIATE;", NULL, NULL, &err);
+    sqlite3_free(err);
+    if (rc != SQLITE_OK) {
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_FAIL;
+    }
+
+    /* Find the oldest PENDING group for this measure_type */
+    const char *select_sql =
+        "SELECT measureID FROM measurements "
+        "WHERE measureType = ? AND syncState = 0 "
+        "ORDER BY timestamp, measureID LIMIT 1;";
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(s_db, select_sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_FAIL;
+    }
+
+    sqlite3_bind_text(stmt, 1, measure_type, -1, SQLITE_STATIC);
+
+    int64_t claimed_id = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        claimed_id = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+
+    if (claimed_id < 0) {
+        sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* Mark all rows of this group INFLIGHT atomically */
+    const char *update_sql =
+        "UPDATE measurements SET syncState = 1 WHERE measureID = ? AND syncState = 0;";
+    rc = sqlite3_prepare_v2(s_db, update_sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_FAIL;
+    }
+
+    sqlite3_bind_int64(stmt, 1, claimed_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_FAIL;
+    }
+
+    rc = sqlite3_exec(s_db, "COMMIT;", NULL, NULL, &err);
+    sqlite3_free(err);
+    xSemaphoreGive(s_sqlite_mutex);
+
+    if (rc != SQLITE_OK) {
+        return ESP_FAIL;
+    }
+
+    *out_measure_id = claimed_id;
+    return ESP_OK;
 }
 
 /* ── fn getters ──────────────────────────────────────────────────────── */
@@ -518,4 +753,24 @@ measurement_query_unsynced_fn sqlite_persistence_get_query_unsynced_fn(void)
 measurement_mark_synced_fn sqlite_persistence_get_mark_synced_fn(void)
 {
     return sqlite_persistence_mark_synced;
+}
+
+measurement_mark_inflight_fn sqlite_persistence_get_mark_inflight_fn(void)
+{
+    return sqlite_persistence_mark_inflight;
+}
+
+measurement_mark_pending_fn sqlite_persistence_get_mark_pending_fn(void)
+{
+    return sqlite_persistence_mark_pending;
+}
+
+measurement_query_by_id_fn sqlite_persistence_get_query_by_id_fn(void)
+{
+    return sqlite_persistence_query_by_id;
+}
+
+measurement_claim_next_pending_fn sqlite_persistence_get_claim_next_pending_fn(void)
+{
+    return sqlite_persistence_claim_next_pending;
 }

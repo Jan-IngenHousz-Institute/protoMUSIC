@@ -599,6 +599,15 @@ CONFIG_AMBYTE_WIFI_PASSWORD="__UNPROVISIONED__"
 # end of Ambbyte IoT Settings
 
 #
+# Ambyte MQTT Client
+#
+CONFIG_AMBYTE_DEVICE_ID="1"
+CONFIG_AMBYTE_MQTT_URI="mqtts://localhost:8883"
+CONFIG_AMBYTE_MQTT_CLIENT_ID="ambyte_device_1"
+CONFIG_AMBYTE_MQTT_TOPIC_ROOT="ambyte"
+# end of Ambyte MQTT Client
+
+#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y

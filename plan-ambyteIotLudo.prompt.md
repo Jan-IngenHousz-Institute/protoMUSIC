@@ -166,18 +166,24 @@ Create a `components/domain/` component containing only header files that define
   - This replaces direct includes of `bme280.h` and `pcf2131tfy_rtc_api.h` in consumers
 
 1.3. Define **Persistence port** — `components/domain/include/persistence_port.h`:
-  - `typedef struct { int64_t sensor_id; int64_t measure_id; char measure_type[32]; time_t timestamp; char data_type[32]; float value; bool synced; } measurement_record_t;`
-  - Fixed-size char arrays avoid heap allocation and ownership ambiguity. SQLite callbacks `strncpy` directly into these fields. ~92 bytes per struct; queries capped at 64 records max (~5.9KB).
-  - **sensorID**: identifies the physical sensor instance (e.g., device-prefixed, from `channel_config`). Distinct from measureID which groups data points within a single reading.
-  - **Device-prefixed measureID**: `measure_id` format = `<device_id_prefix> * 1000000 + <sequence>`. E.g., device 1 → IDs 1000001, 1000002, ...; device 2 → 2000001, etc. The prefix is set at init time via configuration (NVS or compile-time define). This allows merging DBs from multiple devices without ID collisions.
-  - EAV schema: one row per data point, grouped by `measure_id` + `measure_type`. Example: a single BME280 reading produces 3 rows with the same `measure_id` and `measure_type="bme280"`, each with a different `data_type` ("temperature_c", "humidity_pct", "pressure_pa").
+  - **Flat schema** (single struct, single table). No separate header/value types.
+  - `typedef enum { MEASUREMENT_SYNC_PENDING = 0, MEASUREMENT_SYNC_INFLIGHT = 1, MEASUREMENT_SYNC_SYNCED = 2 } measurement_sync_state_t;`
+  - `typedef struct { int64_t sensor_id; int64_t measure_id; char measure_type[32]; time_t timestamp; char data_type[32]; float value; measurement_sync_state_t sync_state; } measurement_record_t;`
+  - Fixed-size char arrays avoid heap allocation and ownership ambiguity. SQLite callbacks `strncpy` directly into these fields. Query results remain capped at 64 rows max (~6KB).
+  - **sensorID**: identifies the physical sensor instance. **measureID**: groups all data points within one logical reading. A BME280 reading produces 3 rows with the same `measure_id` and different `data_type` values ("temperature_c", "humidity_pct", "pressure_pa").
+  - **Device-prefixed measureID**: `measure_id` format = `<device_id_prefix> * 1000000 + <sequence>`. E.g., device 1 → IDs 1000001, 1000002, ...; device 2 → 2000001. Allows merging DBs from multiple devices without ID collisions.
+  - **sync_state** lives on every row of a logical group (denormalized). All rows for a given `measure_id` always share the same `sync_state`. Transitions (`mark_inflight`, `mark_pending`, `mark_synced`) UPDATE all rows for that `measure_id` atomically.
   - Repository operations:
-    - `typedef esp_err_t (*measurement_store_fn)(const measurement_record_t *records, size_t count);` — stores a batch of records sharing the same measure_id
+    - `typedef esp_err_t (*measurement_store_fn)(const measurement_record_t *records, size_t count);` — caller assembles all flat rows for one logical group and passes them together
     - `typedef esp_err_t (*measurement_query_fn)(const char *measure_type, time_t from, time_t to, measurement_record_t *out, size_t max, size_t *count);`
-    - `typedef esp_err_t (*measurement_count_fn)(const char *measure_type, size_t *count);`
+    - `typedef esp_err_t (*measurement_query_by_id_fn)(int64_t measure_id, measurement_record_t *out, size_t max, size_t *count);` — all rows for one `measureID`, ordered by `dataType`
+    - `typedef esp_err_t (*measurement_count_fn)(const char *measure_type, size_t *count);` — counts distinct `measureID` groups
     - `typedef esp_err_t (*measurement_next_id_fn)(int64_t *out_id);` — returns next device-prefixed measure_id
-    - `typedef esp_err_t (*measurement_query_unsynced_fn)(const char *measure_type, measurement_record_t *out, size_t max, size_t *count);` — queries records where synced = 0
-    - `typedef esp_err_t (*measurement_mark_synced_fn)(int64_t measure_id);` — marks all rows with given measure_id as synced
+    - `typedef esp_err_t (*measurement_query_unsynced_fn)(const char *measure_type, measurement_record_t *out, size_t max, size_t *count);` — rows where `syncState = PENDING`
+    - `typedef esp_err_t (*measurement_claim_next_pending_fn)(const char *measure_type, int64_t *out_measure_id);` — atomically claims the oldest `PENDING` group (PENDING→INFLIGHT) and returns its `measureID`; `ESP_ERR_NOT_FOUND` when nothing pending
+    - `typedef esp_err_t (*measurement_mark_inflight_fn)(int64_t measure_id);` — `PENDING → INFLIGHT`
+    - `typedef esp_err_t (*measurement_mark_pending_fn)(int64_t measure_id);` — `INFLIGHT → PENDING`
+    - `typedef esp_err_t (*measurement_mark_synced_fn)(int64_t measure_id);` — `INFLIGHT → SYNCED`
   - This replaces the old text-file approach and supports any sensor type without schema changes
 
 1.4. Define **Device Status port** — `components/domain/include/device_status_port.h`:
@@ -214,7 +220,7 @@ Wrap existing components behind port interfaces without rewriting their internal
                               on success: remove flushed entries from LittleFS
   ```
 
-  **Data lifecycle**: Measurements are stored with `synced = 0` when flushed to SQLite. When MQTT successfully publishes a record, the `synced` column is set to `1`. This enables tracking which records have been uploaded vs. pending. Optionally, old synced records can be pruned periodically.
+  **Data lifecycle**: Synchronization state (`syncState`) is stored on every row of a logical group (denormalized flat schema). New measurements start as `PENDING` (0), move to `INFLIGHT` (1) only after a publish is successfully queued, and become `SYNCED` (2) only after broker acknowledgment. On boot, any stale `INFLIGHT` rows are reset to `PENDING` before MQTT starts.
 
   - **Prerequisites**:
     - Add `joltwallet/littlefs` as ESP Component Registry dependency (or git submodule under `components/littlefs/`)
@@ -222,9 +228,10 @@ Wrap existing components behind port interfaces without rewriting their internal
     - Add `sd_card` to `main/CMakeLists.txt` REQUIRES. Add `sdcard_init_default()` + `sdcard_mount()` calls in `app_main.c`. **SD mount failure handling**: if `sdcard_mount()` fails, wait 500ms → retry once (SD cards may need warm-up after power-on). If still fails, log `ESP_LOGW` and set `sd_available = false`. Add `bool sd_card_is_available(void)` to `sd_card.h` public API. Device continues operating — new measurements accumulate in LittleFS pending buffer until SD card becomes available. `cmd_query`/`cmd_count` return `ESP_ERR_NOT_SUPPORTED` (queries require SQLite). Lua’s `device.status()` includes SD state.
   - Add `siara-cc/esp32-idf-sqlite3` as a git submodule under `components/sqlite3/` (pure ESP-IDF, Apache-2.0)
   - **Fix VFS shim**: The `siara-cc` `esp32.c` has a sync no-op (`esp32_Sync()` only calls `fflush`, not `fsync`) and stub-only locking. Fix `esp32_Sync()` to call `fflush()` + `fsync(fileno(fd))`. Without this fix, no journal mode is truly safe.
-  - Add a new source file `sqlite_persistence.c` (in a new `components/persistence/` component) that implements `measurement_store_fn`, `measurement_query_fn`, `measurement_count_fn`, `measurement_next_id_fn`, `measurement_query_unsynced_fn`, and `measurement_mark_synced_fn`:
+  - Add a new source file `sqlite_persistence.c` (in a new `components/persistence/` component) that implements all port functions from `persistence_port.h`:
     - On init: `sqlite3_open("/sdcard/measurements.db", &db)`, configure PRAGMAs, create table if not exists
     - **Startup integrity check**: Immediately after `sqlite3_open()`, run `PRAGMA integrity_check;`. If result ≠ `"ok"`: close DB → rename `.db`/`.db-wal`/`.db-shm` to `.corrupt` suffix → reopen (creates fresh DB) → log event to NVS (`nvs_set_u32("diag", "db_corrupt_count", ++n)`). Data is lost but device recovers function.
+    - **Schema migration**: `migrate_schema()` runs after `CREATE TABLE` — uses `PRAGMA table_info` to detect the legacy `synced` column name and renames it to `syncState` via `ALTER TABLE RENAME COLUMN`. Safe to call on every boot; no-op if column is already `syncState`.
     - **PRAGMAs** (set immediately after open and integrity check):
       ```
       PRAGMA journal_mode = WAL;
@@ -236,42 +243,50 @@ Wrap existing components behind port interfaces without rewriting their internal
       PRAGMA journal_size_limit = 65536;
       PRAGMA temp_store = MEMORY;
       ```
-    - Table schema: `CREATE TABLE IF NOT EXISTS measurements (sensorID INTEGER NOT NULL, measureID INTEGER NOT NULL, measureType TEXT NOT NULL, timestamp INTEGER NOT NULL, dataType TEXT NOT NULL, dataValue REAL, synced INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (measureID, dataType));`
-    - Index: `CREATE INDEX IF NOT EXISTS idx_type_ts ON measurements (measureType, timestamp);`
-    - `measurement_store_fn` → appends records to LittleFS pending store (see below), returns immediately. Records are flushed to SQLite by the background task.
-    - `measurement_query_fn` → `SELECT * FROM measurements WHERE measureType = ? AND timestamp BETWEEN ? AND ? ORDER BY measureID, dataType;` — caller provides heap-allocated buffer (`measurement_record_t *out`), capped at `max` records
+    - **Flat table schema** (single table, all columns per row):
+      - `CREATE TABLE IF NOT EXISTS measurements (sensorID INTEGER NOT NULL, measureID INTEGER NOT NULL, measureType TEXT NOT NULL, timestamp INTEGER NOT NULL, dataType TEXT NOT NULL, dataValue REAL, syncState INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (measureID, dataType));`
+    - Indexes:
+      - `CREATE INDEX IF NOT EXISTS idx_type_ts ON measurements (measureType, timestamp);`
+      - `CREATE INDEX IF NOT EXISTS idx_sync_type ON measurements (syncState, measureType, timestamp);`
+    - On init, run `UPDATE measurements SET syncState = 0 WHERE syncState = 1;` so stale in-flight rows are retried after reboot
+    - `measurement_store_fn` → caller passes all flat `measurement_record_t` rows for one logical group; implementation appends them to the LittleFS pending store, returns immediately
+    - `measurement_query_fn` → `SELECT … FROM measurements WHERE measureType = ? AND timestamp BETWEEN ? AND ? ORDER BY measureID, dataType`; returns flat `measurement_record_t` rows
+    - `measurement_query_by_id_fn` → `SELECT … FROM measurements WHERE measureID = ? ORDER BY dataType`; returns all rows for one logical group
     - `measurement_count_fn` → `SELECT COUNT(DISTINCT measureID) FROM measurements WHERE measureType = ?;`
     - `measurement_next_id_fn` → reads `s_next_measure_id` atomic counter from `pending_store.c` (initialized at startup from `max(SQLite MAX(measureID), pending_meta.max_measure_id) + 1`; incremented on each append)
-    - `measurement_query_unsynced_fn` → `SELECT * FROM measurements WHERE measureType = ? AND synced = 0 ORDER BY measureID, dataType;`
-    - `measurement_mark_synced_fn` → `UPDATE measurements SET synced = 1 WHERE measureID = ?;`
-  - **Query result buffers**: Heap-allocated by the caller (not stack). `measurement_query_fn` takes `measurement_record_t *out, size_t max, size_t *count`. Default `max=64` → ~5.5KB heap allocation (acceptable on ESP32-S3 with 512KB SRAM). Lua bindings `malloc` the buffer, push results to Lua table, then `free`. This avoids stack overflow in 4KB task stacks.
+    - `measurement_query_unsynced_fn` → `SELECT … FROM measurements WHERE measureType = ? AND syncState = 0 ORDER BY measureID, dataType;`
+    - `measurement_claim_next_pending_fn` → `BEGIN IMMEDIATE`; select oldest PENDING `measureID`; `UPDATE SET syncState = 1`; `COMMIT`; return `measureID`; returns `ESP_ERR_NOT_FOUND` when nothing pending
+    - `measurement_mark_inflight_fn` → `UPDATE measurements SET syncState = 1 WHERE measureID = ? AND syncState = 0;`
+    - `measurement_mark_pending_fn` → `UPDATE measurements SET syncState = 0 WHERE measureID = ? AND syncState = 1;`
+    - `measurement_mark_synced_fn` → `UPDATE measurements SET syncState = 2 WHERE measureID = ? AND syncState = 1;`
+  - **Query result buffers**: Heap-allocated by the caller (not stack). Lua bindings `malloc` the needed buffer, push results to a Lua table, then `free`. This avoids stack overflow in 4KB task stacks.
   - **LittleFS pending store** (`components/persistence/pending_store.c`):
-    - Fixed-size binary records for fast append/read without parsing:
+    - Each entry stores one flat `measurement_record_t` with a magic/CRC wrapper:
       ```c
       typedef struct {
           uint32_t magic;              // 0xABCD1234 — validity marker
-          measurement_record_t record; // ~92 bytes
+          measurement_record_t record; // flat row (sync_state always PENDING on write)
           uint32_t crc32;              // integrity check
-      } pending_entry_t;              // ~100 bytes
+      } pending_entry_t;
       ```
-    - `pending_store_append(const measurement_record_t *records, size_t count)` — appends to `/littlefs/pending.bin`. This is what `measurement_store_fn` calls.
-    - `pending_store_read(pending_entry_t *out, size_t max, size_t *count)` — reads first N valid entries
-    - `pending_store_remove(size_t count)` — advances head pointer in `/littlefs/pending_meta.bin` by N entries (circular buffer — no rewrite of `pending.bin`). When head catches up to tail, truncate file to reclaim space.
-    - `pending_store_count()` — returns `(tail - head)` from metadata
-    - **Circular buffer metadata**: `/littlefs/pending_meta.bin` stores `{ uint32_t head; uint32_t tail; int64_t max_measure_id; }`. Updated atomically (write + fsync) on every append and remove. On boot, metadata is read to resume from last known position. If metadata is corrupt (bad magic/CRC), reset head=tail=0 and scan `pending.bin` for valid entries.
-    - **Atomic measureID counter**: `s_next_measure_id` in `pending_store.c` tracks the highest measureID across both pending entries and SQLite. Initialized at startup as `max(SQLite MAX(measureID), pending_meta.max_measure_id)`. Incremented atomically on each `pending_store_append()`. `measurement_next_id_fn` reads this counter instead of querying SQLite — avoids duplicate IDs when records are still in the pending buffer.
+    - `pending_store_append(const measurement_record_t *records, size_t count)` — appends flat records to `/littlefs/pending.bin`. This is what `measurement_store_fn` calls.
+    - `pending_store_read(pending_entry_t *out, size_t max, size_t *count)` — reads the first N valid entries
+    - `pending_store_remove(size_t count)` — advances head pointer in `/littlefs/pending_meta.bin` (circular buffer). When head catches tail, truncate file to reclaim space.
+    - `pending_store_count()` — returns pending entry count from metadata
+    - **Circular buffer metadata**: `/littlefs/pending_meta.bin` stores `{ uint32_t head; uint32_t tail; int64_t max_measure_id; }`. Updated atomically (write + fsync) on every append and remove.
+    - **Atomic measureID counter**: `s_next_measure_id` in `pending_store.c` tracks the highest measureID. Initialized at startup as `max(SQLite MAX(measureID), pending_meta.max_measure_id)`. Incremented on each `pending_store_append()`. `measurement_next_id_fn` reads this counter instead of querying SQLite — avoids duplicate IDs when records are still in the pending buffer.
     - **Thread safety**: Protected by `s_pending_mutex` (`SemaphoreHandle_t`). Both `cmd_store_measurement` (producer, any task) and the flush task (consumer, Core 0) take this mutex.
-    - **Capacity**: 512KB LittleFS partition holds ~5,100 entries at 100 bytes each. At typical sampling rates (1 reading/min, 3 rows/reading = 3 entries/min), this buffers ~28 hours of data. If pending store exceeds 80% (410KB, ~4,100 entries), log `ESP_LOGW`. If 100% full, `cmd_store_measurement` returns `ESP_ERR_NO_MEM`.
+    - **Capacity**: 512KB LittleFS partition holds roughly 1,700 flat three-value measurements at ~300 bytes each — about 28 hours of buffer at 1 reading per minute. If pending store exceeds 80%, log `ESP_LOGW`. If 100% full, `cmd_store_measurement` returns `ESP_ERR_NO_MEM`.
   - **Pending flush task** (`pending_flush_task`, pinned to Core 0):
     - Runs every 5 seconds: checks `pending_store_count()`, skips if 0
-    - If `sd_card_is_available()`: reads batch of up to 16 entries, converts to `measurement_record_t` array, batch `INSERT`s into SQLite inside a transaction
-    - On successful SQLite INSERT: calls `pending_store_remove(n)` to clear flushed entries from LittleFS
+    - If `sd_card_is_available()`: reads up to 16 flat entries and inserts them into SQLite inside one transaction
+    - On successful SQLite INSERT: calls `pending_store_remove(n)` to clear flushed entries
     - On failure (SD card removed mid-flush): entries remain in LittleFS, retried next cycle
-    - **Startup drain**: On boot, after SQLite init, immediately drain all pending LittleFS records to SQLite before starting normal operation. This handles records buffered during a previous run where the SD card was absent.
-    - **Read-after-write latency**: `db.store()` followed immediately by `db.query()` won’t see the just-stored record (up to 5s delay). Acceptable for IoT telemetry. If synchronous write is needed, a future `db.store(records, {flush=true})` option can bypass the buffer.
+    - **Startup drain**: On boot, after SQLite init, immediately drain all pending LittleFS records to SQLite before starting normal operation.
+    - **Read-after-write latency**: `db.store()` followed immediately by `db.query()` won’t see the just-stored record (up to 5s delay). Acceptable for IoT telemetry.
   - Text-file functions (`sdcard_write_line`, `sdcard_append_file`, `sdcard_read_line_at`, etc.) are kept until Phase 3C when both Lua and CLI are rewired to use `device_commands`. After Phase 3C, these functions are removed.
   - `components/persistence/CMakeLists.txt`: `REQUIRES domain sqlite3 sd_card` + `PRIV_REQUIRES esp_littlefs`
-  - **Thread safety**: SQLite compiled with `SQLITE_THREADSAFE=2` (multi-thread mode). Add a dedicated `s_sqlite_mutex` (`SemaphoreHandle_t`) in `sqlite_persistence.c`. All repository function implementations (query, count, next_id, mark_synced) and the flush task take this mutex before any `sqlite3_*` call and release after. Separate from SD card mount/unmount mutex. Serializes all DB access — acceptable given short writes and periodic reads. LittleFS pending store has its own `s_pending_mutex` protecting append/read/remove operations.
+  - **Thread safety**: SQLite compiled with `SQLITE_THREADSAFE=2` (multi-thread mode). `s_sqlite_mutex` in `sqlite_persistence.c` serializes all DB access. LittleFS pending store has its own `s_pending_mutex`.
 
 2.4. **Status adapter** — `ambyte_status` already fits. Add a function returning `status_set_fn`.
 
@@ -310,21 +325,22 @@ No FreeRTOS queue or IPC needed between CLI and Lua — they operate independent
 - `device.read_rtc()` — RTC time
 - `device.status()` — device status (sensors ready, WiFi, etc.)
 - `device.read_env()` — BME280 environmental reading
-- `db.store(records)` — store measurement records to SQLite (takes array of records, not sensor reads)
+- `db.store(header, values)` — store one logical measurement group to SQLite (takes caller-assembled metadata + values, not sensor reads)
 - `db.query(type, from, to)` — query measurements
 - `db.count(type)` — measurement count
 - `db.next_id()` — get next device-prefixed measure ID
-- `db.unsynced(type)` — query un-synced measurement records
-- `db.mark_synced(id)` — mark measurement as synced after MQTT upload
+- `db.unsynced(type)` — query un-synced logical measurement headers
+- `device.mqtt_publish(topic, payload)` — raw MQTT publish for diagnostics or ad-hoc messages (Phase 6A)
+- `device.mqtt_publish_measurement(measure_id)` — publish one logical measurement group as a JSON payload using the fixed telemetry topic contract (Phase 6A)
+- `device.mqtt_publish_unsynced(type)` — claim and publish the next unsynced measurement group of the requested type using the fixed telemetry topic contract (Phase 6A)
+- `device.mqtt_status()` — MQTT connection status (Phase 6A)
 - `device.uart_query(channel, cmd, timeout)` — UART sensor query
 - `device.uart_ping(channel)` — UART health check
 - `device.uart_status()` — all channel states
-- `device.mqtt_publish(topic, payload)` — MQTT publish
-- `device.mqtt_status()` — MQTT connection status
 - `device.sleep_ms(ms)` — task delay
 - `device.log(msg)` — ESP_LOGI logging
 
-### Current Command Inventory
+### Command Inventory
 
 | Operation | Old CLI | After | Lua binding |
 |---|---|---|---|
@@ -335,15 +351,17 @@ No FreeRTOS queue or IPC needed between CLI and Lua — they operate independent
 | Ping | `ping` | removed | — |
 | Exit | `exit` | removed | — |
 | BME280 read | — | CLI → `cmd_read_env()` | `device.read_env()` |
-| Store measurement | — | CLI → `cmd_store_measurement()` | `db.store(records)` |
+| Store measurement | — | CLI → `cmd_store_measurement()` | `db.store(header, values)` |
 | Query measurements | — | CLI → `cmd_query_measurements()` | `db.query(type, from, to)` |
 | Count measurements | — | CLI → `cmd_measurement_count()` | `db.count(type)` |
 | Next measure ID | — | CLI → `cmd_next_measure_id()` | `db.next_id()` |
-| Query unsynced | — | CLI → `cmd_query_unsynced()` | `db.unsynced(type)` |
-| Mark synced | — | CLI → `cmd_mark_synced()` | `db.mark_synced(id)` |
+| Query unsynced groups | — | CLI → `cmd_query_unsynced()` | `db.unsynced(type)` |
+| MQTT publish | — | CLI → `cmd_mqtt_publish()` | `device.mqtt_publish(topic, payload)` |
+| MQTT publish measurement | — | CLI → `cmd_mqtt_publish_measurement()` | `device.mqtt_publish_measurement(id)` |
+| MQTT publish unsynced | — | CLI → `cmd_mqtt_publish_unsynced()` | `device.mqtt_publish_unsynced(type)` |
+| MQTT status | — | CLI → `cmd_mqtt_status()` | `device.mqtt_status()` |
 | UART query | — | CLI → `cmd_uart_query()` | `device.uart_query(ch, cmd, timeout)` |
 | UART ping | — | CLI → `cmd_uart_ping()` | `device.uart_ping(ch)` |
-| MQTT publish | — | CLI → `cmd_mqtt_publish()` | `device.mqtt_publish(topic, payload)` |
 
 ### Command function pattern
 
@@ -358,16 +376,20 @@ cmd_result_t cmd_read_rtc(time_t *out_time);
 cmd_result_t cmd_device_status(bool *bme_ready, bool *rtc_ready, time_t *rtc_time);
 cmd_result_t cmd_read_env(float *temp, float *hum, float *pres);
 cmd_result_t cmd_log(const char *msg);
-cmd_result_t cmd_store_measurement(const measurement_record_t *records, size_t count);   // stores to LittleFS pending buffer (flushed to SQLite by background task) — does NOT read sensors
+cmd_result_t cmd_store_measurement(const measurement_header_t *header, const measurement_value_t *values, size_t count);   // stores one logical measurement group to LittleFS pending buffer (flushed to SQLite by background task) — does NOT read sensors
 cmd_result_t cmd_query_measurements(const char *measure_type, time_t from, time_t to, measurement_record_t *out, size_t max, size_t *count);   // caller provides heap-allocated buffer
 cmd_result_t cmd_measurement_count(const char *measure_type, size_t *count);
 cmd_result_t cmd_next_measure_id(int64_t *out_id);
 cmd_result_t cmd_sleep_ms(uint32_t ms);
-cmd_result_t cmd_query_unsynced(const char *measure_type, measurement_record_t *out, size_t max, size_t *count);
-cmd_result_t cmd_mark_synced(int64_t measure_id);
+cmd_result_t cmd_query_unsynced(const char *measure_type, measurement_header_t *out, size_t max, size_t *count);   // returns logical measurement groups, not flattened rows
+// Phase 6A additions:
+cmd_result_t cmd_mqtt_publish(const char *topic, const char *payload);
+cmd_result_t cmd_mqtt_publish_measurement(int64_t measure_id);   // fixed-contract topic derived internally
+cmd_result_t cmd_mqtt_publish_unsynced(const char *measure_type);   // fixed-contract topic, claims and publishes at most one pending group per call
+cmd_result_t cmd_mqtt_status(void);
 ```
 
-Note: `cmd_store_measurement` receives fully assembled records (sensorID, measureID, measureType, timestamp, dataType, dataValue). The caller (Lua script) is responsible for reading sensors via `device.read_env()`, getting timestamp via `device.read_rtc()`, obtaining a measureID via `db.next_id()`, and assembling the `measurement_record_t` array before calling `db.store(records)`.
+Note: `cmd_store_measurement` receives one fully assembled `measurement_header_t` plus a `measurement_value_t[]` array. The caller (Lua script) is responsible for reading sensors via `device.read_env()`, getting timestamp via `device.read_rtc()`, obtaining a measureID via `db.next_id()`, assembling the header, and filling the value array before calling `db.store(header, values)`.
 
 **CMakeLists.txt:** `REQUIRES domain` only (uses domain ports, not concrete components)
 
@@ -375,7 +397,7 @@ Note: `cmd_store_measurement` receives fully assembled records (sensorID, measur
 
 **CLI adapter** (in `CLI.c`):
 - Uses `esp_console` for command registration and argument parsing (provides line editing, history, and tab completion for field debugging)
-- Does NOT use `esp_console`'s built-in REPL loop — CLI task owns its own `fgets`-based read loop and calls `esp_console_run()` to dispatch parsed commands
+- Uses `esp_console`'s built-in REPL (`esp_console_new_repl_*()` + `esp_console_start_repl()`) rather than a custom `fgets()` loop
 - Register commands via `esp_console_cmd_register()`: each command's handler calls the corresponding `cmd_*()` function from `device_commands`
 - Native handler: `i2cscan` → registered as `esp_console` command, runs directly in CLI task using `i2c_bus_lock()` + `i2c_master_cmd_begin()`
 - All other commands: handler calls `cmd_*()` directly, prints `cmd_result_t.message`
@@ -394,33 +416,46 @@ Note: `cmd_store_measurement` receives fully assembled records (sensorID, measur
 
 3A.1. Create `components/device_commands/` with `cmd_result_t` struct and all command functions listed above. `REQUIRES domain` only — receives all port function pointers via a config struct:
   ```
-  // Phase 3 initial struct — grows incrementally per phase
   typedef struct {
-      sensor_read_fn   read_env;        // Phase 2
-      clock_read_fn    read_clock;      // Phase 2
-      measurement_store_fn  store;      // Phase 2
-      measurement_query_fn  query;      // Phase 2
-      measurement_count_fn  count;      // Phase 2
-      measurement_next_id_fn next_id;   // Phase 2
-      measurement_query_unsynced_fn query_unsynced;  // Phase 2
-      measurement_mark_synced_fn mark_synced;        // Phase 2
-      status_set_fn    set_status;      // Phase 2
+      /* Sensing ports (Phase 2) */
+      sensor_read_fn                      read_env;
+      clock_read_fn                       read_clock;
+      /* Persistence ports (Phase 2) */
+      measurement_store_fn                store;
+      measurement_query_fn                query;
+      measurement_count_fn                count;
+      measurement_next_id_fn              next_id;
+      measurement_query_unsynced_fn       query_unsynced;
+      measurement_mark_synced_fn          mark_synced;
+      measurement_mark_inflight_fn        mark_inflight;
+      measurement_mark_pending_fn         mark_pending;
+      measurement_query_by_id_fn          query_by_id;
+      measurement_claim_next_pending_fn   claim_next_pending;
+      /* Status port (Phase 2) */
+      status_set_fn                       set_status;
+      /* Messaging ports (Phase 6A) */
+      message_publish_fn                  publish;
+      message_is_connected_fn             message_is_connected;
+      message_set_publish_ack_handler_fn  set_publish_ack_handler;
+      /* Phase 6B adds: message_subscribe_fn subscribe; */
+      /* Phase 7 adds:  uart_sensor_query_fn uart_query; */
+      /* Phase 8 adds:  power_read_fn read_power;        */
   } device_commands_config_t;
-  // Phase 6 adds: message_publish_fn publish;
-  // Phase 7 adds: uart_sensor_query_fn uart_query;
-  // Phase 8 adds: power_read_fn read_power;
   ```
-  `device_commands_init(const device_commands_config_t *cfg)` — single pointer arg. Each `cmd_*` function checks if its required port(s) are NULL before use (returns `ESP_ERR_NOT_SUPPORTED`). New ports are added as struct fields in the phase that creates their port header (e.g., Phase 6 adds `messaging_port.h` and the `publish` field). Requires recompilation of `device_commands` per phase, which happens anyway.
+  `device_commands_init(const device_commands_config_t *cfg)` — registers the publish-ack handler (`on_publish_ack`) via `set_publish_ack_handler` if provided. Each `cmd_*` function checks if its required port(s) are NULL before use (returns `ESP_ERR_NOT_SUPPORTED`). Messaging ports are NULL until Phase 6A wires them up.
   
   **Port requirements per command:**
   - `cmd_set_rgb` → needs `set_status`
   - `cmd_read_rtc` → needs `read_clock`
   - `cmd_read_env` → needs `read_env`
-  - `cmd_store_measurement` → needs `store` only (records provided by caller)
+  - `cmd_store_measurement` → needs `store` only (header + values provided by caller)
   - `cmd_query_measurements` → needs `query` only
   - `cmd_next_measure_id` → needs `next_id` only
-  - `cmd_query_unsynced` → needs `query_unsynced` only
-  - `cmd_mark_synced` → needs `mark_synced` only
+  - `cmd_query_unsynced` → needs `query_unsynced_headers` only
+  - `cmd_mqtt_publish` → needs `publish` only
+  - `cmd_mqtt_publish_measurement` → needs `query_header_by_id` + `query_by_id` + `publish` + `mark_inflight` + `mark_pending` + `mark_synced`; also depends on the publish-ack handler being registered during `device_commands_init()`
+  - `cmd_mqtt_publish_unsynced` → needs `claim_next_pending_header` + `query_by_id` + `publish` + `mark_pending` + `mark_synced`; also depends on the publish-ack handler being registered during `device_commands_init()`
+  - `cmd_mqtt_status` → needs `message_is_connected`
   - `cmd_device_status` → needs `read_env` + `read_clock` (checks readiness)
 
 **Verification:** `pio run` succeeds with `device_commands` component added. No consumers call it yet.
@@ -434,6 +469,7 @@ Note: `cmd_store_measurement` receives fully assembled records (sensorID, measur
 3B.2. Rewrite Lua bindings in `lua_runner.c`:
   - **Remove old `status.*` and `sd.*` module registrations entirely** — old bindings using `ambyte_status_set_rgb()`, `sdcard_append_line()`, etc. are deleted (intentional breaking change)
   - Register new `device.*` and `db.*` bindings, each calling the corresponding `cmd_*()` function directly
+  - Do **not** expose any manual sync-state mutation API to Lua; sync state is managed by the MQTT publish path, not by scripts
   - Update embedded Lua script (`lua_script_blob.c`) to use new `device.*`/`db.*` API
 3B.3. **Lua VM lifecycle**: Keep current one-shot lifecycle (create VM → run script → close VM → `vTaskDelete`). The VM does NOT need to stay alive permanently since CLI calls `cmd_*` directly instead of dispatching through Lua. This saves ~30-50KB heap when no script is running. Future enhancement: persistent VM for continuous automation scripts.
   - Error recovery: If `lua_pcall` fails: log error via `ESP_LOGE`, return error — VM destruction handles cleanup
@@ -449,8 +485,7 @@ Note: `cmd_store_measurement` receives fully assembled records (sensorID, measur
   - Keep `esp_console` (provides line editing, history, argument parsing)
 3C.2. Rewrite `CLI.c`:
   - Use `esp_console_cmd_register()` to register all commands (including `i2cscan`)
-  - CLI task owns its own read loop: `fgets()` from console fd, then `esp_console_run()` to dispatch
-  - Do NOT use `esp_console_start_repl()` or `esp_console_new_repl_*()` — avoid the built-in REPL thread
+  - Use `esp_console_new_repl_*()` plus `esp_console_start_repl()` for the shell lifecycle
   - Each command handler: calls corresponding `cmd_*()` function directly → prints `cmd_result_t.message`
   - Native command: `i2cscan` handler uses `i2c_bus_lock()` + `i2c_master_cmd_begin()` directly
   - No FreeRTOS queue or IPC — direct function calls
@@ -465,7 +500,7 @@ Note: `cmd_store_measurement` receives fully assembled records (sensorID, measur
   - Create domain port adapters (function pointers)
   - Call `device_commands_init()` with port adapters
   - Start Lua runner (registers bindings, runs default script)
-  - Start CLI (creates reader task, calls `cmd_*()` directly)
+  - Start CLI (`esp_console_start_repl()`, handlers call `cmd_*()` directly)
   - **Task stack sizes** (defined as `#define` constants in respective headers):
     - Lua task: **8192 bytes** (must handle lua_pcall → C binding → cmd_* → SQLite → VFS call chain; 4096 is insufficient). Log `uxTaskGetStackHighWaterMark()` at end of first Lua script execution to validate sizing.
     - CLI task: **4096 bytes** (esp_console + i2cscan + direct cmd_* calls)
@@ -476,7 +511,8 @@ Note: `cmd_store_measurement` receives fully assembled records (sensorID, measur
   - `main/CMakeLists.txt` REQUIRES — explicit list per phase:
     - Current: `i2c_bus wifi_manager nvs_flash ambyte_status lua_runner pcf2131tfy_rtc bme280 CLI`
     - After Phase 3: `i2c_bus wifi_manager nvs_flash ambyte_status lua_runner pcf2131tfy_rtc bme280 CLI device_commands persistence sd_card domain`
-    - After Phase 6: add `mqtt_client certs`
+    - After Phase 6A: add `mqtt_client certs`
+    - After Phase 6B: add `device_config`
     - After Phase 7: add `uart_sensors`
     - After Phase 8: add `mp2731`
 
@@ -517,7 +553,7 @@ Rename public APIs to use domain language. This is non-essential but improves re
 
 ---
 
-## Phase 5: BLE Credential Provisioning
+## Phase 5: BLE Wi-Fi Provisioning
 
 ### Best Practice: ESP-IDF Wi-Fi Provisioning Manager
 
@@ -526,14 +562,12 @@ ESP-IDF provides a **built-in solution** (`wifi_prov_mgr`) that handles exactly 
 **How it works:**
 1. On first boot (or when `wifi_prov_mgr_is_provisioned()` returns false):
    - Start BLE GATT server with `wifi_prov_scheme_ble`
-   - A **custom mobile app** will be developed to handle both WiFi provisioning and AMBIT device configuration (channel metadata, MQTT broker config)
-   - User connects via custom app, provides WiFi credentials + device config
-   - Device receives credentials over encrypted BLE (X25519 + AES-CTR, Security 1)
-   - Device attempts WiFi connection; reports success/failure to app
-   - On success: credentials saved to NVS automatically, provisioning stops
+   - User provisions Wi-Fi credentials over encrypted BLE (X25519 + AES-CTR, Security 1)
+   - Device attempts Wi-Fi connection and reports success/failure to the provisioning client
+   - On success: credentials are saved to NVS automatically and provisioning stops
 2. **BLE memory is freed automatically** using `WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE` (note: `FREE_BTDM` is for ESP32 with combined BT+BLE controller; ESP32-S3 has a separate BLE controller and requires `FREE_BLE`)
    - This frees BLE memory (~60-70 KB RAM) when provisioning manager is de-initialized
-   - On subsequent boots, BLE is never initialized (credentials found in NVS → skip provisioning entirely)
+   - On subsequent boots, BLE is never initialized when stored Wi-Fi credentials are present
 3. Credentials **persist in NVS** across reboots — never need to re-provision unless NVS is erased
 
 **Key config**: Use `WIFI_PROV_SECURITY_1` with a proof-of-possession (PoP) string printed on device label or shown on LED pattern.
@@ -541,7 +575,7 @@ ESP-IDF provides a **built-in solution** (`wifi_prov_mgr`) that handles exactly 
 ### Steps
 
 5.1. Extend `components/wifi_manager/` — add provisioning mode (no separate `ble_provisioning/` component):
-  - Add `wifi_manager_is_provisioned(bool *out)` — checks NVS for stored credentials
+  - Add `wifi_manager_is_provisioned(bool *out)` — checks the real Wi-Fi provisioning state stored by ESP-IDF / `esp_wifi`, not only a project-local flag
   - Add `wifi_manager_start_provisioning(const char *device_name, const char *pop)` — internally calls `wifi_prov_mgr_init()` with BLE scheme, starts provisioning, waits for `WIFI_PROV_CRED_SUCCESS`, then deinits prov mgr (frees BLE RAM) and connects WiFi
   - BLE-specific code lives entirely *inside* `wifi_manager` — consumers never see BLE types
   - Update `wifi_manager/CMakeLists.txt`: add `PRIV_REQUIRES wifi_provisioning protocomm bt` (private — no BLE leak to consumers)
@@ -555,82 +589,305 @@ ESP-IDF provides a **built-in solution** (`wifi_prov_mgr`) that handles exactly 
     │   ├─ NO → wifi_manager_start_provisioning("AMBYTE", pop_string)
     │   │       Internally: starts BLE, waits for credentials, connects WiFi
     │   │       On success: deinits prov mgr (frees BLE RAM)
-    │   └─ YES → wifi_manager_connect_configured() (never inits BT stack → saves ~60KB RAM)
+    │   └─ YES → wifi_manager_connect_stored() (uses NVS-stored credentials, never inits BT stack → saves ~60KB RAM)
     ├─ Continue normal startup (I2C, sensors, SD, MQTT, CLI, Lua...)
   ```
 
-5.3. Add custom BLE endpoint for device configuration (inside `wifi_manager`):
-  - Register `device-config` endpoint via `wifi_prov_mgr_endpoint_create()` inside `wifi_manager_start_provisioning()`
-  - Receives a JSON (or protobuf) payload with:
-    - MQTT broker config: broker URI, client ID (stored in NVS, used by Phase 6)
-    - AMBIT channel metadata (4 channels):
-      ```
-      {
-        "ambit1": { "sensor_name": "MultispeQ v2.0" },
-        "ambit2": { "sensor_name": "Soil Moisture Probe" },
-        "ambit3": { "sensor_name": "" },
-        "ambit4": { "sensor_name": "" }
-      }
-      ```
-    - Empty `sensor_name` means channel is unused/disabled
-  - Stores metadata in **NVS** (non-volatile storage on internal flash):
-    - NVS namespace `"device_cfg"`, keys: `"ambit1"`, `"ambit2"`, `"ambit3"`, `"ambit4"` → values: sensor_name strings (max 15 chars per NVS convention, or use `nvs_set_blob` for longer names)
-    - MQTT broker config: `"mqtt_uri"`, `"mqtt_id"` keys in same namespace
-    - Inserted/updated during provisioning, persists on internal flash — survives SD card removal
-    - Device commands can query: `cmd_channel_config(uint8_t channel)` returns sensor_name from NVS
-  - App sends device-config BEFORE WiFi config (per ESP-IDF requirement: custom endpoints must be targeted first)
-  - On subsequent boots, metadata is read from NVS — no BLE needed, no SD card dependency for device config
+5.3. Phase 5A scope ends with Wi-Fi provisioning only. **Do not block Phase 6A on a custom BLE device-config endpoint.**
+  - Phase 6A is **compile-time-config only**. It does not read `device_config`.
+  - Define the exact 6A config carrier in Kconfig / `sdkconfig.defaults` (or a local `sdkconfig` overlay):
+    - `CONFIG_AMBYTE_DEVICE_ID`
+    - `CONFIG_AMBYTE_MQTT_URI`
+    - `CONFIG_AMBYTE_MQTT_CLIENT_ID`
+    - `CONFIG_AMBYTE_MQTT_TOPIC_ROOT`
+  - `CONFIG_AMBYTE_DEVICE_ID` is the canonical device identity for Phase 6A. It is used in telemetry payloads/topics and also parsed once at startup as the numeric `measure_id` prefix for persistence. `CONFIG_AMBYTE_MQTT_CLIENT_ID` remains the broker client identifier and may differ.
 
-5.4. Enable BLE in sdkconfig.defaults:
+5.4. Phase 5B / 6B follow-up — add a dedicated `components/device_config/` component (NVS-backed, separate from `wifi_manager`):
+  - Owns device configuration stored in NVS namespace `"device_cfg"`
+  - First fields: `"mqtt_uri"`, `"mqtt_client_id"`, `"mqtt_topic_root"`
+  - Later fields: AMBIT channel metadata (`"ambit1"` ... `"ambit4"`) with string values stored via `nvs_set_str`; the 15-character NVS limit applies to keys and namespaces, not stored string values
+  - Optional custom BLE endpoint `device-config` can populate this component later; that work is explicitly deferred to Phase 6B
+  - App still sends device-config before Wi-Fi config when that endpoint is introduced, per ESP-IDF provisioning requirements
+
+5.5. Enable BLE in sdkconfig.defaults:
   - `CONFIG_BT_ENABLED=y`
   - `CONFIG_BT_NIMBLE_ENABLED=y` (NimBLE uses less RAM than Bluedroid)
   - `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y` (if PSRAM available)
 
-**Verification:** Flash, observe BLE advertising → connect with custom mobile app → enter WiFi credentials + channel config → device connects → reboot → device auto-connects without BLE.
+**Verification:** Flash, observe BLE advertising → provision Wi-Fi credentials → device connects → reboot → device auto-connects without BLE. Device configuration beyond Wi-Fi is deferred to Phase 5B / 6B.
 
 ---
 
-## Phase 6: MQTT Publisher/Subscriber
+## Phase 6A: MQTT Telemetry Publisher
 
-Add basic MQTT connectivity — publish measurement data and subscribe to commands. MQTT v5 is already enabled in sdkconfig (`CONFIG_MQTT_PROTOCOL_5=y`). Target broker: AWS IoT Core (mutual TLS).
+Add outbound MQTT telemetry only. MQTT v5 is already enabled in sdkconfig (`CONFIG_MQTT_PROTOCOL_5=y`). Target broker: AWS IoT Core (mutual TLS). Inbound MQTT commands are deferred to Phase 6B.
 
 ### Bounded Context Addition
 
 | Bounded Context | Domain Concepts | Components |
 |---|---|---|
-| **Messaging** | Message, Topic, Subscription, PublishResult | `mqtt_client/` (new) |
+| **Messaging** | Message, Topic, PublishResult, ConnectionState | `mqtt_client/` (new) |
 
 ### Domain Port
 
-6.0. Define **Messaging port** in `components/domain/include/messaging_port.h`:
-  - `typedef esp_err_t (*message_publish_fn)(const char *topic, const char *payload, size_t len);`
-  - `typedef void (*message_handler_fn)(const char *topic, const char *payload, size_t len);`
-  - `typedef esp_err_t (*message_subscribe_fn)(const char *topic, message_handler_fn handler);`
+6A.0. Define **Messaging port** in `components/domain/include/messaging_port.h`:
+  - `typedef esp_err_t (*message_publish_fn)(const char *topic, const char *payload, size_t len, int *out_msg_id);`
+  - `typedef bool (*message_is_connected_fn)(void);`
+  - `typedef void (*message_publish_ack_fn)(int msg_id, esp_err_t status, void *ctx);`
+  - `typedef esp_err_t (*message_set_publish_ack_handler_fn)(message_publish_ack_fn handler, void *ctx);`
+  - Phase 6B later adds:
+    - `typedef void (*message_handler_fn)(const char *topic, const char *payload, size_t len);`
+    - `typedef esp_err_t (*message_subscribe_fn)(const char *topic, message_handler_fn handler);`
 
 ### Steps
 
-6.1. Create `components/mqtt_client/` — wraps ESP-MQTT (`esp_mqtt_client`):
-  - `mqtt_client_init(const char *broker_uri, const char *client_id)` — configures with TLS certs from `components/certs/`
+6A.1. Create `components/mqtt_client/` — wraps ESP-MQTT (`esp_mqtt_client`):
+  - Add `components/mqtt_client/Kconfig.projbuild` and define the 6A compile-time carrier:
+    - `CONFIG_AMBYTE_DEVICE_ID`
+    - `CONFIG_AMBYTE_MQTT_URI`
+    - `CONFIG_AMBYTE_MQTT_CLIENT_ID`
+    - `CONFIG_AMBYTE_MQTT_TOPIC_ROOT`
+  - `typedef struct { const char *broker_uri; const char *client_id; const char *device_id; const char *topic_root; } mqtt_client_config_t;`
+  - `mqtt_client_init(const mqtt_client_config_t *cfg)` takes config built by `app_main` from the compile-time carrier above; 6A does **not** read NVS or `device_config`
   - `mqtt_client_start()` / `mqtt_client_stop()`
-  - Implements `message_publish_fn` and `message_subscribe_fn` ports
+  - Implements `message_publish_fn`, `message_is_connected_fn`, and `message_set_publish_ack_handler_fn`
+  - Uses QoS 1 for telemetry publishes
+  - Registers an ESP-MQTT event handler and translates `MQTT_EVENT_PUBLISHED` into the plan's publish-ack callback
   - `REQUIRES domain certs` + `PRIV_REQUIRES mqtt esp_event`
 
-6.2. Add MQTT commands to `device_commands`:
-  - `cmd_mqtt_publish(const char *topic, const char *payload)` — publish arbitrary message
-  - `cmd_mqtt_publish_measurement(int64_t measure_id)` — query SQLite by measure_id, format as JSON, publish. On successful publish, call `cmd_mark_synced(measure_id)` to set `synced = 1`
-  - `cmd_mqtt_publish_unsynced(const char *measure_type, const char *topic)` — query all unsynced records of given type, publish each, mark synced on success. Enables batch upload of pending measurements.
-  - `cmd_mqtt_status()` — return connection status
+6A.2. Extend persistence for telemetry upload:
+  - Add a group-aware repository API now:
+    - `measurement_query_header_by_id_fn`
+    - `measurement_query_unsynced_headers_fn`
+    - `measurement_claim_next_pending_header_fn`
+    - `measurement_mark_inflight_fn`
+    - `measurement_mark_pending_fn`
+    - `measurement_mark_synced_fn`
+  - Keep `measurement_query_by_id_fn` for loading the value rows belonging to one logical measurement group
+  - Sync state is persisted in `measurement_headers.syncState`, not inferred from an in-memory table alone
+  - On boot, reset any stale `INFLIGHT` headers back to `PENDING` before MQTT publishing starts
 
-6.3. Wire in `app_main.c`:
-  - After WiFi connects, init MQTT client
-  - Pass `message_publish_fn` to `device_commands_init()`
-  - Subscribe to a command topic for receiving remote commands
+6A.3. Add MQTT commands to `device_commands`:
+  - `cmd_mqtt_publish(const char *topic, const char *payload)` — raw publish for debugging / ad-hoc messages
+  - `cmd_mqtt_publish_measurement(int64_t measure_id)` — query the header plus all value rows for `measure_id`, derive the fixed-contract topic internally, mark the header `INFLIGHT`, then publish with QoS 1
+  - `cmd_mqtt_publish_unsynced(const char *measure_type)` — atomically claims the next pending measurement header of the requested type, derives the fixed-contract topic internally, and publishes exactly one logical measurement group per call
+  - `cmd_mqtt_status()` — return connection state
+  - `device_commands` owns a single pending measurement publish slot `msg_id <-> measure_id` for ack correlation only; durable publish state remains in SQLite
+  - Raw `cmd_mqtt_publish()` calls never occupy or overwrite the measurement publish slot
+  - The publish-ack handler only acts on the tracked measurement slot; unknown `msg_id` values are ignored
+  - `device_commands_init()` registers a publish-ack handler through `message_set_publish_ack_handler_fn`
+  - Robust + light sync policy with a single-in-flight uploader:
+    - Before publish: transition header `PENDING -> INFLIGHT`
+    - If publish queueing fails immediately: transition header back `INFLIGHT -> PENDING`
+    - On `MQTT_EVENT_PUBLISHED`: transition header `INFLIGHT -> SYNCED`
+    - On disconnect or reboot recovery: any remaining `INFLIGHT` header returns to `PENDING`
+    - `cmd_mqtt_publish_unsynced()` claims at most one pending header and refuses to queue another measurement publish while one measurement is already in flight
+  - **Important**: `cmd_mqtt_publish_measurement()` and `cmd_mqtt_publish_unsynced()` do **not** mark anything synced immediately after `publish()`
 
-6.4. Provision certs properly — currently empty placeholders in `components/certs/certs.c`. Options:
-  - Embed at compile time (simple, current approach — just fill in the PEM strings)
-  - Store in NVS and provision via BLE (Phase 5 — more secure)
+6A.4. Define the telemetry wire contract explicitly:
+  - One MQTT payload represents one logical measurement group (`measure_id`)
+  - JSON payload contains:
+    - device identifier (`CONFIG_AMBYTE_DEVICE_ID`)
+    - `measure_id`
+    - `measure_type`
+    - timestamp
+    - array of `{ data_type, value }`
+  - Topic format comes from `CONFIG_AMBYTE_MQTT_TOPIC_ROOT`, for example:
+    - `<CONFIG_AMBYTE_MQTT_TOPIC_ROOT>/<CONFIG_AMBYTE_DEVICE_ID>/<measure_type>/<measure_id>`
+  - Measurement-oriented MQTT commands use this topic format only; they do not accept caller-provided topic overrides
 
-**Verification:** Publish a test message; verify reception on AWS IoT console or MQTT test client.
+6A.5. Wire in `app_main.c`:
+  - `app_main` subscribes directly to `IP_EVENT_STA_GOT_IP` and `WIFI_EVENT_STA_DISCONNECTED`
+  - Wi-Fi event handlers do not call MQTT APIs directly; they only notify a small MQTT supervisor task owned by `app_main`
+  - The MQTT supervisor task owns a small state machine, for example `STOPPED`, `STARTING`, `RUNNING`
+  - On `IP_EVENT_STA_GOT_IP`: the handler posts `WIFI_UP`; the supervisor builds `mqtt_client_config_t` from `CONFIG_AMBYTE_*`, initializes if needed, and starts MQTT
+  - On `WIFI_EVENT_STA_DISCONNECTED`: the handler posts `WIFI_DOWN`; the supervisor stops MQTT, clears the in-memory pending measurement publish slot, and returns any still-inflight measurement headers to `PENDING`
+  - Pass `publish`, `message_is_connected`, and `set_publish_ack_handler` into `device_commands_init()`
+  - Do **not** subscribe to remote command topics yet
+
+6A.6. Provision certs pragmatically for the first milestone:
+  - First implementation uses compile-time embedded PEMs via `components/certs/certs.c`
+  - Runtime certificate provisioning is deferred until NVS / flash encryption or secure-element strategy is decided
+  - Do not describe plain NVS certificate storage as "more secure" unless the security model is explicitly strengthened
+
+**Verification:** Publish a test message and a real measurement payload; verify reception on AWS IoT console or MQTT test client. Force a disconnect between queue and acknowledgment and confirm the affected measurement header returns to `PENDING`, not `SYNCED`.
+
+---
+
+## Phase 6B: MQTT Inbound Commands And Runtime Device Config
+
+Add inbound MQTT command handling and runtime device configuration only after 6A telemetry is stable.
+
+### Bounded Context Addition
+
+| Bounded Context | Domain Concepts | Components |
+|---|---|---|
+| **Messaging** | Subscription, CommandMessage, ReassembledPayload | `mqtt_client/`, `device_config/` |
+
+### Steps
+
+6B.1. ~~Extend `components/domain/include/messaging_port.h`~~ — **DONE** (completed in Phase 6A):
+  - `message_handler_fn` already present
+  - `message_subscribe_fn` already present
+
+6B.2. Extend `components/mqtt_client/` — **DONE**:
+  - Subscription table (8 slots, re-subscribes on MQTT_EVENT_CONNECTED)
+  - Dynamic heap reassembly of fragmented `MQTT_EVENT_DATA` (malloc on first chunk, free after dispatch)
+  - OOM on oversized payloads: skips remaining chunks and logs error — no crash
+
+6B.3. Implement `components/device_config/` — **DONE**:
+  - NVS namespace `"device_cfg"`: keys `mqtt_uri`, `mqtt_client_id`, `mqtt_topic_root`
+  - `device_config_init()` + get/set functions for each key
+  - `app_main` reads runtime config first, falls back to `CONFIG_AMBYTE_*` if key absent
+
+6B.4. Wire inbound command topic handling — **DONE**:
+  - `device_commands_subscribe_inbound()` subscribes to `<root>/<device_id>/cmd`
+  - `cmd_dispatch_json()` parses JSON `{"cmd":...}` and dispatches to `cmd_*` functions
+  - `cJSON` used for parsing (PRIV_REQUIRES in `device_commands/CMakeLists.txt`)
+  - Supported commands: `set_rgb`, `read_env`, `status`, `publish_unsynced`, `mqtt_status`, `sleep_ms`, `log`
+  - Command parsing lives in `device_commands`, not in `mqtt_client` plumbing
+
+6B.5. Add BLE `device-config` provisioning endpoint (deferred — requires 6B.3 stable):
+  - Advertise a custom GATT characteristic allowing writes to `device_config` fields over BLE
+  - Accepted JSON payload: `{"mqtt_uri":"…","mqtt_client_id":"…","mqtt_topic_root":"…"}`
+  - Persist each present field to NVS via `device_config_set_*`; absent fields are left unchanged
+  - **Timeout: stop BLE advertising after 60 seconds** if no write is received; device proceeds with existing NVS values or Kconfig defaults
+  - Reboot after a successful config write so the new broker URI/client-ID take effect
+  - Per ESP-IDF provisioning requirements, `device-config` endpoint is advertised before the Wi-Fi credentials endpoint when both are active
+
+**Verification:** Publish a fragmented test command payload; verify `mqtt_client` reassembles it once, command dispatch runs once, and OOM on oversize payload logs error without crashing.
+
+---
+
+## Phase 6C: TLS Certificate Provisioning over BLE
+
+Deliver TLS client certificates to the device at runtime over BLE, replacing the compile-time `certs.c` placeholder. Requires 6B.5 (BLE `device-config` endpoint) to be stable first.
+
+### Motivation
+
+Compile-time embedding (`certs.c`) is acceptable for a first milestone but does not scale to field deployment: each device needs unique client certificates, and rebuilding firmware per device is impractical. This phase provisions certificates over the existing BLE connection used for Wi-Fi and device-config.
+
+### Constraints
+
+- **Security**: Certificate data is delivered as a custom `protocomm` endpoint registered via `wifi_prov_mgr_endpoint_create("cert-prov")`. This endpoint runs **inside** the existing SRP6a-encrypted BLE session (`WIFI_PROV_SECURITY_1`), so the private key is never transmitted in plaintext. A raw standalone GATT characteristic must not be used — it would bypass the session encryption entirely.
+- **BLE MTU limit**: `protocomm` endpoint payloads are capped by the negotiated MTU (typically 512 bytes minus framing). A PEM certificate is ~1–2 KB, so multi-chunk transfer is required.
+- **NVS value size limit**: NVS string values are limited to 4000 bytes. PEM certificates and RSA-2048 private keys (~1700 bytes) all fit.
+- **No flash encryption yet**: Certificates stored in NVS are readable if physical access to flash is obtained. This is an accepted risk until flash encryption is addressed in a later phase.
+- **120-second BLE window is session-scoped**: the timeout starts when BLE advertising begins and covers the entire provisioning session — Wi-Fi credentials, device-config, and certificate writes must all complete within that window. The timeout does not reset on each write. 120 s is chosen to accommodate SRP6a key exchange, three endpoint writes, and BLE chunked cert transfer in a realistic mobile-app-driven flow.
+
+### Steps
+
+6C.1. Extend `components/certs/` to support NVS-backed certificate storage:
+  - NVS namespace `"certs"`, keys: `"ca_cert"` (7), `"dev_cert"` (8), `"dev_key"` (7) — all ≤ 15 chars (NVS_KEY_NAME_MAX_SIZE = 16 incl. null)
+  - On `certs_init()`: read all three keys from NVS into module-level static buffers declared as:
+    ```c
+    static char s_ca_cert[2048];
+    static char s_dev_cert[2048];
+    static char s_dev_key[2048];
+    ```
+    6 KB BSS total, always resident. If a key is absent the buffer holds an empty string and the compiled-in global is used as fallback. If flash cost becomes a concern, replace with heap-allocated `char *` pointers initialised to `NULL` on `certs_init()` and allocated only when the NVS key is found.
+  - `certs_get_ca()`, `certs_get_device_cert()`, `certs_get_device_key()` — return `const char *` pointing to the static buffer if `buffer[0] != '\0'`, otherwise return the compiled-in global directly. Pointers are stable for the device lifetime; callers must not free them.
+  - `certs_set_ca(const char *pem)`, `certs_set_device_cert(const char *pem)`, `certs_set_device_key(const char *pem)` — write to NVS via `nvs_set_str` + `nvs_commit`; do **not** update the cached static buffer (a reboot is required to reload)
+  - `certs_are_provisioned()` — per-cert check; returns true only if every getter returns a non-empty string:
+    ```c
+    return certs_get_ca()[0]          != '\0'
+        && certs_get_device_cert()[0] != '\0'
+        && certs_get_device_key()[0]  != '\0';
+    ```
+    A mix of NVS-loaded and compiled-in certs correctly returns true.
+  - Remove `certs_port.h` — not needed; certs are infrastructure-to-infrastructure and need no domain port
+
+6C.2. Decouple `wifi_manager` from cert logic — extend `wifi_manager_start_provisioning` to accept caller-provided extra endpoints:
+  - Add to `wifi_manager.h`:
+    ```c
+    typedef struct {
+        const char              *name;
+        protocomm_req_handler_t  handler;
+        void                    *ctx;
+    } wifi_prov_extra_endpoint_t;
+
+    esp_err_t wifi_manager_start_provisioning(
+        const char                       *device_name,
+        const char                       *pop,
+        const wifi_prov_extra_endpoint_t *extra_endpoints,
+        size_t                            num_extra_endpoints);
+    ```
+  - Inside `wifi_manager_start_provisioning`: iterate `extra_endpoints`, call `wifi_prov_mgr_endpoint_create(ep->name)` for each before `wifi_prov_mgr_start_provisioning()`, then `wifi_prov_mgr_endpoint_register(ep->name, ep->handler, ep->ctx)` for each after start
+  - `wifi_manager` gains no dependency on `certs` or `device_config`; `app_main` owns the endpoint descriptors
+
+6C.3. Implement `cert_prov_handler` — chunked transfer inside the encrypted session:
+  - `cert_prov_handler` is a `protocomm_req_handler_t` (signature: `esp_err_t handler(uint32_t session_id, const uint8_t *inbuf, ssize_t inlen, uint8_t **outbuf, ssize_t *outlen, void *priv_data)`); responses are written into `*outbuf`/`*outlen` (the protocomm response buffer) — not GATT notifications
+  - Handler state machine (`IDLE → RECEIVING → DONE`), with `bool *out_written` injected via `priv_data`:
+
+    | State | Write received | Action | Response written to `*outbuf` |
+    |---|---|---|---|
+    | IDLE | first chunk (≥ 4 bytes) | read big-endian `total_len` from bytes 0–3; if `total_len > 8192` reject immediately; else `malloc(total_len+1)`, copy bytes 4+ | `{"complete":false}` |
+    | IDLE | first chunk < 4 bytes | — | `{"ok":false,"error":"bad header"}` |
+    | RECEIVING | continuation chunk | append to buffer | `{"complete":false}` |
+    | RECEIVING | fill == total_len (last chunk) | null-terminate; parse JSON; call `certs_set_*` for each present field; free buffer; set `*out_written = true` | `{"ok":true}` or `{"ok":false,"error":"…"}` |
+    | RECEIVING | oversize / OOM | free buffer; reset to IDLE | `{"ok":false,"error":"overflow"}` |
+
+  - On BLE disconnect before last chunk: free buffer, reset to IDLE, no NVS write (`priv_data` flag not set)
+  - **Accepted JSON payload** (all fields optional; absent fields leave existing NVS values unchanged):
+    ```json
+    {"ca_cert":"-----BEGIN CERTIFICATE-----\n…","dev_cert":"…","dev_key":"…"}
+    ```
+  - The client must wait for each protocomm response before sending the next chunk
+
+6C.4. Register endpoints and own write flags in `app_main`:
+  - `app_main` declares and owns both flags:
+    ```c
+    static bool s_certs_written  = false;
+    static bool s_config_written = false;
+    ```
+  - Build the endpoint array and pass it to `wifi_manager_start_provisioning`:
+    ```c
+    wifi_prov_extra_endpoint_t extra[] = {
+        { "cert-prov", cert_prov_handler,    &s_certs_written  },
+        { "dev-cfg",   dev_cfg_prov_handler, &s_config_written },
+    };
+    esp_err_t prov_err = wifi_manager_start_provisioning(
+        "AMBYTE", "ambyte123", extra, 2);
+    ```
+  - `dev_cfg_prov_handler` is a thin wrapper that calls `device_config_set_*` for each present JSON field and sets `*(bool *)priv_data = true` on success
+  - Both handlers are defined in `app_main.c`; no cert or config logic moves into `wifi_manager`
+
+6C.5. Decouple `mqtt_client` from `certs` — pass PEM pointers through config:
+  - Extend `mqtt_client_config_t` with three new fields:
+    ```c
+    const char *ca_cert_pem;     /* NULL → no TLS */
+    const char *device_cert_pem; /* NULL → no client auth */
+    const char *device_key_pem;  /* NULL → no client auth */
+    ```
+  - `mqtt_client_init()` reads TLS config from these fields instead of referencing `aws_*_pem` globals directly; the `certs_are_provisioned()` gate is replaced by a NULL check on `ca_cert_pem`
+  - `mqtt_client` no longer REQUIRES `certs`; remove `certs` from `mqtt_client/CMakeLists.txt`
+  - `app_main` calls `certs_get_ca()`, `certs_get_device_cert()`, `certs_get_device_key()` and populates `mqtt_client_config_t` before calling `mqtt_client_init()`
+
+6C.6. Single reboot at provisioning session end:
+  - After `wifi_manager_start_provisioning()` returns, check the return value and the write flags:
+    ```c
+    bool any_write = s_certs_written || s_config_written;
+    bool prov_ok   = (prov_err == ESP_OK);
+    if (prov_ok || any_write) {
+        // prov_ok: Wi-Fi creds written; reboot to connect with new credentials
+        // any_write: cert or config written before timeout; reboot to load new NVS values
+        esp_restart();
+    }
+    // else: timed out with zero writes → continue without rebooting
+    ```
+  - This covers both the success path and the edge case where cert/config were written but the session timed out before Wi-Fi credentials were sent
+
+6C.7. CLI cert status via `device_commands`:
+  - Add `certs_status_fn` function pointer to `device_commands_config_t`:
+    ```c
+    typedef bool (*certs_status_fn)(void); /* wraps certs_are_provisioned() */
+    ```
+  - Add `cmd_cert_status()` to `device_commands` — calls `s_cfg.certs_status` and returns a `cmd_result_t` describing whether NVS-backed certs are present
+  - CLI calls `cmd_cert_status()` — CLI never references `certs` directly
+  - `app_main` wires `certs_are_provisioned` into `device_commands_config_t.certs_status`
+  - Update `WIFI_MANAGER_PROV_TIMEOUT_MS` in `wifi_manager.c` to `120000`
+
+**Verification:** Flash device with empty `certs.c` stubs. Over BLE provisioning (using ESP's provisioning app or `esp_prov` CLI tool), send Wi-Fi credentials to the standard endpoint, device-config JSON to `"dev-cfg"`, and cert JSON to `"cert-prov"`. Confirm single reboot occurs after session. Confirm MQTT connects with TLS to AWS IoT Core on next boot. Run `cert status` CLI command to confirm NVS-backed certs are reported. Test edge case: send only cert JSON then let session time out — confirm single reboot still occurs.
 
 ---
 
@@ -729,8 +986,8 @@ ESP32-S3 has 2 cores. Pin tasks to specific cores to minimize blocking:
 |---|---|---|
 | **Sensing** | Measurement, SensorReading, SensorId | `bme280/`, `pcf2131tfy_rtc/`, `uart_sensors/` (new) |
 | **Connectivity** | Connection, NetworkCredentials, Provisioning | `wifi_manager/` (incl. BLE provisioning), `certs/` |
-| **Messaging** | Message, Topic, Subscription | `mqtt_client/` (new) |
-| **Persistence** | MeasurementLog, MeasurementRecord | `persistence/` (new, LittleFS WAL + SQLite on SD card), `sd_card/` (FAT I/O), `sqlite3` |
+| **Messaging** | Message, Topic, PublishResult, Subscription | `mqtt_client/` (new), `device_config/` |
+| **Persistence** | MeasurementLog, MeasurementHeader, MeasurementRecord | `persistence/` (new, LittleFS WAL + SQLite on SD card), `sd_card/` (FAT I/O), `sqlite3` |
 | **Automation** | Script, MeasurementJob | `lua_runner/`, `lua/` |
 | **Device Management** | DeviceStatus, Command | `CLI/`, `ambyte_status/` |
 
@@ -743,7 +1000,7 @@ ESP32-S3 has 2 cores. Pin tasks to specific cores to minimize blocking:
 - [components/CLI/CMakeLists.txt](components/CLI/CMakeLists.txt) — Remove direct sensor PRIV_REQUIRES (Phase 3C)
 - [components/CLI/CLI.c](components/CLI/CLI.c) — Rewrite to call `cmd_*()` directly, keep only `i2cscan` native (Phase 3C)
 - [components/lua_runner/CMakeLists.txt](components/lua_runner/CMakeLists.txt) — Remove direct component REQUIRES (Phase 3B)
-- [components/lua_runner/lua_runner.c](components/lua_runner/lua_runner.c) — Remove old sd.*/status.* bindings, add device.*/db.* bindings via cmd_*() (Phase 3B)
+- [components/lua_runner/lua_runner.c](components/lua_runner/lua_runner.c) — Remove old sd.*/status.* bindings, add device.*/db.* bindings via cmd_*(), and expose no manual sync-state mutation API (Phase 3B)
 - [components/bme280/CMakeLists.txt](components/bme280/CMakeLists.txt) — Remove I2C_device + Arduino deps (Phase 0B), add `REQUIRES domain` (Phase 2.1)
 - [components/bme280/bme280_arduino_shim.cpp](components/bme280/bme280_arduino_shim.cpp) — Rename to `bme280_driver.cpp`, refactor to use i2c_bus directly (Phase 0B)
 - [components/bme280/BME280.cpp](components/bme280/BME280.cpp) — Rewrite I2C primitives (write8/read8/read16/read24/begin), replace Arduino functions (Phase 0B)
@@ -751,7 +1008,9 @@ ESP32-S3 has 2 cores. Pin tasks to specific cores to minimize blocking:
 - [components/pcf2131tfy_rtc/CMakeLists.txt](components/pcf2131tfy_rtc/CMakeLists.txt) — Add `REQUIRES domain` (Phase 2.2)
 - [components/pcf2131tfy_rtc/include/RTC_NXP.h](components/pcf2131tfy_rtc/include/RTC_NXP.h) — Move to source directory (Phase 0C)
 - [components/I2C_device/](components/I2C_device/) — DELETE entire component (Phase 0B)
-- [components/wifi_manager/](components/wifi_manager/) — Extend with BLE provisioning (Phase 5), add `PRIV_REQUIRES wifi_provisioning protocomm bt`
+- [components/wifi_manager/](components/wifi_manager/) — Extend with BLE Wi-Fi provisioning only (Phase 5A), add `PRIV_REQUIRES wifi_provisioning protocomm bt`
+- `components/device_config/` — NVS-backed runtime MQTT and channel metadata store (Phase 5B / 6B)
+- `components/mqtt_client/Kconfig.projbuild` — compile-time MQTT config carrier for Phase 6A (`CONFIG_AMBYTE_DEVICE_ID`, `CONFIG_AMBYTE_MQTT_URI`, `CONFIG_AMBYTE_MQTT_CLIENT_ID`, `CONFIG_AMBYTE_MQTT_TOPIC_ROOT`)
 - [components/sd_card/sd_card.c](components/sd_card/sd_card.c) — Text-file functions removed in Phase 3C.3 (after Lua/CLI rewired); SQLite DB lives on SD card
 
 **New files to create:**
@@ -760,7 +1019,7 @@ ESP32-S3 has 2 cores. Pin tasks to specific cores to minimize blocking:
 - `components/domain/include/sensing_port.h` — Sensing contracts
 - `components/domain/include/persistence_port.h` — Persistence contracts (SQLite repository pattern, fixed-size char[32] fields)
 - `components/domain/include/device_status_port.h` — Status contracts
-- `components/domain/include/messaging_port.h` — MQTT publish/subscribe contracts (Phase 6)
+- `components/domain/include/messaging_port.h` — MQTT publish / ack / status contracts (Phase 6A), subscribe contracts added in Phase 6B
 - `components/domain/include/uart_sensor_port.h` — UART query/response contracts (Phase 7)
 - `components/sqlite3/` — Git submodule of `siara-cc/esp32-idf-sqlite3` (Phase 2.3) — with VFS shim fix for `esp32_Sync()`
 - `components/littlefs/` — `joltwallet/littlefs` from ESP Component Registry (Phase 2.3)
@@ -772,7 +1031,11 @@ ESP32-S3 has 2 cores. Pin tasks to specific cores to minimize blocking:
 - `components/device_commands/CMakeLists.txt` — Shared command layer, REQUIRES `domain` only
 - `components/device_commands/device_commands.c` — All `cmd_*` implementations + `device_commands_config_t` struct aggregating all ports
 - `components/device_commands/include/device_commands.h` — `cmd_result_t` + `device_commands_config_t` + all command signatures
-- `components/mqtt_client/` — ESP-MQTT wrapper with TLS (Phase 6)
+- `components/device_config/CMakeLists.txt` — NVS-backed runtime config component (Phase 5B / 6B)
+- `components/device_config/device_config.c` — reads/writes MQTT runtime config and later channel metadata in NVS (Phase 5B / 6B)
+- `components/device_config/include/device_config.h` — device config API (Phase 5B / 6B)
+- `components/mqtt_client/Kconfig.projbuild` — compile-time MQTT config carrier for 6A
+- `components/mqtt_client/` — ESP-MQTT wrapper with TLS, publish ack translation, and later subscribe support (Phase 6A / 6B)
 - `components/uart_sensors/` — 4-channel UART sensor manager, Core 1 tasks (Phase 7)
 - `components/mp2731/` — MP2731 battery charger I2C driver (Phase 8)
 
@@ -810,8 +1073,12 @@ ESP32-S3 has ~512KB total SRAM, of which ~320KB is available after ESP-IDF + WiF
 7. **Robustness checks**: Pull SDA low with jumper wire → device should recover via `i2c_bus_check_and_recover()` and log, not hang
 8. Remove SD card during operation → new measurements continue accumulating in LittleFS pending buffer, `cmd_query` returns `ESP_ERR_NOT_SUPPORTED`, device continues operating. Re-insert SD card → flush task drains pending records to SQLite within 5s.
 9. Disconnect BME280 mid-operation → `device.read_env()` returns error, device continues operating
-10. Monitor `esp_get_minimum_free_heap_size()` across a full boot+provision+measure cycle → stays above 32KB
-11. Verify `uxTaskGetStackHighWaterMark()` for Lua task reports >1KB remaining after first script execution
+10. After Phase 6A: publish one measurement group and verify the header transitions `PENDING -> INFLIGHT -> SYNCED`, never directly to `SYNCED` before MQTT acknowledgment
+11. After Phase 6A: disconnect Wi-Fi after queueing a publish but before ack and verify the measurement header returns to `PENDING` for retry
+12. After Phase 6A: call `cmd_mqtt_publish_unsynced()` twice before the first publish is acknowledged and verify the second call does not claim or queue another measurement
+13. After Phase 6B: send a fragmented inbound MQTT payload and verify it is reassembled into a single logical command callback
+14. Monitor `esp_get_minimum_free_heap_size()` across a full boot+provision+measure cycle → stays above 32KB
+15. Verify `uxTaskGetStackHighWaterMark()` for Lua task reports >1KB remaining after first script execution
 
 ---
 
@@ -831,21 +1098,23 @@ ESP32-S3 has ~512KB total SRAM, of which ~320KB is available after ESP-IDF + WiF
 - **Device-prefixed measureID**: `measureID` includes a device ID prefix for future multi-device support.
 - **Misc files moved to `docs/`**: `AI prompts.txt`, `MQTT TLS test client.py`, `overall_architecture.txt` moved to `docs/` folder.
 - **Excluded**: Event-driven pub/sub between bounded contexts. Can be layered on later.
+- **MQTT rollout split into 6A and 6B**: 6A is outbound telemetry only. 6B adds subscribe, inbound command handling, and optional custom BLE-backed runtime device configuration. This keeps the first MQTT milestone shippable and avoids blocking on command parsing or custom provisioning.
 - **MQTT v5**: Already enabled in sdkconfig. Uses ESP-MQTT with mutual TLS to AWS IoT Core.
-- **BLE provisioning inside wifi_manager**: No separate `ble_provisioning/` component. `wifi_manager` gains `wifi_manager_is_provisioned()` and `wifi_manager_start_provisioning()` — BLE code is private (`PRIV_REQUIRES bt`). Consumers never see BLE types. A **custom mobile app** will be developed (stock Espressif apps don't support custom endpoints for device config).
+- **BLE provisioning inside wifi_manager**: No separate `ble_provisioning/` component. `wifi_manager` gains `wifi_manager_is_provisioned()` and `wifi_manager_start_provisioning()` — BLE code is private (`PRIV_REQUIRES bt`). Consumers never see BLE types. Phase 5A covers Wi-Fi credentials only.
 - **Dual-core split**: Core 0 = WiFi/MQTT/data. Core 1 = Lua/CLI/UART sensors. Prevents 2-min UART queries from blocking networking.
 - **4 UART channels on 3 HW UARTs**: GPIO matrix remap for 4th channel (sequential queries allow time-sharing). No extra hardware needed.
 - **domain/ REQUIRES esp_common only**: Needed for `esp_err_t` type. This is purely type definitions — no infrastructure dependency. Domain stays header-only (no .c files).
-- **measurement_record_t uses fixed-size char[32] arrays + synced bool**: No heap allocation, no ownership ambiguity. SQLite callbacks `strncpy` directly into fields. `synced` field tracks MQTT upload status. ~92 bytes per struct, queries capped at 64 records.
+- **Flat persistence schema (single table)**: A single `measurements` table holds all columns per row — no split `measurement_headers`/`measurement_values` tables. `measurement_record_t` is the only struct; `sync_state` is stored on every row of a logical group (denormalized). `mark_inflight`/`mark_pending`/`mark_synced` UPDATE all rows for a given `measureID`. Trade-off: group metadata is duplicated across rows of the same measurement, but this eliminates JOIN complexity and simplifies both the write path and the pending store.
 - **CLI and Lua both call `device_commands` directly**: Both CLI and Lua tasks call `cmd_*` functions directly. Thread safety provided by per-resource mutexes (I2C bus lock, SQLite mutex). No FreeRTOS queue or IPC between CLI and Lua — they operate independently. CLI remains responsive during Lua script execution. `i2cscan` stays native in CLI, not in device_commands or Lua.
 - **Query result buffers heap-allocated**: Caller `malloc`s the buffer, passes to `cmd_query_measurements`, then `free`s. Avoids stack overflow in 4KB task stacks. Default max 64 records → ~5.9KB heap allocation.
-- **device_commands_init() takes a config struct**: `device_commands_config_t` aggregates port function pointers. Struct grows incrementally per phase: Phase 3 has Phase 2 ports only; Phase 6 adds `message_publish_fn`; Phase 7 adds `uart_sensor_query_fn`; Phase 8 adds `power_read_fn`. NULL fields mean "not available" → `ESP_ERR_NOT_SUPPORTED`. Port requirements per command documented (e.g., `cmd_store_measurement` needs only `store`, not `read_env` or `read_clock`).
-- **cmd_store_measurement takes data as input**: Receives `measurement_record_t *records, size_t count` — does NOT read sensors internally. Caller responsible for assembling records from `device.read_env()` + `device.read_rtc()` + `db.next_id()`. Enables any sensor type to use the same store function.
+- **device_commands_init() takes a config struct**: `device_commands_config_t` aggregates port function pointers. Struct grows incrementally per phase: Phase 3 has Phase 2 ports only; Phase 6A adds `message_publish_fn`, `message_is_connected_fn`, and `message_set_publish_ack_handler_fn`; Phase 6B adds `message_subscribe_fn`; Phase 7 adds `uart_sensor_query_fn`; Phase 8 adds `power_read_fn`. NULL fields mean "not available" → `ESP_ERR_NOT_SUPPORTED`. Port requirements per command documented (e.g., `cmd_store_measurement` needs only `store`, not `read_env` or `read_clock`).
+- **cmd_store_measurement takes flat records**: Receives `const measurement_record_t *records, size_t count` — does NOT read sensors internally. Caller responsible for assembling all rows from `device.read_env()` + `device.read_rtc()` + `db.next_id()` and filling `data_type`/`value` per row. Enables any sensor type to use the same store function.
 - **SQLite access serialized by dedicated mutex**: `s_sqlite_mutex` in `sqlite_persistence.c`, separate from SD mount mutex and LittleFS pending mutex. Only the flush task and query commands access SQLite. Prevents Core 0 / Core 1 concurrent DB corruption.
 - **sensing_ctx_t folded into device_commands_config_t**: No `sensing_service.h` in domain/. Port aggregation is application-layer concern, lives in `device_commands/`.
 - **SD card required for persistence (64GB, FAT32)**: `sdcard_init_default()` + `sdcard_mount()` called in `app_main`. SQLite DB at `/sdcard/measurements.db`. If SD absent, new measurements accumulate in LittleFS pending buffer (up to ~28 hours at typical rates). Queries require SD card. `sd_card_is_available()` public API for Lua scripts.
 - **PCF2131 RTC hierarchy preserved**: All features (alarm, timestamp, periodic interrupt, watchdog) kept. Only change: `RTC_NXP.h` moved from `include/` to source directory (privatized). No source files deleted.
 - **Lua `sd.*` API explicitly removed in Phase 3B**: Old `status.*` and `sd.*` module registrations deleted. Replaced by `device.*`/`db.*` API. Embedded script updated. Breaking change for user scripts using old API.
+- **No public manual sync-state mutation command**: Neither Lua nor CLI exposes `mark_synced`. Scripts can inspect pending groups and request publish, but MQTT acknowledgment remains the only normal path to `SYNCED`.
 - **Lua task lifecycle stays one-shot**: VM is created, runs script, then destroyed. Does NOT stay alive permanently since CLI calls `cmd_*` directly (no queue dispatch needed). This saves ~30-50KB heap when no script is running. Error recovery: `lua_pcall` failure → log + return error; VM destruction handles cleanup.
 - **sdkconfig.defaults tracked in git**: Removed from `.gitignore` — defines project build defaults that must be version-controlled.
 - **BLE deinit uses `FREE_BLE` not `FREE_BTDM`**: ESP32-S3 has a separate BLE controller (not combined BTDM like ESP32). `WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE` is the correct handler.
@@ -861,13 +1130,17 @@ ESP32-S3 has ~512KB total SRAM, of which ~320KB is available after ESP-IDF + WiF
 - **SD card mount retry**: Retry once after 500ms on mount failure (warm-up). `sd_card_is_available()` public API. If SD unavailable, new measurements continue accumulating in LittleFS pending buffer. Queries return `ESP_ERR_NOT_SUPPORTED` until SD card is available.
 - **UART sensor task not WDT-registered**: Designed to block up to 2 minutes; WDT monitoring counterproductive. Caller detects hangs via response timeout.
 - **UART auto-ping at boot**: Each configured channel pinged (2s timeout) at startup; results in hardware inventory.
-- **Data sync via `synced` column**: Measurements stored with `synced = 0`. MQTT publish sets `synced = 1`. `db.unsynced(type)` queries pending records. `cmd_mqtt_publish_unsynced()` batch-publishes and marks synced. Enables reliable data upload with at-least-once semantics.
+- **Data sync via `measurements.syncState` (three-state enum)**: `MEASUREMENT_SYNC_PENDING=0`, `MEASUREMENT_SYNC_INFLIGHT=1`, `MEASUREMENT_SYNC_SYNCED=2`. Rows start as `PENDING`, move to `INFLIGHT` when a publish is successfully queued, and become `SYNCED` only after `MQTT_EVENT_PUBLISHED`. `device_commands` keeps a single in-flight publish slot (`s_inflight_msg_id` ↔ `s_inflight_measure_id`); raw `cmd_mqtt_publish` calls never occupy this slot, and unknown `msg_id` acks are ignored. Durable state lives in SQLite. On disconnect or reboot recovery, stale `INFLIGHT` rows are reset to `PENDING`. This is the basis for at-least-once delivery without requeue storms.
+- **Measurement-oriented MQTT commands are fixed-contract**: `cmd_mqtt_publish_measurement()` and `cmd_mqtt_publish_unsynced()` derive topics internally from `CONFIG_AMBYTE_MQTT_TOPIC_ROOT`, `CONFIG_AMBYTE_DEVICE_ID`, `measure_type`, and `measure_id`. Only `cmd_mqtt_publish(topic, payload)` remains free-form.
 - **SD card text-file functions removed in Phase 3C**: Deferred until after both Lua (3B) and CLI (3C) are rewired to `device_commands`. Prevents breakage of `sd.append()` Lua binding during transition.
-- **BLE provisioning (Phase 5) before MQTT (Phase 6)**: WiFi credentials must be provisioned before MQTT can connect. Phase ordering reflects this dependency.
+- **Phase 6A uses a compile-time MQTT config carrier**: `CONFIG_AMBYTE_DEVICE_ID`, `CONFIG_AMBYTE_MQTT_URI`, `CONFIG_AMBYTE_MQTT_CLIENT_ID`, and `CONFIG_AMBYTE_MQTT_TOPIC_ROOT` define the entire 6A MQTT identity/config surface. Runtime `device_config` is deferred to Phase 6B.
+- **`app_main` owns the MQTT supervisor**: It subscribes directly to `IP_EVENT_STA_GOT_IP` and `WIFI_EVENT_STA_DISCONNECTED`, but those handlers only notify a dedicated supervisor task. The supervisor task alone initializes, starts, and stops MQTT, and it also reverts stale in-flight publishes when Wi-Fi drops.
 - **Sensor liveness via Lua scripts**: `device.read_env()` returns nil+error on I2C failure. Periodic health checks are a Lua script concern, not additional C code.
 - **sdkconfig safety for field deployment**: `CONFIG_ESP_TASK_WDT_PANIC=y` (reboot on hang), `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y` (post-mortem), `CONFIG_HEAP_POISONING_LIGHT=y` (corruption detection), `CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y` (stack instrumentation). 64KB coredump partition in `partitions.csv`.
-- **CLI uses `esp_console` without built-in REPL**: Commands registered via `esp_console_cmd_register()`, dispatched via `esp_console_run()`. CLI task owns its own `fgets`-based read loop — does NOT use `esp_console_start_repl()` or `esp_console_new_repl_*()`. Provides line editing, history, and tab completion for field debugging. Each command handler calls `cmd_*()` directly.
-- **Channel metadata stored in NVS**: AMBIT channel sensor names and MQTT broker config stored in NVS namespace `"device_cfg"` (internal flash), not in SQLite on SD card. Survives SD card removal. Provisioned via BLE custom endpoint (Phase 5), read from NVS on subsequent boots.
+- **CLI uses `esp_console` with the built-in REPL**: Commands are registered via `esp_console_cmd_register()`, and shell lifecycle is handled by `esp_console_new_repl_*()` plus `esp_console_start_repl()`. This preserves line editing, history, and tab completion while keeping each command handler as a direct `cmd_*()` call.
+- **Device configuration stored in NVS via `device_config`**: MQTT broker config and later AMBIT channel sensor names live in NVS namespace `"device_cfg"` (internal flash), not in SQLite on SD card. This survives SD card removal. The custom BLE endpoint that writes these values is deferred to Phase 6B. Phase 6A does not consult `device_config`.
+- **One MQTT payload per logical measurement**: Telemetry is serialized per `measure_id`, not per row. Each payload contains one logical measurement group with an array of `{ data_type, value }`.
+- **Inbound MQTT payload reassembly lives in `mqtt_client`**: ESP-MQTT may emit multiple `MQTT_EVENT_DATA` chunks for one message. `mqtt_client` reassembles them before calling higher-level handlers in Phase 6B.
 - **cmd_result_t message[256]**: Human-readable result or error text. Used by both CLI (prints directly) and Lua (returns as string).
 
 ---
