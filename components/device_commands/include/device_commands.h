@@ -57,6 +57,13 @@ typedef struct {
 
     /* Cert status (Phase 6C) */
     certs_status_fn                     certs_status;
+
+    /* Payload metadata (provisioned via BLE) */
+    const char                         *protocol_id;
+    const char                         *device_name;
+    const char                         *device_version;
+    const char                         *device_firmware;
+    const char                         *firmware_version;
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);

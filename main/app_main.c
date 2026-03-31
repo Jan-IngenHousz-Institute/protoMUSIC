@@ -181,10 +181,21 @@ static esp_err_t dev_cfg_prov_handler(uint32_t session_id,
     cJSON *topic  = cJSON_GetObjectItemCaseSensitive(root, "mqtt_topic_root");
     cJSON *dev_id = cJSON_GetObjectItemCaseSensitive(root, "device_id");
 
-    if (cJSON_IsString(uri)    && uri->valuestring)    device_config_set_mqtt_uri(uri->valuestring);
-    if (cJSON_IsString(cid)    && cid->valuestring)    device_config_set_mqtt_client_id(cid->valuestring);
-    if (cJSON_IsString(topic)  && topic->valuestring)  device_config_set_mqtt_topic_root(topic->valuestring);
-    if (cJSON_IsString(dev_id) && dev_id->valuestring) device_config_set_device_id(dev_id->valuestring);
+    cJSON *prot_id   = cJSON_GetObjectItemCaseSensitive(root, "protocol_id");
+    cJSON *dev_name  = cJSON_GetObjectItemCaseSensitive(root, "device_name");
+    cJSON *dev_ver   = cJSON_GetObjectItemCaseSensitive(root, "device_version");
+    cJSON *dev_firm  = cJSON_GetObjectItemCaseSensitive(root, "device_firmware");
+    cJSON *firm_ver  = cJSON_GetObjectItemCaseSensitive(root, "firmware_version");
+
+    if (cJSON_IsString(uri)      && uri->valuestring)      device_config_set_mqtt_uri(uri->valuestring);
+    if (cJSON_IsString(cid)      && cid->valuestring)      device_config_set_mqtt_client_id(cid->valuestring);
+    if (cJSON_IsString(topic)    && topic->valuestring)    device_config_set_mqtt_topic_root(topic->valuestring);
+    if (cJSON_IsString(dev_id)   && dev_id->valuestring)   device_config_set_device_id(dev_id->valuestring);
+    if (cJSON_IsString(prot_id)  && prot_id->valuestring)  device_config_set_protocol_id(prot_id->valuestring);
+    if (cJSON_IsString(dev_name) && dev_name->valuestring) device_config_set_device_name(dev_name->valuestring);
+    if (cJSON_IsString(dev_ver)  && dev_ver->valuestring)  device_config_set_device_version(dev_ver->valuestring);
+    if (cJSON_IsString(dev_firm) && dev_firm->valuestring) device_config_set_device_firmware(dev_firm->valuestring);
+    if (cJSON_IsString(firm_ver) && firm_ver->valuestring) device_config_set_firmware_version(firm_ver->valuestring);
 
     cJSON_Delete(root);
     if (priv_data != NULL) {
@@ -352,7 +363,7 @@ void app_main(void)
     }
 
     /* ── Resolve config: NVS first, Kconfig fallback ─────────────── */
-    char mqtt_uri[256], mqtt_client_id[64], topic_root[128], device_id[64];
+    char mqtt_uri[256], mqtt_client_id[64], topic_root[256], device_id[64];
     if (device_config_get_mqtt_uri(mqtt_uri, sizeof(mqtt_uri)) != ESP_OK) {
         strncpy(mqtt_uri, CONFIG_AMBYTE_MQTT_URI, sizeof(mqtt_uri) - 1);
         mqtt_uri[sizeof(mqtt_uri) - 1] = '\0';
@@ -368,6 +379,23 @@ void app_main(void)
     if (device_config_get_device_id(device_id, sizeof(device_id)) != ESP_OK) {
         strncpy(device_id, CONFIG_AMBYTE_DEVICE_ID, sizeof(device_id) - 1);
         device_id[sizeof(device_id) - 1] = '\0';
+    }
+    char protocol_id[32], device_name[64], device_version[16],
+         device_firmware[16], firmware_version[16];
+    if (device_config_get_protocol_id(protocol_id, sizeof(protocol_id)) != ESP_OK) {
+        protocol_id[0] = '\0';
+    }
+    if (device_config_get_device_name(device_name, sizeof(device_name)) != ESP_OK) {
+        device_name[0] = '\0';
+    }
+    if (device_config_get_device_version(device_version, sizeof(device_version)) != ESP_OK) {
+        device_version[0] = '\0';
+    }
+    if (device_config_get_device_firmware(device_firmware, sizeof(device_firmware)) != ESP_OK) {
+        device_firmware[0] = '\0';
+    }
+    if (device_config_get_firmware_version(firmware_version, sizeof(firmware_version)) != ESP_OK) {
+        firmware_version[0] = '\0';
     }
 
     /* ── MQTT Client ─────────────────────────────────────────────── */
@@ -516,6 +544,11 @@ void app_main(void)
         .topic_root             = topic_root,
         .device_id              = device_id,
         .certs_status           = certs_are_provisioned,
+        .protocol_id            = protocol_id,
+        .device_name            = device_name,
+        .device_version         = device_version,
+        .device_firmware        = device_firmware,
+        .firmware_version       = firmware_version,
     };
     device_commands_init(&cmd_cfg);
     device_commands_subscribe_inbound();

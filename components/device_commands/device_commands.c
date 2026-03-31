@@ -8,6 +8,7 @@
 #include "cJSON.h"
 
 #include "esp_log.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -15,6 +16,7 @@
 
 static device_commands_config_t s_cfg;
 static bool s_initialized = false;
+static char s_mac_str[18]; /* "XX:XX:XX:XX:XX:XX\0" */
 
 /* Single in-flight measurement publish slot — correlates QoS-1 ack to a measureID */
 static int64_t s_inflight_measure_id = -1;
@@ -63,6 +65,14 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
     }
     s_cfg = *cfg;
     s_initialized = true;
+
+    uint8_t mac[6];
+    if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
+        snprintf(s_mac_str, sizeof(s_mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    } else {
+        s_mac_str[0] = '\0';
+    }
 
     if (s_cfg.set_publish_ack_handler != NULL) {
         s_cfg.set_publish_ack_handler(on_publish_ack, NULL);
@@ -255,7 +265,7 @@ cmd_result_t cmd_mqtt_publish(const char *topic, const char *payload)
 
 /* ── helpers shared by the two publish commands ──────────────────── */
 
-#define MQTT_TOPIC_MAX   128
+#define MQTT_TOPIC_MAX   256
 #define MQTT_PAYLOAD_MAX 1024
 #define MQTT_RECORDS_MAX 8
 
@@ -278,35 +288,42 @@ static cmd_result_t build_and_publish(int64_t measure_id)
              records[0].measure_type,
              (long long)measure_id);
 
-    /* Build JSON: {"measure_id":…,"sensor_id":…,"measure_type":…,"timestamp":…,"values":{…}} */
-    char payload[MQTT_PAYLOAD_MAX];
-    int pos = snprintf(payload, sizeof(payload),
-                       "{\"measure_id\":%lld,\"sensor_id\":%lld,\"measure_type\":\"%s\","
-                       "\"timestamp\":%lld,\"values\":{",
-                       (long long)records[0].measure_id,
-                       (long long)records[0].sensor_id,
-                       records[0].measure_type,
-                       (long long)records[0].timestamp);
-
+    /* Build set[] array: [{"key":"<data_type>","value":<float>}, …] */
+    char set_buf[512];
+    int sp = 0;
     for (size_t i = 0; i < count; i++) {
-        if (i > 0) {
-            if (pos + 1 >= (int)sizeof(payload) - 3) break;
-            payload[pos++] = ',';
+        if (i > 0 && sp < (int)sizeof(set_buf) - 3) {
+            set_buf[sp++] = ',';
         }
-        /* Use actual written length, not would-be length, to avoid advancing pos past buffer */
-        int remaining = (int)sizeof(payload) - pos - 3; /* reserve room for "}}\0" */
-        if (remaining <= 0) break;
-        int n = snprintf(payload + pos, (size_t)remaining,
-                         "\"%s\":%.6g", records[i].data_type, (double)records[i].value);
-        if (n > 0 && n < remaining) {
-            pos += n;
+        int n = snprintf(set_buf + sp, sizeof(set_buf) - (size_t)sp,
+                         "{\"key\":\"%s\",\"value\":%.6g}",
+                         records[i].data_type, (double)records[i].value);
+        if (n > 0 && sp + n < (int)sizeof(set_buf)) {
+            sp += n;
         } else {
-            break; /* truncated — stop */
+            break;
         }
     }
-    payload[pos++] = '}';
-    payload[pos++] = '}';
-    payload[pos]   = '\0';
+    set_buf[sp] = '\0';
+
+    /* Build full payload */
+    char payload[MQTT_PAYLOAD_MAX];
+    int pos = snprintf(payload, sizeof(payload),
+                       "{\"sample\":[{\"protocol_id\":\"%s\",\"set\":[%s]}],"
+                       "\"device_firmware\":\"%s\","
+                       "\"device_id\":\"%s\","
+                       "\"device_name\":\"%s\","
+                       "\"device_version\":\"%s\","
+                       "\"firmware_version\":\"%s\","
+                       "\"timestamp\":%lld}",
+                       s_cfg.protocol_id      ? s_cfg.protocol_id      : "",
+                       set_buf,
+                       s_cfg.device_firmware  ? s_cfg.device_firmware  : "",
+                       s_mac_str,
+                       s_cfg.device_name      ? s_cfg.device_name      : "",
+                       s_cfg.device_version   ? s_cfg.device_version   : "",
+                       s_cfg.firmware_version ? s_cfg.firmware_version : "",
+                       (long long)records[0].timestamp * 1000LL);
 
     int msg_id = 0;
     err = s_cfg.publish(topic, payload, (size_t)pos, &msg_id);
@@ -485,7 +502,7 @@ void device_commands_subscribe_inbound(void)
         return;
     }
 
-    char topic[128];
+    char topic[MQTT_TOPIC_MAX];
     snprintf(topic, sizeof(topic), "%s/%s/cmd",
              s_cfg.topic_root ? s_cfg.topic_root : "",
              s_cfg.device_id  ? s_cfg.device_id  : "");

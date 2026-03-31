@@ -84,17 +84,25 @@ async def _send_raw(tp, sec, endpoint: str, payload: bytes) -> bytes:
 
 async def send_dev_cfg(tp, sec,
                        mqtt_uri: str, client_id: str,
-                       topic_root: str, device_id: str) -> None:
+                       topic_root: str, device_id: str,
+                       protocol_id: str, device_name: str,
+                       device_version: str, device_firmware: str,
+                       firmware_version: str) -> None:
     """
     Send MQTT runtime config to the 'dev-cfg' endpoint.
     Payload is a plain JSON object — always fits in a single BLE send.
     Device handler: dev_cfg_prov_handler in app_main.c.
     """
     payload = json.dumps({
-        "mqtt_uri":        mqtt_uri,
-        "mqtt_client_id":  client_id,
-        "mqtt_topic_root": topic_root,
-        "device_id":       device_id,
+        "mqtt_uri":         mqtt_uri,
+        "mqtt_client_id":   client_id,
+        "mqtt_topic_root":  topic_root,
+        "device_id":        device_id,
+        "protocol_id":      protocol_id,
+        "device_name":      device_name,
+        "device_version":   device_version,
+        "device_firmware":  device_firmware,
+        "firmware_version": firmware_version,
     }).encode()
 
     response = await _send_raw(tp, sec, "dev-cfg", payload)
@@ -184,10 +192,15 @@ async def run(args) -> None:
         # 3. MQTT device config (custom endpoint)
         print("[2/3] MQTT device config...")
         await send_dev_cfg(tp, sec,
-                           mqtt_uri   = args.mqtt_uri,
-                           client_id  = args.client_id,
-                           topic_root = args.topic_root,
-                           device_id  = args.device_id)
+                           mqtt_uri         = args.mqtt_uri,
+                           client_id        = args.client_id,
+                           topic_root       = args.topic_root,
+                           device_id        = args.device_id,
+                           protocol_id      = args.protocol_id,
+                           device_name      = args.device_name,
+                           device_version   = args.device_version,
+                           device_firmware  = args.device_firmware,
+                           firmware_version = args.firmware_version)
 
         # 4. TLS certificates (custom endpoint, chunked)
         print("[3/3] TLS certificates...")
@@ -220,6 +233,16 @@ def parse_args() -> argparse.Namespace:
                    help="MQTT topic root prefix (e.g. ambyte/prod)")
     p.add_argument("--device_id",   required=True,
                    help="Device ID embedded in MQTT topics (e.g. thing-001)")
+    p.add_argument("--protocol_id", required=True,
+                   help="MultispeQ protocol ID (e.g. 3517)")
+    p.add_argument("--device_name", required=True,
+                   help="Device name reported in payload (e.g. AmbyteOnAir)")
+    p.add_argument("--device_version", required=True,
+                   help="Device hardware version string (e.g. 1)")
+    p.add_argument("--device_firmware", required=True,
+                   help="Device firmware version string (e.g. 1)")
+    p.add_argument("--firmware_version", required=True,
+                   help="Firmware version string (e.g. 1)")
     p.add_argument("--ca_cert",     required=True,
                    help="Path to AWS root CA certificate PEM file")
     p.add_argument("--dev_cert",    required=True,

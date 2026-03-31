@@ -62,7 +62,7 @@ static int integrity_callback(void *arg, int ncols, char **values, char **names)
     return 0;
 }
 
-/* Rename legacy 'synced' column to 'syncState' if the old schema is present */
+/* Ensure the 'syncState' column exists, migrating from legacy names if needed */
 static void migrate_schema(void)
 {
     sqlite3_stmt *stmt = NULL;
@@ -71,28 +71,44 @@ static void migrate_schema(void)
         return;
     }
 
-    bool needs_rename = false;
+    bool has_synced    = false;
+    bool has_syncState = false;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *col = (const char *)sqlite3_column_text(stmt, 1);
-        if (col && strcmp(col, "synced") == 0) {
-            needs_rename = true;
-            break;
-        }
+        if (col == NULL) continue;
+        if (strcmp(col, "synced")    == 0) has_synced    = true;
+        if (strcmp(col, "syncState") == 0) has_syncState = true;
     }
     sqlite3_finalize(stmt);
 
-    if (!needs_rename) {
-        return;
+    if (has_syncState) {
+        return; /* already correct */
     }
 
     char *err = NULL;
+    if (has_synced) {
+        rc = sqlite3_exec(s_db,
+                          "ALTER TABLE measurements RENAME COLUMN synced TO syncState;",
+                          NULL, NULL, &err);
+        if (rc != SQLITE_OK) {
+            ESP_LOGE(TAG, "Schema migration (rename) failed: %s", err ? err : "");
+        } else {
+            ESP_LOGI(TAG, "Migrated schema: column 'synced' -> 'syncState'");
+            sqlite3_free(err);
+            return;
+        }
+        sqlite3_free(err);
+        err = NULL;
+    }
+
+    /* syncState missing and rename not possible — add the column */
     rc = sqlite3_exec(s_db,
-                      "ALTER TABLE measurements RENAME COLUMN synced TO syncState;",
+                      "ALTER TABLE measurements ADD COLUMN syncState INTEGER NOT NULL DEFAULT 0;",
                       NULL, NULL, &err);
     if (rc != SQLITE_OK) {
-        ESP_LOGE(TAG, "Schema migration failed: %s", err ? err : "");
+        ESP_LOGE(TAG, "Schema migration (add column) failed: %s", err ? err : "");
     } else {
-        ESP_LOGI(TAG, "Migrated schema: column 'synced' -> 'syncState'");
+        ESP_LOGI(TAG, "Schema migration: added 'syncState' column with DEFAULT 0");
     }
     sqlite3_free(err);
 }
@@ -216,10 +232,13 @@ static esp_err_t flush_batch_to_sqlite(const pending_entry_t *entries, size_t co
 
     char *err_msg = NULL;
     int rc = sqlite3_exec(s_db, "BEGIN TRANSACTION;", NULL, NULL, &err_msg);
-    sqlite3_free(err_msg);
     if (rc != SQLITE_OK) {
+        ESP_LOGE(TAG, "BEGIN TRANSACTION failed (%d): %s",
+                 rc, err_msg ? err_msg : sqlite3_errmsg(s_db));
+        sqlite3_free(err_msg);
         return ESP_FAIL;
     }
+    sqlite3_free(err_msg);
 
     const char *insert_sql =
         "INSERT OR REPLACE INTO measurements "
@@ -229,6 +248,7 @@ static esp_err_t flush_batch_to_sqlite(const pending_entry_t *entries, size_t co
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(s_db, insert_sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
+        ESP_LOGE(TAG, "prepare_v2 failed (%d): %s", rc, sqlite3_errmsg(s_db));
         sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
         return ESP_FAIL;
     }
@@ -255,9 +275,14 @@ static esp_err_t flush_batch_to_sqlite(const pending_entry_t *entries, size_t co
     sqlite3_finalize(stmt);
 
     rc = sqlite3_exec(s_db, "COMMIT;", NULL, NULL, &err_msg);
+    if (rc != SQLITE_OK) {
+        ESP_LOGE(TAG, "COMMIT failed (%d): %s",
+                 rc, err_msg ? err_msg : sqlite3_errmsg(s_db));
+        sqlite3_free(err_msg);
+        return ESP_FAIL;
+    }
     sqlite3_free(err_msg);
-
-    return (rc == SQLITE_OK) ? ESP_OK : ESP_FAIL;
+    return ESP_OK;
 }
 
 static void drain_pending_to_sqlite(void)

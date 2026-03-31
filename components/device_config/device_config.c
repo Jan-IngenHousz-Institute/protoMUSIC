@@ -12,6 +12,11 @@
 #define KEY_MQTT_CLIENT_ID  "mqtt_client_id"
 #define KEY_MQTT_TOPIC_ROOT "mqtt_topic_root"
 #define KEY_DEVICE_ID       "device_id"
+#define KEY_PROTOCOL_ID     "protocol_id"
+#define KEY_DEVICE_NAME     "device_name"
+#define KEY_DEVICE_VERSION  "device_ver"
+#define KEY_DEVICE_FIRMWARE "device_firm"
+#define KEY_FIRMWARE_VER    "firmware_ver"
 
 static nvs_handle_t s_handle    = 0;
 static bool         s_initialized = false;
@@ -81,4 +86,54 @@ esp_err_t device_config_get_device_id(char *buf, size_t len)
 esp_err_t device_config_set_device_id(const char *val)
 {
     return cfg_set(KEY_DEVICE_ID, val);
+}
+
+esp_err_t device_config_get_protocol_id(char *buf, size_t len)
+{
+    return cfg_get(KEY_PROTOCOL_ID, buf, len);
+}
+
+esp_err_t device_config_set_protocol_id(const char *val)
+{
+    return cfg_set(KEY_PROTOCOL_ID, val);
+}
+
+esp_err_t device_config_get_device_name(char *buf, size_t len)
+{
+    return cfg_get(KEY_DEVICE_NAME, buf, len);
+}
+
+esp_err_t device_config_set_device_name(const char *val)
+{
+    return cfg_set(KEY_DEVICE_NAME, val);
+}
+
+esp_err_t device_config_get_device_version(char *buf, size_t len)
+{
+    return cfg_get(KEY_DEVICE_VERSION, buf, len);
+}
+
+esp_err_t device_config_set_device_version(const char *val)
+{
+    return cfg_set(KEY_DEVICE_VERSION, val);
+}
+
+esp_err_t device_config_get_device_firmware(char *buf, size_t len)
+{
+    return cfg_get(KEY_DEVICE_FIRMWARE, buf, len);
+}
+
+esp_err_t device_config_set_device_firmware(const char *val)
+{
+    return cfg_set(KEY_DEVICE_FIRMWARE, val);
+}
+
+esp_err_t device_config_get_firmware_version(char *buf, size_t len)
+{
+    return cfg_get(KEY_FIRMWARE_VER, buf, len);
+}
+
+esp_err_t device_config_set_firmware_version(const char *val)
+{
+    return cfg_set(KEY_FIRMWARE_VER, val);
 }

@@ -10,7 +10,7 @@
 
 #define TAG                  "mqtt_client"
 #define MQTT_MAX_SUBSCRIPTIONS 8
-#define MQTT_TOPIC_BUF_SIZE  128
+#define MQTT_TOPIC_BUF_SIZE  256
 
 typedef struct {
     char               topic[MQTT_TOPIC_BUF_SIZE];
@@ -228,6 +228,9 @@ esp_err_t mqtt_client_init(const mqtt_client_config_t *cfg)
                 .certificate = tls_ok ? cfg->device_cert_pem : NULL,
                 .key         = tls_ok ? cfg->device_key_pem  : NULL,
             },
+        },
+        .session = {
+            .protocol_ver = MQTT_PROTOCOL_V_5,
         },
     };
 
