@@ -1,0 +1,294 @@
+Phase 6 Hardware Test Plan
+===========================
+
+Prerequisites
+-------------
+- Serial monitor running (USB Serial JTAG, 115200 baud)
+- AWS IoT Core console open -> MQTT test client subscribed to #
+- esp_prov CLI tool or ESP BLE Provisioning Android/iOS app available
+- Three certificate files ready from AWS IoT Core thing creation: ca.pem, device.crt, device.key
+- mosquitto_pub or a Python script available for publishing to the inbound command topic
+
+Flash commands (PlatformIO — run from project root):
+  pio run -t erase       (equivalent to idf.py erase_flash)
+  pio run -t upload      (equivalent to idf.py flash)
+  pio device monitor     (serial monitor)
+
+
+------------------------------------------------------------------------
+T0 — Factory reset (run before every full test suite)
+------------------------------------------------------------------------
+  pio run -t erase
+  pio run -t upload
+
+Expected: device starts with empty NVS, boots to BLE provisioning mode.
+Serial log: "Device not provisioned — starting BLE provisioning"
+
+
+========================================================================
+BLOCK 1: BLE Provisioning + Reboot (6C)
+========================================================================
+
+T1.1 — Provisioning without extras (baseline)
+----------------------------------------------
+Steps:
+  1. Boot device (no NVS).
+  2. Open ESP BLE Provisioning app, connect to "AMBYTE", PoP "ambyte123".
+  3. Send Wi-Fi credentials only. Complete session.
+
+Expected:
+  - Log: "Provisioning complete — rebooting to apply"
+  - Device reboots and connects to Wi-Fi.
+  - Log: "Wi-Fi connected"
+  - Log: "MQTT client initialised (TLS=no)"   <-- no certs yet, TLS disabled
+
+
+T1.2 — Full provisioning: WiFi + device-config + certs in one BLE session
+--------------------------------------------------------------------------
+Steps:
+  1. Erase flash. Boot device.
+  2. Open BLE provisioning session ("AMBYTE", PoP "ambyte123").
+  3. Send Wi-Fi credentials via standard endpoint.
+  4. Send to "dev-cfg" endpoint:
+       {"mqtt_uri":"mqtts://YOUR_ENDPOINT.iot.REGION.amazonaws.com:8883",
+        "mqtt_client_id":"thing-001",
+        "mqtt_topic_root":"ambyte/prod",
+        "device_id":"thing-001"}
+  5. Send to "cert-prov" endpoint: 4-byte big-endian total_len header + JSON:
+       {"ca_cert":"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+        "dev_cert":"...",
+        "dev_key":"..."}
+     (Use a Python script to prepend the 4-byte length header.)
+  6. End session.
+
+Expected:
+  - Log: "Provisioning complete — rebooting to apply"
+  - Single reboot.
+  - On next boot: "certs initialised (provisioned=yes)"
+  - Log: "MQTT client initialised (TLS=yes)"
+  - Log: "MQTT connected"
+  - AWS IoT console shows client "thing-001" connected.
+
+
+T1.3 — Timeout with zero writes, no reboot
+-------------------------------------------
+Steps:
+  1. Erase flash. Boot device.
+  2. Open BLE session but do NOT send anything.
+  3. Wait 120 seconds for timeout.
+
+Expected:
+  - Log: "BLE provisioning timed out with no writes — continuing"
+  - NO reboot.
+  - Execution continues: I2C init, sensor init etc. all logged normally.
+
+
+T1.4 — Timeout with partial write, reboot required
+----------------------------------------------------
+Steps:
+  1. Erase flash. Boot device.
+  2. Open BLE session. Send cert JSON to "cert-prov" only (no Wi-Fi credentials).
+  3. Let session time out.
+
+Expected:
+  - s_certs_written flag set by handler.
+  - Log: "Provisioning complete — rebooting to apply"   <-- reboot despite timeout
+  - On next boot: device enters BLE provisioning again (no Wi-Fi stored).
+  - Log: "certs initialised (provisioned=yes)"   <-- certs survived in NVS.
+
+
+========================================================================
+BLOCK 2: MQTT Telemetry — no TLS (6A)
+========================================================================
+Run after T1.1: WiFi connected, no certs, MQTT up without TLS.
+Send commands to topic: <topic_root>/<device_id>/cmd
+  e.g.  ambyte/thing-001/cmd   (Kconfig defaults)
+
+
+T2.1 — Raw inbound log command
+-------------------------------
+Publish to inbound command topic:
+  {"cmd":"log","msg":"hello from phase 6"}
+
+Expected:
+  - Log: "inbound cmd: logged"
+
+
+T2.2 — Read env via MQTT command
+---------------------------------
+  {"cmd":"read_env"}
+
+Expected:
+  - Log: "inbound cmd: T=XX.XXC H=XX.X% P=XXXXXXPa"
+
+
+T2.3 — Store measurement and publish by ID
+------------------------------------------
+Steps:
+  1. Store a measurement (via Lua script or manual CLI).
+  2. Publish:
+       {"cmd":"publish_unsynced","type":"env"}
+
+Expected:
+  - Log: "published measure_id=X msg_id=Y"
+  - AWS IoT console receives on topic:
+      ambyte/prod/thing-001/env/X
+    with payload:
+      {"measure_id":1,"sensor_id":1,"measure_type":"env",
+       "timestamp":1700000000,
+       "values":{"temperature":25.1,"humidity":60.0,"pressure":101325}}
+  - Verify "values" is a JSON object keyed by data_type, NOT an array.
+  - Verify device identifier is in the topic, not the payload.
+
+
+T2.4 — INFLIGHT -> PENDING on disconnect
+-----------------------------------------
+Steps:
+  1. Store 3+ measurements.
+  2. Send "publish_unsynced" to put one in flight.
+  3. Immediately kill WiFi (pull cable or block SSID) before MQTT_EVENT_PUBLISHED.
+  4. Restore WiFi.
+
+Expected:
+  - Log: "Wi-Fi disconnected — stopping MQTT"
+  - device_commands_on_mqtt_disconnect() transitions header INFLIGHT -> PENDING.
+  - After WiFi/MQTT reconnect, "publish_unsynced" picks up the same measurement again.
+  - Measurement is NOT stuck as INFLIGHT.
+
+
+T2.5 — INFLIGHT -> PENDING on reboot
+--------------------------------------
+Steps:
+  1. Store a measurement, trigger publish_unsynced.
+  2. Hard-reset the device while QoS-1 publish is in flight.
+  3. On next boot inspect DB state.
+
+Expected:
+  - No rows remain in INFLIGHT state after boot (persistence init resets them to PENDING).
+  - "publish_unsynced" on reconnect finds the measurement as PENDING and uploads it.
+
+NOTE: Verify that sqlite_persistence_init() runs:
+  UPDATE measurement_headers SET sync_state=PENDING WHERE sync_state=INFLIGHT
+on startup. If not, this is an open issue.
+
+
+T2.6 — mqtt_status command
+----------------------------
+While connected:
+  {"cmd":"mqtt_status"}
+Expected: "inbound cmd: MQTT: connected"
+
+Kill WiFi, send again:
+Expected: "inbound cmd: MQTT: disconnected"
+
+
+========================================================================
+BLOCK 3: MQTT Inbound Commands — fragmentation and OOM (6B)
+========================================================================
+
+T3.1 — Single-chunk command dispatch
+--------------------------------------
+All commands in T2.1–T2.6 exercise the single-chunk path. Pass if those pass.
+
+
+T3.2 — Fragmented payload reassembly
+--------------------------------------
+Steps:
+  Publish a command payload > one MQTT packet (e.g. 600+ byte log message):
+    {"cmd":"log","msg":"AAAA...(600 chars)...AAAA"}
+
+Expected:
+  - mqtt_client reassembles across multiple MQTT_EVENT_DATA events.
+  - Log: "inbound cmd: logged" exactly ONCE (not duplicated).
+  - No reassembly errors in log.
+
+
+T3.3 — Oversized payload: no crash
+------------------------------------
+Steps:
+  Publish a payload of ~64 KB to the inbound command topic.
+
+Expected:
+  - Log: "OOM: cannot reassemble XXXXX-byte payload"
+  - Device keeps running — no panic, no watchdog reset.
+  - Subsequent normal commands still dispatch correctly (send T2.1 to confirm).
+
+
+========================================================================
+BLOCK 4: TLS + cert status (6C, full flow)
+========================================================================
+Run after T1.2: device has NVS certs, connects with TLS.
+
+
+T4.1 — Confirm TLS connection to AWS IoT Core
+----------------------------------------------
+Expected at boot:
+  - Log: "certs initialised (provisioned=yes)"
+  - Log: "MQTT client initialised (TLS=yes)"
+  - AWS IoT console shows device connected with its client certificate.
+
+
+T4.2 — cert_status via MQTT command
+-------------------------------------
+  {"cmd":"cert_status"}
+
+Expected: "inbound cmd: certs provisioned"
+
+
+T4.3 — cert_status without certs
+----------------------------------
+Steps:
+  1. Erase flash. Boot without provisioning certs.
+  2. Send cert_status command.
+
+Expected: "inbound cmd: certs not provisioned"
+
+
+T4.4 — Publish telemetry over TLS
+-----------------------------------
+Repeat T2.3 with TLS active (after T1.2 full provisioning).
+
+Expected:
+  - Same payload arrives on AWS IoT console.
+  - Inflight/pending state machine works correctly over TLS (repeat T2.4 to confirm).
+
+
+========================================================================
+BLOCK 5: Regression
+========================================================================
+
+T5.1 — All original CLI commands still work
+---------------------------------------------
+Run in serial monitor:
+  status
+  rtc
+  read_env
+  i2cscan
+  red
+
+Expected: same output as before Phase 6. No panics, no unexpected errors.
+
+
+T5.2 — Persistence without MQTT
+---------------------------------
+Steps:
+  1. Erase flash. Let BLE provisioning time out (no WiFi configured).
+  2. Store measurements via Lua or CLI.
+
+Expected:
+  - Measurements persist to SQLite.
+  - All cmd_* functions with NULL publish port return ESP_ERR_NOT_SUPPORTED
+    gracefully instead of crashing.
+
+
+========================================================================
+Known gaps before running
+========================================================================
+
+1. cert-prov test tooling
+   Sending the 4-byte-prefixed binary payload requires a small helper script.
+   The standard ESP BLE Provisioning app does not support custom endpoints.
+   Use docs/ambyte_prov.py for full automated provisioning (WiFi + dev-cfg + cert-prov).
+
+(Previously noted gaps resolved: cert_status CLI command added to CLI.c;
+ stale-INFLIGHT reset confirmed present in db_open_and_configure().)

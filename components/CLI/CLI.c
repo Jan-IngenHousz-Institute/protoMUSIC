@@ -12,7 +12,6 @@
 #include "device_commands.h"
 #include "i2c_bus.h"
 
-static const char *TAG = "CLI";
 static const uint8_t CLI_I2C_SCAN_FIRST_ADDR = 0x08;
 static const uint8_t CLI_I2C_SCAN_LAST_ADDR = 0x77;
 static const uint8_t CLI_RTC_I2C_ADDR = (uint8_t)(0xA6 >> 1);
@@ -150,6 +149,19 @@ static int cli_cmd_read_env(int argc, char **argv)
     return 0;
 }
 
+static int cli_cmd_cert_status(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1) {
+        printf("Usage: cert_status\r\n");
+        return 1;
+    }
+
+    cmd_result_t res = cmd_cert_status();
+    printf("%s\r\n", res.message);
+    return (res.status == ESP_OK) ? 0 : 1;
+}
+
 static int cli_cmd_i2cscan(int argc, char **argv)
 {
     (void)argv;
@@ -264,6 +276,11 @@ static esp_err_t cli_register_commands(void)
         .help = "scan the shared I2C bus for responding 7-bit addresses",
         .func = cli_cmd_i2cscan,
     };
+    static const esp_console_cmd_t cert_status_cmd = {
+        .command = "cert_status",
+        .help = "print whether TLS certificates have been provisioned",
+        .func = cli_cmd_cert_status,
+    };
 
     esp_err_t err = esp_console_cmd_register(&status_cmd);
     if (err != ESP_OK) {
@@ -286,6 +303,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&i2cscan_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&cert_status_cmd);
     if (err != ESP_OK) {
         return err;
     }
