@@ -182,6 +182,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         ESP_LOGW(TAG, "MQTT disconnected");
         break;
 
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT subscribe ack msg_id=%d (SUBACK OK)", event->msg_id);
+        break;
+
     case MQTT_EVENT_PUBLISHED:
         ESP_LOGD(TAG, "MQTT publish ack msg_id=%d", event->msg_id);
         if (s_ack_handler != NULL) {

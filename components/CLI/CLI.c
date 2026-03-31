@@ -162,6 +162,30 @@ static int cli_cmd_cert_status(int argc, char **argv)
     return (res.status == ESP_OK) ? 0 : 1;
 }
 
+static int cli_cmd_mqtt_pub(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: mqtt_pub <payload>\r\n");
+        return 1;
+    }
+
+    /* Rejoin all tokens — allows JSON with spaces without requiring quotes */
+    static char s_payload[480];
+    int pos = 0;
+    for (int i = 1; i < argc && pos < (int)sizeof(s_payload) - 1; i++) {
+        if (i > 1 && pos < (int)sizeof(s_payload) - 2) {
+            s_payload[pos++] = ' ';
+        }
+        int n = snprintf(s_payload + pos, sizeof(s_payload) - (size_t)pos, "%s", argv[i]);
+        if (n > 0) pos += n;
+    }
+    s_payload[pos] = '\0';
+
+    cmd_result_t res = cmd_mqtt_publish_raw(s_payload);
+    printf("%s\r\n", res.message);
+    return (res.status == ESP_OK) ? 0 : 1;
+}
+
 static int cli_cmd_i2cscan(int argc, char **argv)
 {
     (void)argv;
@@ -281,6 +305,11 @@ static esp_err_t cli_register_commands(void)
         .help = "print whether TLS certificates have been provisioned",
         .func = cli_cmd_cert_status,
     };
+    static const esp_console_cmd_t mqtt_pub_cmd = {
+        .command = "mqtt_pub",
+        .help = "mqtt_pub <payload>  publish string to <topic_root>/<device_id>/cli",
+        .func = cli_cmd_mqtt_pub,
+    };
 
     esp_err_t err = esp_console_cmd_register(&status_cmd);
     if (err != ESP_OK) {
@@ -308,6 +337,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&cert_status_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&mqtt_pub_cmd);
     if (err != ESP_OK) {
         return err;
     }
@@ -349,7 +383,7 @@ esp_err_t cli_start(void)
 
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_config.prompt = "ambyte> ";
-    repl_config.max_cmdline_length = 64;
+    repl_config.max_cmdline_length = 512;
 
     esp_err_t err = cli_create_repl(&repl_config);
     if (err != ESP_OK) {

@@ -79,6 +79,14 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
     }
 
     ESP_LOGI(TAG, "Device commands initialized");
+    ESP_LOGI(TAG, "  MAC:            %s", s_mac_str[0] ? s_mac_str : "(unavail)");
+    ESP_LOGI(TAG, "  topic_root:     %s", s_cfg.topic_root      ? s_cfg.topic_root      : "(null)");
+    ESP_LOGI(TAG, "  device_id:      %s", s_cfg.device_id       ? s_cfg.device_id       : "(null)");
+    ESP_LOGI(TAG, "  protocol_id:    %s", s_cfg.protocol_id     ? s_cfg.protocol_id     : "(null)");
+    ESP_LOGI(TAG, "  device_name:    %s", s_cfg.device_name     ? s_cfg.device_name     : "(null)");
+    ESP_LOGI(TAG, "  device_version: %s", s_cfg.device_version  ? s_cfg.device_version  : "(null)");
+    ESP_LOGI(TAG, "  device_firm:    %s", s_cfg.device_firmware ? s_cfg.device_firmware : "(null)");
+    ESP_LOGI(TAG, "  firmware_ver:   %s", s_cfg.firmware_version? s_cfg.firmware_version: "(null)");
     return ESP_OK;
 }
 
@@ -263,6 +271,28 @@ cmd_result_t cmd_mqtt_publish(const char *topic, const char *payload)
     return make_result(ESP_OK, "published (msg_id=%d)", msg_id);
 }
 
+cmd_result_t cmd_mqtt_publish_raw(const char *payload)
+{
+    if (!s_initialized || s_cfg.publish == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not available");
+    }
+    if (payload == NULL) {
+        return make_result(ESP_ERR_INVALID_ARG, "payload required");
+    }
+    char topic[256];
+    snprintf(topic, sizeof(topic), "%s/%s/cli",
+             s_cfg.topic_root ? s_cfg.topic_root : "",
+             s_cfg.device_id  ? s_cfg.device_id  : "");
+    ESP_LOGI(TAG, "mqtt_pub → topic: %s", topic);
+    ESP_LOGI(TAG, "mqtt_pub → payload: %s", payload);
+    int msg_id = 0;
+    esp_err_t err = s_cfg.publish(topic, payload, strlen(payload), &msg_id);
+    if (err != ESP_OK) {
+        return make_result(err, "publish failed: %s", esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "published to %s (msg_id=%d)", topic, msg_id);
+}
+
 /* ── helpers shared by the two publish commands ──────────────────── */
 
 #define MQTT_TOPIC_MAX   256
@@ -324,6 +354,9 @@ static cmd_result_t build_and_publish(int64_t measure_id)
                        s_cfg.device_version   ? s_cfg.device_version   : "",
                        s_cfg.firmware_version ? s_cfg.firmware_version : "",
                        (long long)records[0].timestamp * 1000LL);
+
+    ESP_LOGI(TAG, "publish → topic: %s", topic);
+    ESP_LOGI(TAG, "publish → payload: %.120s%s", payload, pos > 120 ? "…" : "");
 
     int msg_id = 0;
     err = s_cfg.publish(topic, payload, (size_t)pos, &msg_id);

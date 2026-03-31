@@ -363,7 +363,7 @@ void app_main(void)
     }
 
     /* ── Resolve config: NVS first, Kconfig fallback ─────────────── */
-    char mqtt_uri[256], mqtt_client_id[64], topic_root[256], device_id[64];
+    static char mqtt_uri[256], mqtt_client_id[64], topic_root[256], device_id[64];
     if (device_config_get_mqtt_uri(mqtt_uri, sizeof(mqtt_uri)) != ESP_OK) {
         strncpy(mqtt_uri, CONFIG_AMBYTE_MQTT_URI, sizeof(mqtt_uri) - 1);
         mqtt_uri[sizeof(mqtt_uri) - 1] = '\0';
@@ -380,8 +380,8 @@ void app_main(void)
         strncpy(device_id, CONFIG_AMBYTE_DEVICE_ID, sizeof(device_id) - 1);
         device_id[sizeof(device_id) - 1] = '\0';
     }
-    char protocol_id[32], device_name[64], device_version[16],
-         device_firmware[16], firmware_version[16];
+    static char protocol_id[32], device_name[64], device_version[16],
+                device_firmware[16], firmware_version[16];
     if (device_config_get_protocol_id(protocol_id, sizeof(protocol_id)) != ESP_OK) {
         protocol_id[0] = '\0';
     }

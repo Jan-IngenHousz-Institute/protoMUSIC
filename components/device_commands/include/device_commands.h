@@ -84,6 +84,7 @@ cmd_result_t cmd_query_unsynced(const char *measure_type, measurement_record_t *
 
 /* MQTT commands (Phase 6A) */
 cmd_result_t cmd_mqtt_publish(const char *topic, const char *payload);
+cmd_result_t cmd_mqtt_publish_raw(const char *payload);
 cmd_result_t cmd_mqtt_publish_measurement(int64_t measure_id);
 cmd_result_t cmd_mqtt_publish_unsynced(const char *measure_type);
 cmd_result_t cmd_mqtt_status(void);
