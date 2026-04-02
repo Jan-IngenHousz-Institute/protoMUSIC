@@ -182,12 +182,15 @@ async def run(args) -> None:
 
     try:
         # 2. Wi-Fi credentials (standard endpoint)
-        print("[1/3] Wi-Fi credentials...")
-        if not await esp_prov.send_wifi_config(tp, sec, args.ssid, args.password):
-            raise RuntimeError("Wi-Fi config rejected by device")
-        if not await esp_prov.apply_wifi_config(tp, sec):
-            raise RuntimeError("Wi-Fi apply failed")
-        print("  prov-config: OK")
+        if args.ssid is not None:
+            print("[1/3] Wi-Fi credentials...")
+            if not await esp_prov.send_wifi_config(tp, sec, args.ssid, args.password):
+                raise RuntimeError("Wi-Fi config rejected by device")
+            if not await esp_prov.apply_wifi_config(tp, sec):
+                raise RuntimeError("Wi-Fi apply failed")
+            print("  prov-config: OK")
+        else:
+            print("[1/3] Skipping Wi-Fi credentials (none provided)")
 
         # 3. MQTT device config (custom endpoint)
         print("[2/3] MQTT device config...")

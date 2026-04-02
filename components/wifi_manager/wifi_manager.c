@@ -8,6 +8,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -635,4 +636,21 @@ esp_err_t wifi_manager_start_provisioning(
 
     ESP_LOGW(TAG, "WiFi connection after provisioning did not complete in time");
     return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t wifi_manager_clear_provisioning(void)
+{
+    /* Clear our custom provisioned flag */
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(WIFI_MANAGER_PROV_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_erase_key(nvs, WIFI_MANAGER_PROV_NVS_KEY);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    /* Clear stored Wi-Fi credentials (factory reset WiFi config in NVS) */
+    esp_wifi_restore();
+    ESP_LOGI(TAG, "Wi-Fi provisioning cleared — rebooting");
+    esp_restart();
+    return ESP_OK; /* never reached */
 }

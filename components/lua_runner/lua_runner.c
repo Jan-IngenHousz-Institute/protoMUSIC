@@ -124,6 +124,123 @@ static int l_device_log(lua_State *L)
     return 0;
 }
 
+/* ── device.uart_* bindings ──────────────────────────────────────────── */
+
+/* device.uart_ping(channel) → boolean */
+static int l_device_uart_ping(lua_State *L)
+{
+    lua_Integer ch = luaL_checkinteger(L, 1);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        return luaL_error(L, "channel must be 0-%d", UART_SENSOR_NUM_CHANNELS - 1);
+    }
+    bool connected = false;
+    cmd_result_t res = cmd_uart_ping((uint8_t)ch, &connected);
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    lua_pushboolean(L, connected);
+    return 1;
+}
+
+/* device.uart_status() → { [0]="connected", [1]="disconnected", ... } */
+static int l_device_uart_status(lua_State *L)
+{
+    cmd_result_t res = cmd_uart_status();
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    lua_pushstring(L, res.message);
+    return 1;
+}
+
+/* device.uart_query(channel, cmd_bytes, extra_bytes_or_nil, expect_raw, timeout_ms)
+ *
+ *   cmd_bytes  : table of 8 integers (the 8-byte command)
+ *   extra_bytes: string of extra payload bytes (or nil)
+ *   expect_raw : integer — 0 for FSM mode, >0 for immediate raw response length
+ *   timeout_ms : integer
+ *
+ * Returns:
+ *   FSM mode  → { arrays = { {index=N, data={...}}, ... }, array_count=N }
+ *   Raw mode  → { raw = "binary string", raw_len = N }
+ *   Error     → nil, error_message
+ */
+static int l_device_uart_query(lua_State *L)
+{
+    lua_Integer ch         = luaL_checkinteger(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    lua_Integer expect_raw = luaL_checkinteger(L, 4);
+    lua_Integer timeout_ms = luaL_checkinteger(L, 5);
+
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        return luaL_error(L, "channel must be 0-%d", UART_SENSOR_NUM_CHANNELS - 1);
+    }
+
+    /* Build 8-byte command from table */
+    uint8_t cmd[8] = {0};
+    for (int i = 1; i <= 8; i++) {
+        lua_rawgeti(L, 2, i);
+        if (lua_isinteger(L, -1)) {
+            cmd[i - 1] = (uint8_t)lua_tointeger(L, -1);
+        }
+        lua_pop(L, 1);
+    }
+
+    /* Optional extra payload (string or nil at index 3) */
+    const uint8_t *extra = NULL;
+    size_t extra_len = 0;
+    if (lua_isstring(L, 3)) {
+        extra = (const uint8_t *)lua_tolstring(L, 3, &extra_len);
+    }
+
+    uart_sensor_response_t response;
+    memset(&response, 0, sizeof(response));
+    cmd_result_t res = cmd_uart_query((uint8_t)ch, cmd, extra, extra_len,
+                                      (size_t)expect_raw, &response,
+                                      (uint32_t)timeout_ms);
+    if (res.status != ESP_OK) {
+        uart_sensor_response_free(&response);
+        return lua_push_nil_reason(L, res.message);
+    }
+
+    lua_newtable(L);
+
+    if (expect_raw > 0 && response.raw != NULL) {
+        /* Raw mode: push raw bytes as a Lua string */
+        lua_pushlstring(L, (const char *)response.raw, response.raw_len);
+        lua_setfield(L, -2, "raw");
+        lua_pushinteger(L, (lua_Integer)response.raw_len);
+        lua_setfield(L, -2, "raw_len");
+    } else {
+        /* FSM mode: push arrays table */
+        lua_newtable(L);
+        for (uint8_t i = 0; i < response.array_count; i++) {
+            lua_newtable(L);
+            lua_pushinteger(L, response.arrays[i].index);
+            lua_setfield(L, -2, "index");
+
+            /* Push data as a sub-table of integers */
+            lua_newtable(L);
+            for (uint16_t j = 0; j < response.arrays[i].length; j++) {
+                lua_pushinteger(L, (lua_Integer)response.arrays[i].data[j]);
+                lua_rawseti(L, -2, (int)(j + 1));
+            }
+            lua_setfield(L, -2, "data");
+
+            lua_pushinteger(L, response.arrays[i].length);
+            lua_setfield(L, -2, "length");
+
+            lua_rawseti(L, -2, (int)(i + 1));
+        }
+        lua_setfield(L, -2, "arrays");
+        lua_pushinteger(L, response.array_count);
+        lua_setfield(L, -2, "array_count");
+    }
+
+    uart_sensor_response_free(&response);
+    return 1;
+}
+
 /* ── db.* bindings ───────────────────────────────────────────────────── */
 
 static int l_db_store(lua_State *L)
@@ -328,12 +445,15 @@ static int l_mqtt_publish_unsynced(lua_State *L)
 static void lua_register_device_module(lua_State *L)
 {
     static const luaL_Reg device_api[] = {
-        {"set_rgb",   l_device_set_rgb},
-        {"read_rtc",  l_device_read_rtc},
-        {"status",    l_device_status},
-        {"read_env",  l_device_read_env},
-        {"sleep_ms",  l_device_sleep_ms},
-        {"log",       l_device_log},
+        {"set_rgb",      l_device_set_rgb},
+        {"read_rtc",     l_device_read_rtc},
+        {"status",       l_device_status},
+        {"read_env",     l_device_read_env},
+        {"sleep_ms",     l_device_sleep_ms},
+        {"log",          l_device_log},
+        {"uart_ping",    l_device_uart_ping},
+        {"uart_query",   l_device_uart_query},
+        {"uart_status",  l_device_uart_status},
         {NULL, NULL},
     };
 

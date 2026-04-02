@@ -19,12 +19,14 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "wifi_provisioning/manager.h"
 #include "i2c_bus.h"
 #include "lua_runner.h"
 #include "nvs_flash.h"
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
 #include "sqlite_persistence.h"
+#include "uart_sensors.h"
 #include "wifi_manager.h"
 
 #define APP_TAG "APP_MAIN"
@@ -318,6 +320,24 @@ static void app_start_cli(void)
     ESP_LOGI(APP_TAG, "CLI started");
 }
 
+/* ── BLE provisioning LED feedback handler ───────────────────────── */
+
+static void prov_led_event_handler(void *arg, esp_event_base_t base,
+                                   int32_t id, void *data)
+{
+    (void)arg; (void)base; (void)data;
+    switch ((wifi_prov_cb_event_t)id) {
+    case WIFI_PROV_CRED_FAIL:
+        ambyte_status_set_rgb(20, 0, 0);  /* red = wrong password */
+        break;
+    case WIFI_PROV_CRED_SUCCESS:
+        ambyte_status_set_rgb(0, 20, 0);  /* green = credentials accepted */
+        break;
+    default:
+        break;
+    }
+}
+
 /* ── Wi-Fi → MQTT lifecycle handlers ─────────────────────────────── */
 
 static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -348,6 +368,14 @@ void app_main(void)
     }
     ESP_LOGI(APP_TAG, "NVS initialized");
     ESP_LOGI(APP_TAG, "Free heap after NVS: %lu", (unsigned long)esp_get_free_heap_size());
+
+    /* ── Status LED (early init — needed before BLE provisioning) ── */
+    err = ambyte_status_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(APP_TAG, "Status LED init failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(APP_TAG, "Status LED initialized");
+    }
 
     /* ── Certs (NVS-backed) ──────────────────────────────────────── */
     err = certs_init();
@@ -435,6 +463,10 @@ void app_main(void)
             { "cert-prov", cert_prov_handler,    &s_certs_written  },
             { "dev-cfg",   dev_cfg_prov_handler, &s_config_written },
         };
+        /* Register LED handler for provisioning events and signal BLE active */
+        esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
+                                   prov_led_event_handler, NULL);
+        ambyte_status_set_rgb(0, 0, 20);  /* dim blue = BLE advertising */
         esp_err_t prov_err = wifi_manager_start_provisioning("AMBYTE", "ambyte123",
                                                               endpoints, 2);
         cert_prov_handler_reset();  /* free any partial cert buffer */
@@ -444,6 +476,7 @@ void app_main(void)
             ESP_LOGI(APP_TAG, "Provisioning complete — rebooting to apply");
             esp_restart();
         }
+        ambyte_status_set_rgb(0, 0, 0);   /* LED off — continuing without reboot */
         ESP_LOGW(APP_TAG, "BLE provisioning timed out with no writes — continuing");
     } else {
         err = wifi_manager_connect_stored();
@@ -475,13 +508,23 @@ void app_main(void)
         return;
     }
 
-    /* ── Status LED ───────────────────────────────────────────────── */
-    err = ambyte_status_init();
-    if (err != ESP_OK) {
-        ESP_LOGW(APP_TAG, "Status LED init failed: %s", esp_err_to_name(err));
+    /* ── UART Sensors (4 channels, Option D) ────────────────────── */
+    bool uart_available = false;
+    err = uart_sensors_init();
+    if (err == ESP_OK) {
+        uart_available = true;
+        ESP_LOGI(APP_TAG, "UART sensors initialized");
+        /* Auto-ping each channel at boot (up to 2 s per channel) */
+        for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+            bool conn = false;
+            uart_sensors_get_ping_fn()(ch, &conn);
+            ESP_LOGI(APP_TAG, "  AMBIT%u: %s", ch + 1,
+                     conn ? "connected" : "disconnected");
+        }
     } else {
-        ESP_LOGI(APP_TAG, "Status LED initialized");
+        ESP_LOGW(APP_TAG, "UART sensors init failed: %s", esp_err_to_name(err));
     }
+    ESP_LOGI(APP_TAG, "Free heap after UART: %lu", (unsigned long)esp_get_free_heap_size());
 
     /* ── SD Card ──────────────────────────────────────────────────── */
     bool sd_available = false;
@@ -515,12 +558,13 @@ void app_main(void)
     ESP_LOGI(APP_TAG, "Free heap after persistence: %lu", (unsigned long)esp_get_free_heap_size());
 
     /* ── Hardware inventory ───────────────────────────────────────── */
-    ESP_LOGI(APP_TAG, "BOOT: BME280=%s RTC=%s SD=%s LFS=%s DB=%s",
+    ESP_LOGI(APP_TAG, "BOOT: BME280=%s RTC=%s SD=%s LFS=%s DB=%s UART=%s",
              bme280_is_ready() ? "OK" : "ABSENT",
              pcf2131tfy_rtc_is_ready() ? "OK" : "ABSENT",
              sd_available ? "OK" : "ABSENT",
              lfs_available ? "OK" : "ABSENT",
-             persistence_available ? "OK" : "ABSENT");
+             persistence_available ? "OK" : "ABSENT",
+             uart_available ? "OK" : "ABSENT");
 
     /* ── Compose device_commands (DDD composition root) ───────────── */
     device_commands_config_t cmd_cfg = {
@@ -549,6 +593,9 @@ void app_main(void)
         .device_version         = device_version,
         .device_firmware        = device_firmware,
         .firmware_version       = firmware_version,
+        .uart_query             = uart_available ? uart_sensors_get_query_fn()  : NULL,
+        .uart_ping              = uart_available ? uart_sensors_get_ping_fn()   : NULL,
+        .uart_status            = uart_available ? uart_sensors_get_status_fn() : NULL,
     };
     device_commands_init(&cmd_cfg);
     device_commands_subscribe_inbound();

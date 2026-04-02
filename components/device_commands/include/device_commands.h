@@ -11,6 +11,7 @@
 #include "messaging_port.h"
 #include "persistence_port.h"
 #include "sensing_port.h"
+#include "uart_sensor_port.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -64,6 +65,11 @@ typedef struct {
     const char                         *device_version;
     const char                         *device_firmware;
     const char                         *firmware_version;
+
+    /* UART sensor ports (Phase 7) */
+    uart_sensor_query_fn                uart_query;
+    uart_sensor_ping_fn                 uart_ping;
+    uart_sensor_status_fn               uart_status;
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);
@@ -91,6 +97,15 @@ cmd_result_t cmd_mqtt_status(void);
 
 /* Cert status (Phase 6C) */
 cmd_result_t cmd_cert_status(void);
+
+/* UART sensor commands (Phase 7) */
+cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
+                            const uint8_t *extra, size_t extra_len,
+                            size_t expect_raw,
+                            uart_sensor_response_t *response,
+                            uint32_t timeout_ms);
+cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected);
+cmd_result_t cmd_uart_status(void);
 
 /* Call from the Wi-Fi disconnect event handler to clear any in-flight publish slot */
 void device_commands_on_mqtt_disconnect(void);

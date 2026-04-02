@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <time.h>
 
 #include "cJSON.h"
 
@@ -336,24 +337,48 @@ static cmd_result_t build_and_publish(int64_t measure_id)
     }
     set_buf[sp] = '\0';
 
-    /* Build full payload */
+    /* Build inner sample JSON (unescaped) */
+    char sample_inner[600];
+    int si = snprintf(sample_inner, sizeof(sample_inner),
+                      "{\"protocol_id\":\"%s\",\"set\":[%s]}",
+                      s_cfg.protocol_id ? s_cfg.protocol_id : "",
+                      set_buf);
+
+    /* JSON-encode sample_inner as a string value: escape " → \" */
+    char sample_esc[800];
+    int se = 0;
+    for (int j = 0; j < si && se < (int)sizeof(sample_esc) - 2; j++) {
+        if (sample_inner[j] == '"' && se < (int)sizeof(sample_esc) - 3) {
+            sample_esc[se++] = '\\';
+        }
+        sample_esc[se++] = sample_inner[j];
+    }
+    sample_esc[se] = '\0';
+
+    /* ISO 8601 timestamp */
+    char ts_str[32];
+    time_t ts = (time_t)records[0].timestamp;
+    struct tm tm_info;
+    gmtime_r(&ts, &tm_info);
+    strftime(ts_str, sizeof(ts_str), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
+
+    /* Build full payload — sample is a JSON-encoded string per server schema */
     char payload[MQTT_PAYLOAD_MAX];
     int pos = snprintf(payload, sizeof(payload),
-                       "{\"sample\":[{\"protocol_id\":\"%s\",\"set\":[%s]}],"
+                       "{\"sample\":\"%s\","
                        "\"device_firmware\":\"%s\","
                        "\"device_id\":\"%s\","
                        "\"device_name\":\"%s\","
                        "\"device_version\":\"%s\","
                        "\"firmware_version\":\"%s\","
-                       "\"timestamp\":%lld}",
-                       s_cfg.protocol_id      ? s_cfg.protocol_id      : "",
-                       set_buf,
+                       "\"timestamp\":\"%s\"}",
+                       sample_esc,
                        s_cfg.device_firmware  ? s_cfg.device_firmware  : "",
                        s_mac_str,
                        s_cfg.device_name      ? s_cfg.device_name      : "",
                        s_cfg.device_version   ? s_cfg.device_version   : "",
                        s_cfg.firmware_version ? s_cfg.firmware_version : "",
-                       (long long)records[0].timestamp * 1000LL);
+                       ts_str);
 
     ESP_LOGI(TAG, "publish → topic: %s", topic);
     ESP_LOGI(TAG, "publish → payload: %.120s%s", payload, pos > 120 ? "…" : "");
@@ -439,6 +464,72 @@ cmd_result_t cmd_cert_status(void)
     return make_result(ESP_OK, "certs: %s", ok ? "provisioned" : "not provisioned");
 }
 
+/* ── UART sensor commands (Phase 7) ─────────────────────────────── */
+
+cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
+                            const uint8_t *extra, size_t extra_len,
+                            size_t expect_raw,
+                            uart_sensor_response_t *response,
+                            uint32_t timeout_ms)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    if (channel >= UART_SENSOR_NUM_CHANNELS) {
+        return make_result(ESP_ERR_INVALID_ARG, "invalid channel %u", channel);
+    }
+    esp_err_t err = s_cfg.uart_query(channel, cmd, extra, extra_len,
+                                     expect_raw, response, timeout_ms);
+    if (err != ESP_OK) {
+        return make_result(err, "UART ch%u query failed: %s",
+                           channel, esp_err_to_name(err));
+    }
+    if (expect_raw > 0) {
+        return make_result(ESP_OK, "UART ch%u: %u raw bytes",
+                           channel, (unsigned)response->raw_len);
+    }
+    return make_result(ESP_OK, "UART ch%u: %u arrays received",
+                       channel, response->array_count);
+}
+
+cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected)
+{
+    if (!s_initialized || s_cfg.uart_ping == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    if (channel >= UART_SENSOR_NUM_CHANNELS) {
+        return make_result(ESP_ERR_INVALID_ARG, "invalid channel %u", channel);
+    }
+    esp_err_t err = s_cfg.uart_ping(channel, connected);
+    if (err != ESP_OK) {
+        return make_result(err, "UART ch%u ping failed: %s",
+                           channel, esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "AMBIT%u: %s",
+                       channel + 1, *connected ? "connected" : "disconnected");
+}
+
+cmd_result_t cmd_uart_status(void)
+{
+    if (!s_initialized || s_cfg.uart_status == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    static const char *state_str[] = { "disconnected", "connected", "busy" };
+    char buf[200];
+    int pos = 0;
+    for (uint8_t ch = 0; ch < UART_SENSOR_NUM_CHANNELS; ch++) {
+        uart_sensor_state_t st = UART_SENSOR_DISCONNECTED;
+        s_cfg.uart_status(ch, &st);
+        int n = snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                         "AMBIT%u:%s ", ch + 1,
+                         (st < 3) ? state_str[st] : "?");
+        if (n > 0 && pos + n < (int)sizeof(buf)) {
+            pos += n;
+        }
+    }
+    return make_result(ESP_OK, "%s", buf);
+}
+
 /* ── inbound command dispatch ────────────────────────────────────── */
 
 cmd_result_t cmd_dispatch_json(const char *json, size_t len)
@@ -510,6 +601,18 @@ cmd_result_t cmd_dispatch_json(const char *json, size_t len)
             } else {
                 res = cmd_log(msg_field->valuestring);
             }
+
+        } else if (strcmp(cmd, "uart_ping") == 0) {
+            cJSON *ch_field = cJSON_GetObjectItemCaseSensitive(root, "channel");
+            if (!cJSON_IsNumber(ch_field)) {
+                res = make_result(ESP_ERR_INVALID_ARG, "uart_ping requires 'channel'");
+            } else {
+                bool conn = false;
+                res = cmd_uart_ping((uint8_t)ch_field->valueint, &conn);
+            }
+
+        } else if (strcmp(cmd, "uart_status") == 0) {
+            res = cmd_uart_status();
 
         } else {
             res = make_result(ESP_ERR_INVALID_ARG, "unknown command: %.63s", cmd);

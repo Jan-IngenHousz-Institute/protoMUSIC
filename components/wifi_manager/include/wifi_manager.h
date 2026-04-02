@@ -31,6 +31,13 @@ esp_err_t wifi_manager_start_provisioning(
     const wifi_prov_extra_endpoint_t *extra_endpoints,
     size_t num_extra_endpoints);
 
+/**
+ * @brief Clear Wi-Fi credentials and provisioning state, then reboot.
+ *        Clears NVS namespace "wifi_prov" and restores Wi-Fi factory config.
+ *        Never returns — calls esp_restart() internally.
+ */
+esp_err_t wifi_manager_clear_provisioning(void);
+
 #ifdef __cplusplus
 }
 #endif

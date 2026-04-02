@@ -11,6 +11,7 @@
 
 #include "device_commands.h"
 #include "i2c_bus.h"
+#include "wifi_manager.h"
 
 static const uint8_t CLI_I2C_SCAN_FIRST_ADDR = 0x08;
 static const uint8_t CLI_I2C_SCAN_LAST_ADDR = 0x77;
@@ -162,6 +163,72 @@ static int cli_cmd_cert_status(int argc, char **argv)
     return (res.status == ESP_OK) ? 0 : 1;
 }
 
+static int cli_cmd_test_t52(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    /* PASS = function returned at all (no crash/panic).
+     * Both ESP_OK (port available, succeeded) and any error (port unavailable or
+     * MQTT disconnected) are graceful outcomes. Only a panic is a hard FAIL,
+     * which would prevent reaching the result line below. */
+#define T52_CHECK(label, call) do { \
+    cmd_result_t _r = (call); \
+    const char *_tag = (_r.status == ESP_OK)               ? "OK  " : \
+                       (_r.status == ESP_ERR_NOT_SUPPORTED) ? "N/A " : \
+                       (_r.status == ESP_ERR_INVALID_STATE) ? "DIS " : "ERR "; \
+    printf("[T5.2] %-42s PASS [%s] %s\r\n", label, _tag, _r.message); \
+    pass++; total++; \
+} while (0)
+
+    int pass = 0, total = 0;
+
+    /* ── MQTT port guards ──────────────────────────────────────────── */
+    T52_CHECK("cmd_mqtt_status",
+              cmd_mqtt_status());
+    T52_CHECK("cmd_mqtt_publish",
+              cmd_mqtt_publish("test/topic", "test"));
+    T52_CHECK("cmd_mqtt_publish_raw",
+              cmd_mqtt_publish_raw("test"));
+    T52_CHECK("cmd_mqtt_publish_measurement(999999)",
+              cmd_mqtt_publish_measurement(999999LL));
+    T52_CHECK("cmd_mqtt_publish_unsynced(env)",
+              cmd_mqtt_publish_unsynced("env"));
+    T52_CHECK("cmd_cert_status",
+              cmd_cert_status());
+
+    /* ── Persistence port guards ───────────────────────────────────── */
+    measurement_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    strncpy(rec.measure_type, "env",         sizeof(rec.measure_type) - 1);
+    strncpy(rec.data_type,    "temperature", sizeof(rec.data_type)    - 1);
+    rec.value      = 1.0f;
+    rec.timestamp  = 1;
+    rec.sensor_id  = 1;
+    rec.measure_id = 999999LL;
+
+    T52_CHECK("cmd_store_measurement",
+              cmd_store_measurement(&rec, 1));
+
+    size_t cnt = 0;
+    T52_CHECK("cmd_measurement_count(env)",
+              cmd_measurement_count("env", &cnt));
+
+    measurement_record_t out[1];
+    T52_CHECK("cmd_query_unsynced(env)",
+              cmd_query_unsynced("env", out, 1, &cnt));
+
+    int64_t nid = 0;
+    T52_CHECK("cmd_next_measure_id",
+              cmd_next_measure_id(&nid));
+
+#undef T52_CHECK
+
+    /* If we reached here, all calls returned — no crash. */
+    printf("[T5.2] Result: %d/%d returned gracefully (no panic)\r\n", pass, total);
+    printf("[T5.2] Tags: OK=succeeded  N/A=port NULL  DIS=MQTT disconnected  ERR=other error\r\n");
+    return 0;
+}
+
 static int cli_cmd_mqtt_pub(int argc, char **argv)
 {
     if (argc < 2) {
@@ -269,6 +336,46 @@ static int cli_cmd_i2cscan(int argc, char **argv)
     return 0;
 }
 
+static int cli_cmd_ping_uart(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("Usage: ping_uart <channel 0-3>\r\n");
+        return 1;
+    }
+
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+
+    bool connected = false;
+    cmd_result_t res = cmd_uart_ping((uint8_t)ch, &connected);
+    printf("%s\r\n", res.message);
+    return (res.status == ESP_OK) ? 0 : 1;
+}
+
+static int cli_cmd_uart_status(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1) {
+        printf("Usage: uart_status\r\n");
+        return 1;
+    }
+
+    cmd_result_t res = cmd_uart_status();
+    printf("%s\r\n", res.message);
+    return (res.status == ESP_OK) ? 0 : 1;
+}
+
+static int cli_cmd_wifi_reset(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    printf("Clearing Wi-Fi credentials and provisioning state...\r\n");
+    wifi_manager_clear_provisioning();  /* does not return — calls esp_restart() */
+    return 0;
+}
+
 static esp_err_t cli_register_commands(void)
 {
     if (s_cli_commands_registered) {
@@ -310,6 +417,26 @@ static esp_err_t cli_register_commands(void)
         .help = "mqtt_pub <payload>  publish string to <topic_root>/<device_id>/cli",
         .func = cli_cmd_mqtt_pub,
     };
+    static const esp_console_cmd_t test_t52_cmd = {
+        .command = "test_t52",
+        .help = "T5.2: verify all port-guarded cmd_* return gracefully when ports are unavailable",
+        .func = cli_cmd_test_t52,
+    };
+    static const esp_console_cmd_t ping_uart_cmd = {
+        .command = "ping_uart",
+        .help    = "ping_uart <0-3>  check if AMBIT sensor on channel is connected",
+        .func    = cli_cmd_ping_uart,
+    };
+    static const esp_console_cmd_t uart_status_cmd = {
+        .command = "uart_status",
+        .help    = "show connection state of all 4 UART sensor channels",
+        .func    = cli_cmd_uart_status,
+    };
+    static const esp_console_cmd_t wifi_reset_cmd = {
+        .command = "wifi_reset",
+        .help    = "clear Wi-Fi credentials + provisioning flag and reboot",
+        .func    = cli_cmd_wifi_reset,
+    };
 
     esp_err_t err = esp_console_cmd_register(&status_cmd);
     if (err != ESP_OK) {
@@ -342,6 +469,26 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&mqtt_pub_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&test_t52_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ping_uart_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&uart_status_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&wifi_reset_cmd);
     if (err != ESP_OK) {
         return err;
     }
