@@ -282,9 +282,8 @@ cmd_result_t cmd_mqtt_publish_raw(const char *payload)
         return make_result(ESP_ERR_INVALID_ARG, "payload required");
     }
     char topic[256];
-    snprintf(topic, sizeof(topic), "%s/%s/cli",
-             s_cfg.topic_root ? s_cfg.topic_root : "",
-             s_cfg.device_id  ? s_cfg.device_id  : "");
+    snprintf(topic, sizeof(topic), "%s",
+             s_cfg.topic_root ? s_cfg.topic_root : "");
     ESP_LOGI(TAG, "mqtt_pub → topic: %s", topic);
     ESP_LOGI(TAG, "mqtt_pub → payload: %s", payload);
     int msg_id = 0;

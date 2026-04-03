@@ -18,12 +18,19 @@
 #define FLUSH_INTERVAL_MS 5000
 #define FLUSH_BATCH_SIZE  16
 #define FLUSH_TASK_STACK  6144
+#define FLUSH_ERROR_CHECK_THRESHOLD    3   /* run quick_check after N consecutive flush failures */
+#define FLUSH_ERROR_DISABLE_THRESHOLD 10   /* disable DB after N consecutive flush failures */
+#define INTEGRITY_CHECK_INTERVAL     100   /* run quick_check every N successful flush cycles (~8 min) */
 
 static sqlite3 *s_db = NULL;
 static SemaphoreHandle_t s_sqlite_mutex = NULL;
 static StaticSemaphore_t s_sqlite_mutex_storage;
 static bool s_db_available = false;
 static TaskHandle_t s_flush_task = NULL;
+static int s_flush_errors = 0;
+static int s_flush_cycles = 0;
+
+static esp_err_t db_open_and_configure(void);  /* forward decl for recovery */
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
@@ -60,6 +67,42 @@ static int integrity_callback(void *arg, int ncols, char **values, char **names)
         *ok = false;
     }
     return 0;
+}
+
+/* Run PRAGMA quick_check inside an already-held mutex.
+ * If corrupt: close DB, rename to .corrupt, reopen fresh.
+ * Returns true if DB is healthy, false if recovery was attempted. */
+static bool run_quick_check_locked(void)
+{
+    if (s_db == NULL) {
+        return false;
+    }
+    bool ok = true;
+    char *err_msg = NULL;
+    int rc = sqlite3_exec(s_db, "PRAGMA quick_check;", integrity_callback,
+                          &ok, &err_msg);
+    sqlite3_free(err_msg);
+
+    if (ok && rc == SQLITE_OK) {
+        return true;
+    }
+
+    ESP_LOGE(TAG, "quick_check failed — recovering DB");
+    sqlite3_close(s_db);
+    s_db = NULL;
+
+    rename(DB_PATH, DB_PATH ".corrupt");
+    rename(DB_PATH "-wal", DB_PATH "-wal.corrupt");
+    rename(DB_PATH "-shm", DB_PATH "-shm.corrupt");
+    rename(DB_PATH "-journal", DB_PATH "-journal.corrupt");
+    increment_nvs_counter("db_corrupt_cnt");
+
+    esp_err_t err = db_open_and_configure();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "DB re-open after recovery failed");
+        s_db_available = false;
+    }
+    return false;
 }
 
 /* Ensure the 'syncState' column exists, migrating from legacy names if needed */
@@ -137,6 +180,7 @@ static esp_err_t db_open_and_configure(void)
         rename(DB_PATH, DB_PATH ".corrupt");
         rename(DB_PATH "-wal", DB_PATH "-wal.corrupt");
         rename(DB_PATH "-shm", DB_PATH "-shm.corrupt");
+        rename(DB_PATH "-journal", DB_PATH "-journal.corrupt");
         increment_nvs_counter("db_corrupt_cnt");
 
         rc = sqlite3_open(DB_PATH, &s_db);
@@ -147,14 +191,20 @@ static esp_err_t db_open_and_configure(void)
         }
     }
 
-    /* PRAGMAs */
-    exec_pragma(s_db, "PRAGMA journal_mode = WAL;");
+    /* PRAGMAs — crash-safe configuration for SD card
+     *
+     * TRUNCATE mode: journal file is truncated to zero on commit (not deleted).
+     * Avoids FAT32 directory entry create/delete churn on every transaction.
+     * On crash: SQLite replays the journal on next open → DB rolled back cleanly.
+     *
+     * synchronous = FULL: journal is fsynced to SD before any main DB page is
+     * modified. This is the cornerstone of crash safety — without it, a power
+     * loss can leave the DB with half-written pages and no valid journal. */
+    exec_pragma(s_db, "PRAGMA journal_mode = TRUNCATE;");
     exec_pragma(s_db, "PRAGMA locking_mode = EXCLUSIVE;");
-    exec_pragma(s_db, "PRAGMA synchronous = NORMAL;");
+    exec_pragma(s_db, "PRAGMA synchronous = FULL;");
     exec_pragma(s_db, "PRAGMA page_size = 4096;");
     exec_pragma(s_db, "PRAGMA cache_size = -64;");
-    exec_pragma(s_db, "PRAGMA wal_autocheckpoint = 25;");
-    exec_pragma(s_db, "PRAGMA journal_size_limit = 65536;");
     exec_pragma(s_db, "PRAGMA temp_store = MEMORY;");
 
     /* Schema */
@@ -279,6 +329,7 @@ static esp_err_t flush_batch_to_sqlite(const pending_entry_t *entries, size_t co
         ESP_LOGE(TAG, "COMMIT failed (%d): %s",
                  rc, err_msg ? err_msg : sqlite3_errmsg(s_db));
         sqlite3_free(err_msg);
+        sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
         return ESP_FAIL;
     }
     sqlite3_free(err_msg);
@@ -309,14 +360,45 @@ static void drain_pending_to_sqlite(void)
             break;
         }
 
+        if (!sdcard_is_mounted()) {
+            xSemaphoreGive(s_sqlite_mutex);
+            ESP_LOGW(TAG, "SD unmounted during flush");
+            break;
+        }
+
         esp_err_t err = flush_batch_to_sqlite(entries, read_count);
-        xSemaphoreGive(s_sqlite_mutex);
 
         if (err == ESP_OK) {
+            s_flush_errors = 0;
+
+            /* Periodic integrity check (~every 8 minutes) */
+            if (++s_flush_cycles >= INTEGRITY_CHECK_INTERVAL) {
+                s_flush_cycles = 0;
+                if (!run_quick_check_locked()) {
+                    xSemaphoreGive(s_sqlite_mutex);
+                    break;  /* DB was recreated — retry from fresh state next cycle */
+                }
+            }
+            xSemaphoreGive(s_sqlite_mutex);
             pending_store_remove(read_count);
         } else {
-            ESP_LOGW(TAG, "Flush to SQLite failed, will retry");
-            break;
+            s_flush_errors++;
+            ESP_LOGW(TAG, "Flush failed (%d consecutive)", s_flush_errors);
+
+            if (s_flush_errors >= FLUSH_ERROR_DISABLE_THRESHOLD) {
+                ESP_LOGE(TAG, "Too many flush errors — disabling DB until reboot");
+                s_db_available = false;
+                xSemaphoreGive(s_sqlite_mutex);
+                break;
+            }
+            if (s_flush_errors >= FLUSH_ERROR_CHECK_THRESHOLD) {
+                ESP_LOGW(TAG, "Running integrity check after %d errors", s_flush_errors);
+                if (!run_quick_check_locked()) {
+                    s_flush_errors = 0;  /* DB was recreated, reset counter */
+                }
+            }
+            xSemaphoreGive(s_sqlite_mutex);
+            break;  /* retry next cycle */
         }
     }
 }
