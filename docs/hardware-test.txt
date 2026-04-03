@@ -282,6 +282,214 @@ Expected:
 
 
 ========================================================================
+BLOCK 6: UART Sensor Querying — Phase 7
+========================================================================
+
+Prerequisites
+-------------
+- At least one AMBIT sensor connected to a UART channel (CH0 = AMBIT1
+  on GPIO 3 RX / GPIO 46 TX recommended for initial testing).
+- Serial monitor running on USB Serial JTAG (not UART — no conflict).
+- WiFi provisioned and connected (from Phase 6 tests).
+
+Pin reference:
+  CH0 (AMBIT1): UART1  RX=GPIO3   TX=GPIO46  (dedicated)
+  CH1 (AMBIT2): UART2  RX=GPIO17  TX=GPIO18  (dedicated)
+  CH2 (AMBIT3): UART0  RX=GPIO47  TX=GPIO48  (shared, remapped)
+  CH3 (AMBIT4): UART0  RX=GPIO40  TX=GPIO41  (shared, remapped)
+
+
+T6.0 — Boot auto-ping
+----------------------
+Steps:
+  1. Connect one AMBIT sensor to CH0. Leave CH1-CH3 disconnected.
+  2. Flash and boot.
+
+Expected log:
+  "UART sensors initialized"
+  "  AMBIT1: connected"
+  "  AMBIT2: disconnected"
+  "  AMBIT3: disconnected"
+  "  AMBIT4: disconnected"
+  "BOOT: BME280=... UART=OK"
+
+Verify: free heap logged after UART init is reasonable (>100KB).
+
+
+T6.1 — Ping via CLI
+--------------------
+  ping_uart 0
+
+Expected: "AMBIT1: connected"
+
+  ping_uart 1
+
+Expected: "AMBIT1: disconnected"  (nothing connected on CH1)
+
+Repeat ping_uart 0 within 10 seconds:
+Expected: instant response (cached result, no UART traffic).
+
+
+T6.2 — UART status
+-------------------
+  uart_status
+
+Expected: "AMBIT1:connected AMBIT2:disconnected AMBIT3:disconnected AMBIT4:disconnected"
+
+
+T6.3 — Read temperature
+------------------------
+  ambit_temp 0
+
+Expected: "AMBIT1 leaf=XX.XC  chip=XX.XC"
+  - leaf should be near ambient (15-35C typical).
+  - chip should be near or slightly above ambient.
+
+Failure modes:
+  - "AMBIT1 get_temp failed" → sensor not responding or wrong baud rate.
+  - Timeout → check TX/RX wiring (swapped?), check 115200 baud on both sides.
+
+
+T6.4 — Read spectrum
+---------------------
+  ambit_spec 0
+
+Expected: "AMBIT1 spectrum: N N N N N N N N N N  PAR=X.XX"
+  - 10 uint16 channel values + PAR float.
+  - With sensor in ambient light, values should be nonzero.
+  - In dark conditions values should be near zero.
+
+
+T6.5 — Read sensor info
+------------------------
+  ambit_info 0 2
+
+Expected: "AMBIT1 info(2): NN bytes" + "FW version: X.X.X"
+  - Verify FW version matches what is flashed on the AMBIT sensor.
+
+  ambit_info 0 1
+
+Expected: "AMBIT1 info(1): NN bytes" + "Name: AmbitV00X"
+  - Verify the calibration name matches the sensor label.
+
+
+T6.6 — Blink for identification
+--------------------------------
+  ambit_blink 0 1 50
+
+Expected:
+  - AMBIT sensor's AS7341 LED blinks visually.
+  - CLI returns "AMBIT1 cmd 5 OK" after blink completes (~2-3s).
+  - No timeout errors.
+
+
+T6.7 — WiFi stability during UART query
+-----------------------------------------
+Purpose: verify that UART operations do not starve WiFi/MQTT.
+
+Steps:
+  1. Open a second terminal or use `mosquitto_sub` to watch MQTT.
+  2. Run a query that takes noticeable time:
+       ambit_temp 0
+  3. During the query, verify:
+     a. WiFi remains connected (check "Wi-Fi disconnected" NOT logged).
+     b. MQTT remains connected: send {"cmd":"mqtt_status"} to inbound topic.
+        Expected reply: "MQTT: connected".
+
+Expected: no WiFi drops, no MQTT disconnections, UART query completes
+normally. FreeRTOS scheduler balances both cores without explicit pinning.
+
+
+T6.8 — Disconnected sensor graceful failure
+---------------------------------------------
+Steps:
+  1. Physically unplug the AMBIT sensor from CH0.
+  2. Run:
+       ambit_temp 0
+
+Expected:
+  - Timeout after ~5s (wake retries exhausted).
+  - "AMBIT1 get_temp failed" or similar error message.
+  - No panic, no watchdog reset.
+  - ping_uart 0 → "AMBIT1: disconnected"
+  - Other CLI commands (status, read_env, i2cscan) still work normally.
+
+  3. Plug sensor back in. Wait 10s (ping cache TTL).
+  4. Run:
+       ping_uart 0
+
+Expected: "AMBIT1: connected" (sensor recovered).
+
+
+T6.9 — Shared UART0 remap (requires 2 sensors)
+-------------------------------------------------
+Prerequisites: sensors on CH2 (GPIO 47/48) AND CH3 (GPIO 40/41).
+
+Steps:
+  1. Boot. Verify auto-ping:
+       "AMBIT3: connected"
+       "AMBIT4: connected"
+  2. Read temp from both channels sequentially:
+       ambit_temp 2
+       ambit_temp 3
+
+Expected:
+  - Both return valid temperatures (no cross-talk, no data corruption).
+  - Log shows "UART0 remapped to ch2" / "UART0 remapped to ch3" at DEBUG level.
+  - No mutex deadlocks (both commands complete within 5s each).
+
+  3. In a Lua script, trigger both in rapid succession:
+       local t2 = device.ambit_get_temp(2)
+       local t3 = device.ambit_get_temp(3)
+       device.log("CH2=" .. t2.leaf .. " CH3=" .. t3.leaf)
+
+Expected: both temperatures returned, no errors. The UART0 mutex serialises
+access — second query waits for first to release.
+
+
+T6.10 — Boot strapping pin (GPIO 46) check
+--------------------------------------------
+Purpose: verify GPIO 46 (AMBIT1 TX, ESP32-S3 boot strapping pin) does
+not interfere with boot.
+
+Steps:
+  1. With AMBIT sensor connected on CH0 (TX=GPIO46), power-cycle the ESP32-S3.
+  2. Observe boot log — device should enter normal firmware (not download mode).
+
+Expected: normal boot. If boot fails with sensor connected, a series resistor
+(~1k) on GPIO 46 is needed to isolate during strapping phase.
+
+
+========================================================================
+BLOCK 7: Regression after Phase 7
+========================================================================
+
+T7.1 — All Phase 6 CLI commands still work
+--------------------------------------------
+Run in serial monitor:
+  status
+  rtc
+  read_env
+  i2cscan
+  red 1
+  red 0
+  cert_status
+  mqtt_pub {"test":"phase7"}
+
+Expected: same output as Phase 6 tests. No panics, no unexpected errors.
+All device_commands port guards return graceful errors when ports are NULL.
+
+
+T7.2 — Heap check
+-------------------
+After full boot + auto-ping + a few UART queries:
+  (check log for "Free heap after UART:" and final "Startup sequence complete, free heap:")
+
+Expected: minimum free heap stays above 32KB at all times.
+Monitor esp_get_minimum_free_heap_size() in the log.
+
+
+========================================================================
 Known gaps before running
 ========================================================================
 

@@ -15,6 +15,11 @@ extern "C" {
 #define UART_SENSOR_NUM_CHANNELS  4
 #define UART_SENSOR_MAX_ARRAYS    8
 
+/* Sentinel value for expect_raw: return immediately after CMD_DONE.
+ * Used for configuration commands (set gains, set currents, etc.) that
+ * send CMD_DONE but no CMD_END and no response data. */
+#define UART_QUERY_ACK_ONLY  ((size_t)-1)
+
 typedef enum {
     UART_SENSOR_DISCONNECTED = 0,
     UART_SENSOR_CONNECTED    = 1,

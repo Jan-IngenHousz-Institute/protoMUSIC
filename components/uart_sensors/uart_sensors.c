@@ -466,7 +466,11 @@ static esp_err_t do_query(uint8_t channel,
     }
 
     /* 4. Receive response */
-    if (expect_raw > 0) {
+    if (expect_raw == UART_QUERY_ACK_ONLY) {
+        /* Config commands: CMD_DONE is the only response, no CMD_END */
+        response->status = ESP_OK;
+        err = ESP_OK;
+    } else if (expect_raw > 0 && expect_raw != UART_QUERY_ACK_ONLY) {
         err = receive_raw_response(port, response, expect_raw, deadline);
     } else {
         err = receive_fsm_response(port, response, deadline);

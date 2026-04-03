@@ -966,92 +966,137 @@ Compile-time embedding (`certs.c`) is acceptable for a first milestone but does 
 
 ---
 
-## Phase 7: UART Sensor Querying (4 Channels, Non-Blocking)
+## Phase 7: UART Sensor Querying (4 Channels, Option D) — ✓ IMPLEMENTED
 
-### Hardware Constraint
+### Architecture Decisions
 
-ESP32-S3 has **3 hardware UART controllers** (UART0, UART1, UART2). Console uses USB Serial JTAG (not UART), so all 3 hardware UARTs are free. But you need **4 UART channels**. Options:
-  - **Option A**: 3 HW UARTs + 1 time-multiplexed (GPIO matrix remap between queries — possible since queries are sequential with 2-min responses)
-  - **Option B**: External UART multiplexer IC (e.g., SC16IS752 — 2-channel UART over I2C)
-  - **Option C**: Soft UART (bit-banging) for the 4th channel — unreliable at higher baud rates
+**4 channels on 3 HW UARTs — Option D (trigger-all, sequential-read for shared pair)**:
+  - ESP32-S3 has 3 HW UART controllers. Console uses USB Serial JTAG, so all 3 are free.
+  - AMBIT sensors stream data immediately after receiving a command (up to ~60s). GPIO remap during streaming would lose data, so Option A (sequential remap) is ruled out for concurrent use.
+  - Option D: send commands to all 4 quickly (remap UART0 between ch2/ch3 just for the fast command+ack phase), then collect data. Ch0/ch1 on dedicated UARTs receive data concurrently. Ch2/ch3 data is collected sequentially via UART0 remap. The ambit-1 FSM retry mechanism (up to 1 hour) ensures no data loss while waiting.
+  - Overhead vs. true 4-concurrent: ~2-4 seconds (sequential data transfer for ch2/ch3), negligible compared to ~60s measurement time.
 
-**Recommendation**: Option A (GPIO matrix remap). Since queries take up to 2 min each, sensors are queried sequentially. One UART controller can be remapped to different pins between queries using `uart_set_pin()`. This needs zero additional hardware.
+**No core pinning**: `uart_read_bytes()` is a blocking-but-yielding call (zero CPU while waiting). The FreeRTOS SMP scheduler automatically balances tasks across both cores. ESP-IDF WiFi runs at priority 23 and preempts any UART task. Explicit core pinning adds complexity for no measurable benefit. All tasks are left unpinned except the persistence flush task (already pinned to Core 0).
 
-### Dual-Core Architecture
+### Ambit-1 Binary Protocol
 
-ESP32-S3 has 2 cores. Pin tasks to specific cores to minimize blocking:
+The AMBIT sensors run the ambit-1 ESP binary protocol (see `ambit-1/run_esp.cpp`):
+```
+Host → Ambit: Wake (0xAA × 3) → Ack (0x80)
+Host → Ambit: Header (0xA0) + 8-byte cmd [+ extra payload]
+Ambit → Host: CMD_DONE (0xA1)
+Ambit → Host: [response data] → CMD_END (0xF0)
+```
 
-| Core | Tasks | Priority | Rationale |
-|---|---|---|---|
-| **Core 0** (PRO) | WiFi stack, MQTT client, data management, SQLite writes | High | WiFi requires Core 0; MQTT callbacks run here |
-| **Core 1** (APP) | Lua runner, CLI, status LED, UART sensor queries | Mixed | Sensor queries block for up to 2 min; isolated from networking |
+Four response patterns:
+| Pattern | Commands | After CMD_DONE |
+|---|---|---|
+| **ACK_ONLY** | 1, 2, 10 (config) | Nothing — no CMD_END sent |
+| **RAW** | 31, 32, 33, 34 (queries) | Fixed-length bytes → CMD_END |
+| **FSM** | 20, 21 (measurements) | Handshake arrays → CMD_END |
+| **ACTION** | 4, 5, 6, 17, 18, 37 | [work runs] → CMD_END |
+
+FSM data transfer (ambit → host, per data array):
+```
+Ambit sends 0xD3 (wake) → Host acks 0xD2
+Host sends 0xD2 again (length phase) → Ambit sends 8-byte length header
+Host sends 0xC8 (ready) → Host sends 0xC8 again (data phase)
+Ambit sends binary uint32[] data + 4-byte trailer with checksum
+Host verifies checksum → sends 0xB4 (pass) or 0xC8 (resend, up to 4 retries)
+```
 
 ### Domain Port
 
-7.0. Define **UART Sensor port** in `components/domain/include/uart_sensor_port.h`:
-  - `typedef struct { uint8_t channel; const char *query; size_t query_len; } uart_query_t;`
-  - `typedef struct { uint8_t channel; uint8_t *response; size_t response_len; esp_err_t status; } uart_response_t;`
-  - `typedef esp_err_t (*uart_sensor_query_fn)(const uart_query_t *query, uart_response_t *response, uint32_t timeout_ms);`
+7.0. `components/domain/include/uart_sensor_port.h` — ✓ DONE
+  - Types: `uart_sensor_state_t` (DISCONNECTED/CONNECTED/BUSY), `uart_data_array_t` (index + uint32_t[] + length), `uart_sensor_response_t` (arrays[] + raw + status)
+  - `UART_QUERY_ACK_ONLY` sentinel for config commands
+  - `uart_sensor_response_free()` — static inline, no component dependency
+  - Function pointers: `uart_sensor_query_fn`, `uart_sensor_ping_fn`, `uart_sensor_status_fn`
+  - `expect_raw` parameter selects response mode: `UART_QUERY_ACK_ONLY` / `0` (FSM) / `>0` (raw N bytes)
 
 ### Steps
 
-7.1. Create `components/uart_sensors/` — manages 4 UART sensor channels:
-  - Configure 3 UART controllers + GPIO remap for 4th channel
-  - Each query runs as a FreeRTOS task pinned to Core 1 via `xTaskCreatePinnedToCore(..., 1)`
-  - Non-blocking pattern: send query → `uart_read_bytes()` with timeout → yield via `vTaskDelay()` between poll attempts
-  - Response buffer managed per-channel (heap-allocated, freed after processing)
-  - Mutex per UART controller prevents concurrent access
-  - `REQUIRES domain driver` + `PRIV_REQUIRES i2c_bus` (if using Option B)
+7.1. `components/uart_sensors/` — ✓ DONE
+  - `uart_sensors.c`: full ambit-1 protocol handler — wake (with 3-byte UART threshold for light-sleep wakeup), command framing, FSM data reception with checksum verification and retry, GPIO remap for ch2/ch3
+  - Mutex per channel (`s_ch_mtx[4]`) + shared UART0 mutex (`s_uart0_mtx`) for remap protection
+  - `channel_acquire()`: takes channel mutex, takes UART0 mutex + calls `uart_set_pin()` + `uart_flush_input()` if shared channel
+  - `CMakeLists.txt`: `REQUIRES domain`, `PRIV_REQUIRES driver esp_timer`
 
-7.2. UART query task architecture (non-blocking):
+7.2. GPIO pin assignment — ✓ DONE (same as plan):
+
+  | Channel | RX Pin | TX Pin | HW UART | Dedicated? |
+  |---|---|---|---|---|
+  | CH0 (AMBIT1) | GPIO 3 | GPIO 46 | UART1 | Yes |
+  | CH1 (AMBIT2) | GPIO 17 | GPIO 18 | UART2 | Yes |
+  | CH2 (AMBIT3) | GPIO 47 | GPIO 48 | UART0 | Shared (remapped) |
+  | CH3 (AMBIT4) | GPIO 40 | GPIO 41 | UART0 | Shared (remapped) |
+
+  - 115200 baud, 8N1, no flow control
+  - RX ring buffer: 2048 bytes per UART controller
+  - **Note**: GPIO 46 (AMBIT1 TX) is a boot strapping pin — ensure sensor does not drive during reset
+
+7.3. Ping — ✓ DONE
+  - Sends 0xAA × 3 (wake), scans for 0x80 (ack) or 0x85 (boot-idle). Up to 25 retries, 50ms per attempt.
+  - Result cached per-channel with 10s TTL (`PING_CACHE_TTL_US`)
+  - Also recognises 0x85 (AMBIT_BOOT_IDLE) — ambit just woke from light sleep
+  - CLI: `ping_uart <0-3>`
+  - Lua: `device.uart_ping(ch) → boolean`
+
+7.4. Wiring in `app_main.c` — ✓ DONE
+  - `uart_sensors_init()` called after I2C/sensors, before device_commands
+  - Auto-ping all 4 channels at boot (up to 2s each, sequential)
+  - Port adapters wired into `device_commands_config_t` (`uart_query`, `uart_ping`, `uart_status`)
+  - Hardware inventory log updated: `BOOT: BME280=... UART=OK`
+
+7.5. All ambit-1 commands implemented as typed wrappers — ✓ DONE
+
+  `components/device_commands/include/ambit_protocol.h` defines command IDs, info sub-types, and response struct layouts matching the ambit-1 firmware (ESP32 Xtensa alignment).
+
+  **Command table** (13 typed commands + 3 raw commands):
+
+  | Cmd ID | Function | Mode | CLI | Lua |
+  |---|---|---|---|---|
+  | — | `cmd_uart_query()` | generic | — | `device.uart_query()` |
+  | — | `cmd_uart_ping()` | — | `ping_uart` | `device.uart_ping()` |
+  | — | `cmd_uart_status()` | — | `uart_status` | `device.uart_status()` |
+  | 1 | `cmd_ambit_set_gains()` | ACK_ONLY | — | `device.ambit_set_gains()` |
+  | 2 | `cmd_ambit_set_currents()` | ACK_ONLY | — | `device.ambit_set_currents()` |
+  | 10 | `cmd_ambit_config_detector()` | ACK_ONLY | — | `device.ambit_config_detector()` |
+  | 31 | `cmd_ambit_get_spec()` | raw 24B | `ambit_spec` | `device.ambit_get_spec()` |
+  | 32 | `cmd_ambit_get_temp()` | raw 4B | `ambit_temp` | `device.ambit_get_temp()` |
+  | 33 | `cmd_ambit_get_info()` | raw N B | `ambit_info` | `device.ambit_get_info()` |
+  | 34 | `cmd_ambit_get_temp_raw()` | raw 14B | — | `device.ambit_get_temp_raw()` |
+  | 20 | `cmd_ambit_run_mpf()` | FSM | — | `device.ambit_run_mpf()` |
+  | 21 | `cmd_ambit_run()` | FSM | — | `device.ambit_run()` |
+  | 4 | `cmd_ambit_actinic()` | action | — | `device.ambit_actinic()` |
+  | 5 | `cmd_ambit_blink()` | action | `ambit_blink` | `device.ambit_blink()` |
+  | 6 | `cmd_ambit_calibrate_baseline()` | action | — | `device.ambit_calibrate_baseline()` |
+  | 37 | `cmd_ambit_set_metadata()` | action+extra | — | `device.ambit_set_metadata()` |
+
+  Measurement commands (20, 21) and configuration commands (1, 2, 10) are exposed only via Lua — they require multi-step workflows best expressed in scripts. Query commands (31-34) and identification (5) are exposed via both CLI and Lua.
+
+7.6. Example Lua measurement workflow:
+  ```lua
+  -- Configure and run a fluorescence measurement on AMBIT1
+  device.ambit_set_gains(0, 2, 5, 5, 1, 5, 5)
+  device.ambit_set_currents(0, 110, 40, 20)
+  device.ambit_config_detector(0)
+
+  local t = device.ambit_get_temp(0)
+  device.log("Leaf: " .. t.leaf .. "C")
+
+  -- 1 array line: type=1, ir=0, 100 samples @ 10Hz, no actinic, sub=1
+  local arr = {1, 0, 0, 100, 0, 10, 0, 1}
+  local result = device.ambit_run(0, arr, 0, false, 120000)
+  if result then
+      device.log("Arrays: " .. result.array_count)
+      for i, a in ipairs(result.arrays) do
+          device.log("  [" .. a.index .. "] " .. a.length .. " points")
+      end
+  end
   ```
-  uart_sensor_task (pinned to Core 1):
-    for each scheduled query:
-      if channel needs GPIO remap: uart_set_pin(uart_num, new_tx, new_rx, ...)
-      uart_write_bytes(uart_num, query, len)
-      while (elapsed < timeout_ms):
-        bytes = uart_read_bytes(uart_num, buf, len, pdMS_TO_TICKS(100))
-        if (response_complete(buf)) break
-        // Core 1 yields here — Core 0 (WiFi/MQTT) unaffected
-      store result → notify data management task on Core 0
-  ```
-  - **Task watchdog**: The UART sensor task is **not registered** with the ESP task watchdog (`esp_task_wdt`). It is designed to block for up to 2 minutes per query — WDT monitoring is counterproductive. If the UART task truly hangs, the caller (Lua) detects it via response timeout. Other tasks (Lua, CLI, WiFi) remain WDT-monitored.
-  - `cmd_uart_query(uint8_t channel, const char *query, uint32_t timeout_ms)` — send query, wait for response
-  - `cmd_uart_ping(uint8_t channel)` — send a short probe (e.g., `"PING\n"`), expect response within ~2s. Returns connected/disconnected. Used by Lua before attempting a full measurement query.
-  - `cmd_uart_status()` — show all 4 channels: connected/disconnected/busy/disabled (from `channel_config`)
 
-7.3a. **Ping/health-check design**:
-  - Each channel defines a lightweight probe: send a known short command, expect any response within a short timeout (e.g., 2000ms)
-  - `uart_sensor_ping()` internally: flush RX buffer → `uart_write_bytes(ping_cmd)` → `uart_read_bytes(buf, 64, pdMS_TO_TICKS(2000))`
-  - If bytes received > 0 → `SENSOR_CONNECTED`; if timeout → `SENSOR_DISCONNECTED`
-  - Result cached per-channel with a TTL (e.g., 10s) so repeated checks don't hammer the bus
-  - Lua usage: `if device.uart_ping(1) then device.uart_query(1, "MEASURE") end`
-  - CLI usage: `ping_uart 1` → "AMBIT1: connected (MultispeQ v2.0)" or "AMBIT1: disconnected"
-  - Status is also checked automatically before `cmd_uart_query()` — if ping fails, return error immediately instead of blocking for 2 min
-
-7.4. Wire into `app_main.c`:
-  - Init UART controllers with pin assignments
-  - Register `uart_sensor_query_fn` port adapter
-  - Pin sensor tasks to Core 1, networking tasks to Core 0
-  - **Auto-ping at boot**: After UART init + channel config load from NVS, call `uart_sensor_ping(channel)` for each channel where `sensor_name` is non-empty. 2s timeout per channel, sequential (up to 8s total for 4 channels). Results populate `hw_inventory_t` (Phase 3.5) and are logged as part of hardware inventory. Channels marked `SENSOR_DISCONNECTED` remain queryable (sensor may come online later) — just flagged at boot.
-
-7.5. GPIO pin assignment for 4 UART channels:
-
-  | Channel | RX Pin | TX Pin | HW UART |
-  |---|---|---|---|
-  | AMBIT1 | GPIO 3 | GPIO 46 | UART1 |
-  | AMBIT2 | GPIO 17 | GPIO 18 | UART2 |
-  | AMBIT3 | GPIO 47 | GPIO 48 | UART0 (remapped for query, then back) |
-  | AMBIT4 | GPIO 40 | GPIO 41 | UART0 (remapped — time-shared with AMBIT3) |
-
-  - AMBIT1 and AMBIT2 get dedicated HW UARTs (UART1, UART2) — can run concurrently
-  - AMBIT3 and AMBIT4 share UART0 via GPIO matrix remap between queries
-  - Console uses USB Serial JTAG (not UART0), so UART0 is free
-  - AMBIT3/4 pins (47/48, 40/41) are NOT UART0 default pins (43/44) — GPIO matrix remap via `uart_set_pin()` maps UART0 to these custom pins. No conflict with default UART0 GPIOs.
-  - No pin conflicts with: I2C (38, 39), SDMMC (9-14), USB JTAG (19, 20), status LED (45)
-  - **Note**: GPIO 46 (AMBIT1 TX) is a boot strapping pin on ESP32-S3. Ensure the AMBIT1 sensor does not drive this pin during reset (e.g., series resistor, or ensure sensor powers on after ESP32 boot completes).
-
-**Verification:** Send a test query to a sensor, verify response received. Monitor Core 0 WiFi connectivity during a 2-min query on Core 1 — no disconnections.
+**Verification:** Flash device, run `ping_uart 0` → connected. Run `ambit_temp 0` → leaf/chip temperature. Run `ambit_spec 0` → spectrum + PAR. Run `ambit_info 0 2` → FW version. Run Lua measurement script → FSM data arrays received. Monitor WiFi during measurement → no disconnections. Confirm `esp_get_minimum_free_heap_size()` stays above 32KB.
 
 ---
 
@@ -1095,7 +1140,7 @@ ESP32-S3 has 2 cores. Pin tasks to specific cores to minimize blocking:
 - `components/domain/include/persistence_port.h` — Persistence contracts (SQLite repository pattern, fixed-size char[32] fields)
 - `components/domain/include/device_status_port.h` — Status contracts
 - `components/domain/include/messaging_port.h` — MQTT publish / ack / status contracts (Phase 6A), subscribe contracts added in Phase 6B
-- `components/domain/include/uart_sensor_port.h` — UART query/response contracts (Phase 7)
+- `components/domain/include/uart_sensor_port.h` — ✓ UART query/response/ping/status contracts, `UART_QUERY_ACK_ONLY` sentinel, `uart_sensor_response_free()` inline (Phase 7)
 - `components/sqlite3/` — Git submodule of `siara-cc/esp32-idf-sqlite3` (Phase 2.3) — with VFS shim fix for `esp32_Sync()`
 - `components/littlefs/` — `joltwallet/littlefs` from ESP Component Registry (Phase 2.3)
 - `components/persistence/CMakeLists.txt` — SQLite persistence component, `REQUIRES domain sqlite3 sd_card` + `PRIV_REQUIRES esp_littlefs`
@@ -1111,7 +1156,10 @@ ESP32-S3 has 2 cores. Pin tasks to specific cores to minimize blocking:
 - `components/device_config/include/device_config.h` — device config API (Phase 5B / 6B)
 - `components/mqtt_client/Kconfig.projbuild` — compile-time MQTT config carrier for 6A
 - `components/mqtt_client/` — ESP-MQTT wrapper with TLS, publish ack translation, and later subscribe support (Phase 6A / 6B)
-- `components/uart_sensors/` — 4-channel UART sensor manager, Core 1 tasks (Phase 7)
+- `components/uart_sensors/uart_sensors.c` — ✓ 4-channel UART sensor driver (Option D, GPIO remap), ambit-1 binary protocol handler, FSM data reception (Phase 7)
+- `components/uart_sensors/include/uart_sensors.h` — ✓ Init + port adapter getters (Phase 7)
+- `components/uart_sensors/CMakeLists.txt` — ✓ `REQUIRES domain`, `PRIV_REQUIRES driver esp_timer` (Phase 7)
+- `components/device_commands/include/ambit_protocol.h` — ✓ Command IDs, info sub-types, response struct definitions matching ambit-1 nvs1.h (Phase 7)
 - `components/mp2731/` — MP2731 battery charger I2C driver (Phase 8)
 
 ---

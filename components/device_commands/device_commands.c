@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "ambit_protocol.h"
 #include "cJSON.h"
 
 #include "esp_log.h"
@@ -464,8 +465,21 @@ cmd_result_t cmd_cert_status(void)
     return make_result(ESP_OK, "certs: %s", ok ? "provisioned" : "not provisioned");
 }
 
-/* ── UART sensor commands (Phase 7) ─────────────────────────────── */
+/* ── UART sensor commands — raw interface (Phase 7) ─────────────── */
 
+/* Generic binary query: sends the 8-byte `cmd` (+ optional `extra` payload)
+ * to an AMBIT sensor on `channel` (0-3) using the ambit-1 ESP protocol.
+ *
+ * `expect_raw` selects the response mode:
+ *   UART_QUERY_ACK_ONLY  — return after CMD_DONE (0xA1); no response data, no CMD_END
+ *   0                    — FSM data-transfer mode: wait for structured array data via
+ *                          handshake (for measurement commands 20, 21)
+ *   >0                   — immediate raw response: read exactly N bytes after CMD_DONE,
+ *                          then verify CMD_END (0xF0) follows (for query commands 31-34)
+ *
+ * Caller must free response via uart_sensor_response_free().
+ * Lua: device.uart_query(ch, {cmd_bytes}, extra_or_nil, expect_raw, timeout_ms)
+ * CLI: not exposed directly (use typed ambit_* commands instead)                      */
 cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
                             const uint8_t *extra, size_t extra_len,
                             size_t expect_raw,
@@ -492,6 +506,10 @@ cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
                        channel, response->array_count);
 }
 
+/* Ping: send wake byte (0xAA) to the AMBIT sensor, wait for ack (0x80).
+ * Result is cached for 10 seconds to avoid hammering the bus.
+ * Lua:  device.uart_ping(ch) → true/false
+ * CLI:  ping_uart <ch>                                                */
 cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected)
 {
     if (!s_initialized || s_cfg.uart_ping == NULL) {
@@ -509,6 +527,9 @@ cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected)
                        channel + 1, *connected ? "connected" : "disconnected");
 }
 
+/* Report connection state of all 4 UART channels.
+ * Lua:  device.uart_status() → string
+ * CLI:  uart_status                                                   */
 cmd_result_t cmd_uart_status(void)
 {
     if (!s_initialized || s_cfg.uart_status == NULL) {
@@ -528,6 +549,330 @@ cmd_result_t cmd_uart_status(void)
         }
     }
     return make_result(ESP_OK, "%s", buf);
+}
+
+/* ── Typed Ambit commands ────────────────────────────────────────── *
+ *
+ * Each function wraps one ambit-1 ESP binary command (see ambit_protocol.h
+ * for command IDs). The ambit-1 protocol is:
+ *   Wake (0xAA×3) → Ack (0x80) → Header (0xA0) + 8-byte cmd [+extra]
+ *   → CMD_DONE (0xA1) → [response] → [CMD_END (0xF0)]
+ *
+ * Four response patterns exist:
+ *   ACK_ONLY  — cmds 1, 2, 10: CMD_DONE only, no CMD_END (config)
+ *   RAW       — cmds 31-34:    CMD_DONE → N fixed bytes → CMD_END (query)
+ *   FSM       — cmds 20, 21:   CMD_DONE → FSM handshake arrays → CMD_END (measurement)
+ *   ACTION    — cmds 4-6, 17-18, 37: CMD_DONE → [work] → CMD_END (no data returned)
+ * ────────────────────────────────────────────────────────────────── */
+
+/* Helper: send an ack-only command (no response, no CMD_END) */
+static cmd_result_t ambit_ack_only(uint8_t ch, const uint8_t cmd[8])
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    uart_sensor_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0,
+                                     UART_QUERY_ACK_ONLY, &resp, 5000);
+    uart_sensor_response_free(&resp);
+    if (err != ESP_OK) {
+        return make_result(err, "AMBIT%u cmd %u failed: %s",
+                           ch + 1, cmd[0], esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "AMBIT%u cmd %u OK", ch + 1, cmd[0]);
+}
+
+/* Helper: send a command that returns CMD_END but no data (action) */
+static cmd_result_t ambit_action(uint8_t ch, const uint8_t cmd[8],
+                                 const uint8_t *extra, size_t extra_len,
+                                 uint32_t timeout_ms)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    uart_sensor_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, extra, extra_len,
+                                     0, &resp, timeout_ms);
+    uart_sensor_response_free(&resp);
+    if (err != ESP_OK) {
+        return make_result(err, "AMBIT%u cmd %u failed: %s",
+                           ch + 1, cmd[0], esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "AMBIT%u cmd %u OK", ch + 1, cmd[0]);
+}
+
+/* Cmd 1 — Set photodetector gains on the ADPD6100.
+ * Values 1-6 map to gain levels (0 = skip / keep current).
+ * Must be called before cmd_ambit_config_detector() or cmd_ambit_run().
+ * Lua:  device.ambit_set_gains(ch, fluo, fluoref, ir, irref, sun, leaf)
+ * CLI:  (not exposed — use Lua)                                       */
+cmd_result_t cmd_ambit_set_gains(uint8_t ch, uint8_t fluo, uint8_t fluoref,
+                                  uint8_t ir, uint8_t irref,
+                                  uint8_t sun, uint8_t leaf)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_SET_GAINS, fluo, fluoref, ir, irref, sun, leaf, 0 };
+    return ambit_ack_only(ch, cmd);
+}
+
+/* Cmd 2 — Set LED drive currents (0-126).
+ * i620 = 620nm pulsed, i720 = 720nm pulsed, ir = far-red DC.
+ * Must be called before cmd_ambit_config_detector() or cmd_ambit_run().
+ * Lua:  device.ambit_set_currents(ch, i620, i720, ir)                 */
+cmd_result_t cmd_ambit_set_currents(uint8_t ch, uint8_t i620, uint8_t i720,
+                                     uint8_t ir)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_SET_CURRENTS, i620, i720, ir, 0, 0, 0, 0 };
+    return ambit_ack_only(ch, cmd);
+}
+
+/* Cmd 10 — Apply stored gains and currents to the ADPD6100 detector.
+ * Configures the detector into ARRAY_MODE1. Call after set_gains/set_currents,
+ * or omit if cmd_ambit_run() auto-configures when mode differs.
+ * Lua:  device.ambit_config_detector(ch)                              */
+cmd_result_t cmd_ambit_config_detector(uint8_t ch)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_CONFIG_DETECTOR, 0, 0, 0, 0, 0, 0, 0 };
+    return ambit_ack_only(ch, cmd);
+}
+
+/* Cmd 32 — Read leaf and chip temperature from the MLX90632 IR sensor.
+ * Returns temperatures in Celsius (ambit sends int16 × 10, we divide).
+ * Response: 4 bytes (2 × int16_t little-endian).
+ * Lua:  device.ambit_get_temp(ch) → {leaf=float, chip=float}
+ * CLI:  ambit_temp <ch>                                               */
+cmd_result_t cmd_ambit_get_temp(uint8_t ch, float *leaf_temp, float *chip_temp)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    uint8_t cmd[8] = { AMBIT_CMD_GET_TEMP, 0, 0, 0, 0, 0, 0, 0 };
+    uart_sensor_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0,
+                                     AMBIT_RESP_TEMP_SIZE, &resp, 5000);
+    if (err != ESP_OK || resp.raw == NULL || resp.raw_len < AMBIT_RESP_TEMP_SIZE) {
+        uart_sensor_response_free(&resp);
+        return make_result(err != ESP_OK ? err : ESP_FAIL,
+                           "AMBIT%u get_temp failed", ch + 1);
+    }
+    int16_t t1, t2;
+    memcpy(&t1, resp.raw + 0, 2);
+    memcpy(&t2, resp.raw + 2, 2);
+    if (leaf_temp) *leaf_temp = (float)t1 / 10.0f;
+    if (chip_temp) *chip_temp = (float)t2 / 10.0f;
+    uart_sensor_response_free(&resp);
+    return make_result(ESP_OK, "AMBIT%u T=%.1fC chip=%.1fC",
+                       ch + 1, (float)t1 / 10.0f, (float)t2 / 10.0f);
+}
+
+/* Cmd 31 — Read spectral channels from the AS7341 and compute PAR.
+ * Response: 24 bytes = 10 × uint16 channels + 1 × float32 PAR.
+ * Lua:  device.ambit_get_spec(ch) → {spec={10 ints}, par=float}
+ * CLI:  ambit_spec <ch>                                               */
+cmd_result_t cmd_ambit_get_spec(uint8_t ch, uint16_t spec[10], float *par)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    uint8_t cmd[8] = { AMBIT_CMD_GET_SPEC, 0, 0, 0, 0, 0, 0, 0 };
+    uart_sensor_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0,
+                                     AMBIT_RESP_SPEC_SIZE, &resp, 5000);
+    if (err != ESP_OK || resp.raw == NULL || resp.raw_len < AMBIT_RESP_SPEC_SIZE) {
+        uart_sensor_response_free(&resp);
+        return make_result(err != ESP_OK ? err : ESP_FAIL,
+                           "AMBIT%u get_spec failed", ch + 1);
+    }
+    /* spec[0..9] are uint16 channels, spec[10..11] hold a float (PAR) */
+    if (spec) memcpy(spec, resp.raw, 20);
+    if (par)  memcpy(par, resp.raw + 20, 4);
+    uart_sensor_response_free(&resp);
+    return make_result(ESP_OK, "AMBIT%u spectrum OK", ch + 1);
+}
+
+/* Cmd 34 — Extended temperature read: two leaf algorithms + chip + 4 raw
+ * MLX90632 register values for diagnostics.
+ * Response: 14 bytes (7 × int16_t: leaf*10, leaf1*10, chip*10, a1..a4).
+ * Lua:  device.ambit_get_temp_raw(ch) → {leaf,leaf1,chip,raw={4 ints}}
+ * CLI:  (not exposed — use Lua or ambit_temp for basic reading)       */
+cmd_result_t cmd_ambit_get_temp_raw(uint8_t ch, float *leaf, float *leaf1,
+                                     float *chip, int16_t raw[4])
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    uint8_t cmd[8] = { AMBIT_CMD_GET_TEMP_RAW, 0, 0, 0, 0, 0, 0, 0 };
+    uart_sensor_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0,
+                                     AMBIT_RESP_TEMP_RAW_SIZE, &resp, 5000);
+    if (err != ESP_OK || resp.raw == NULL || resp.raw_len < AMBIT_RESP_TEMP_RAW_SIZE) {
+        uart_sensor_response_free(&resp);
+        return make_result(err != ESP_OK ? err : ESP_FAIL,
+                           "AMBIT%u get_temp_raw failed", ch + 1);
+    }
+    int16_t vals[7];
+    memcpy(vals, resp.raw, 14);
+    if (leaf)  *leaf  = (float)vals[0] / 10.0f;
+    if (leaf1) *leaf1 = (float)vals[1] / 10.0f;
+    if (chip)  *chip  = (float)vals[2] / 10.0f;
+    if (raw) {
+        raw[0] = vals[3]; raw[1] = vals[4];
+        raw[2] = vals[5]; raw[3] = vals[6];
+    }
+    uart_sensor_response_free(&resp);
+    return make_result(ESP_OK, "AMBIT%u T=%.1f/%.1f/%.1fC",
+                       ch + 1, (float)vals[0]/10.f, (float)vals[1]/10.f, (float)vals[2]/10.f);
+}
+
+/* Cmd 33 — Retrieve sensor identity/calibration data.
+ *   info_type=1: ambit_calibration_t (~136 B) — name, MLX coefficients,
+ *                ADPD offsets, actinic/spec coefficients, emissivity
+ *   info_type=2: ambit_fw_info_t (~48 B) — FW version, MAC, build date
+ *   info_type=3: ambit_metadata_t (~248 B) — GPS, altitude, user notes
+ * Raw struct bytes are copied into `out`. Struct layouts defined in
+ * ambit_protocol.h (must match ambit-1 nvs1.h on ESP32 Xtensa alignment).
+ * Lua:  device.ambit_get_info(ch, type) → raw bytes string
+ * CLI:  ambit_info <ch> <1|2|3>                                       */
+cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
+                                 uint8_t *out, size_t out_size, size_t *out_len)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    size_t expect = 0;
+    switch (info_type) {
+    case AMBIT_INFO_CALIBRATION: expect = sizeof(ambit_calibration_t); break;
+    case AMBIT_INFO_FW:          expect = sizeof(ambit_fw_info_t);     break;
+    case AMBIT_INFO_METADATA:    expect = sizeof(ambit_metadata_t);    break;
+    default:
+        return make_result(ESP_ERR_INVALID_ARG, "info_type must be 1-3");
+    }
+
+    uint8_t cmd[8] = { AMBIT_CMD_GET_INFO, info_type, 0, 0, 0, 0, 0, 0 };
+    uart_sensor_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0, expect, &resp, 5000);
+    if (err != ESP_OK || resp.raw == NULL) {
+        uart_sensor_response_free(&resp);
+        return make_result(err != ESP_OK ? err : ESP_FAIL,
+                           "AMBIT%u get_info(%u) failed", ch + 1, info_type);
+    }
+    size_t copy = resp.raw_len < out_size ? resp.raw_len : out_size;
+    if (out && copy > 0) memcpy(out, resp.raw, copy);
+    if (out_len) *out_len = resp.raw_len;
+    uart_sensor_response_free(&resp);
+    return make_result(ESP_OK, "AMBIT%u info(%u): %u bytes",
+                       ch + 1, info_type, (unsigned)resp.raw_len);
+}
+
+/* Cmd 21 — Run an array-mode measurement on the ADPD6100.
+ * `run_arr` is a flat byte array of arr_len × 8 bytes. Each 8-byte line
+ * encodes: line_type, ir_on, sample_num(H), sample_num(L), freq(H),
+ * freq(L), actinic, subsampling. Max 16 lines.
+ * The extra payload is sent before CMD_DONE (buffered in ambit RX FIFO).
+ * Response: FSM handshake — up to 7 data arrays (env, fluor, fluoref,
+ * sun, leaf, 730, 730ref), each as {index, uint32_t[], length}.
+ * Typical duration: seconds to ~60s depending on sample count.
+ * Lua:  device.ambit_run(ch, flat_table, led_persist, allow_int, timeout)
+ * CLI:  (not exposed — use Lua scripts for measurement workflows)     */
+cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
+                            uint8_t led_persist, bool allow_interrupt,
+                            uart_sensor_response_t *response, uint32_t timeout_ms)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    if (arr_len == 0 || arr_len > 16 || run_arr == NULL) {
+        return make_result(ESP_ERR_INVALID_ARG, "arr_len must be 1-16");
+    }
+    uint8_t cmd[8] = { AMBIT_CMD_RUN, arr_len, led_persist,
+                       (uint8_t)(allow_interrupt ? 1 : 0), 0, 0, 0, 0 };
+    memset(response, 0, sizeof(*response));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, run_arr, (size_t)arr_len * 8,
+                                     0, response, timeout_ms);
+    if (err != ESP_OK) {
+        return make_result(err, "AMBIT%u run failed: %s",
+                           ch + 1, esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "AMBIT%u run: %u arrays",
+                       ch + 1, response->array_count);
+}
+
+/* Cmd 20 — Run a multi-phase fluorescence (MPF) measurement.
+ * `length` = total measurement points (uint16, encoded as [1]<<7 | [2]),
+ * `interval` = sampling interval, `change_act`/`act` = actinic control.
+ * Response: FSM handshake data arrays (same as cmd 21).
+ * Lua:  device.ambit_run_mpf(ch, length, interval, change_act, act, timeout)
+ * CLI:  (not exposed — use Lua)                                       */
+cmd_result_t cmd_ambit_run_mpf(uint8_t ch, uint16_t length, uint8_t interval,
+                                bool change_act, uint8_t act,
+                                uart_sensor_response_t *response, uint32_t timeout_ms)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    uint8_t cmd[8] = { AMBIT_CMD_RUN_MPF,
+                       (uint8_t)(length >> 7), (uint8_t)(length & 0x7F),
+                       interval, (uint8_t)(change_act ? 1 : 0), act, 0, 0 };
+    memset(response, 0, sizeof(*response));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0, 0, response, timeout_ms);
+    if (err != ESP_OK) {
+        return make_result(err, "AMBIT%u run_mpf failed: %s",
+                           ch + 1, esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "AMBIT%u mpf: %u arrays",
+                       ch + 1, response->array_count);
+}
+
+/* Cmd 5 — Blink the AS7341 LED for visual identification.
+ * `ambit_id` 0-3 selects blink pattern, `intensity` 5-253 sets brightness.
+ * Blocks until blink completes (a few seconds).
+ * Lua:  device.ambit_blink(ch, id, intensity)
+ * CLI:  ambit_blink <ch> <id> <intensity>                             */
+cmd_result_t cmd_ambit_blink(uint8_t ch, uint8_t ambit_id, uint8_t intensity)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_BLINK, ambit_id, intensity, 0, 0, 0, 0, 0 };
+    return ambit_action(ch, cmd, NULL, 0, 10000);
+}
+
+/* Cmd 6 — Run ADPD6100 fluorescence offset calibration.
+ * Measures dark baseline and stores offsets (adpd_lit, adpd_sun, adpd_leaf,
+ * adpd_730, adpd_730r) in the ambit's NVS. Factory/maintenance command.
+ * Blocks for several seconds.
+ * Lua:  device.ambit_calibrate_baseline(ch)                           */
+cmd_result_t cmd_ambit_calibrate_baseline(uint8_t ch)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_CALIBRATE_BASELINE, 0, 0, 0, 0, 0, 0, 0 };
+    return ambit_action(ch, cmd, NULL, 0, 30000);
+}
+
+/* Cmd 4 — Actinic LED control and calibration.
+ *   type=1: test actinics — ramps LED current (var), blocks ~6s
+ *   type=2: set actinic coefficient (float packed in cmd[3..6])
+ *   type=4: set spectral coefficient
+ *   type=5: pulse LED at `var` current for `var2`×100 ms
+ * Factory/calibration command.
+ * Lua:  device.ambit_actinic(ch, type, var, var2)                     */
+cmd_result_t cmd_ambit_actinic(uint8_t ch, uint8_t type, uint8_t var, uint8_t var2)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_ACTINIC, type, var, var2, 0, 0, 0, 0 };
+    return ambit_action(ch, cmd, NULL, 0, 15000);
+}
+
+/* Cmd 37 — Write metadata (GPS coordinates, altitude, user notes) to
+ * the ambit's NVS. `metadata` should be a serialised ambit_metadata_t
+ * (~248 bytes). The struct's eof_mark must be 2025 for the ambit to
+ * accept the write. Data is sent as `extra` before CMD_DONE; the ambit
+ * reads it from its UART RX FIFO after acknowledging.
+ * Lua:  device.ambit_set_metadata(ch, metadata_string)                */
+cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t len)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_SET_METADATA, 0, 0, 0, 0, 0, 0, 0 };
+    return ambit_action(ch, cmd, metadata, len, 5000);
 }
 
 /* ── inbound command dispatch ────────────────────────────────────── */

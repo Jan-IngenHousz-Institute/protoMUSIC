@@ -241,6 +241,255 @@ static int l_device_uart_query(lua_State *L)
     return 1;
 }
 
+/* ── device.ambit_* bindings ─────────────────────────────────────────── */
+
+/* device.ambit_set_gains(ch, fluo, fluoref, ir, irref, sun, leaf) → true or nil,err */
+static int l_device_ambit_set_gains(lua_State *L)
+{
+    uint8_t ch  = (uint8_t)luaL_checkinteger(L, 1);
+    uint8_t g[6];
+    for (int i = 0; i < 6; i++) g[i] = (uint8_t)luaL_checkinteger(L, i + 2);
+    cmd_result_t res = cmd_ambit_set_gains(ch, g[0], g[1], g[2], g[3], g[4], g[5]);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* device.ambit_set_currents(ch, i620, i720, ir) → true or nil,err */
+static int l_device_ambit_set_currents(lua_State *L)
+{
+    uint8_t ch   = (uint8_t)luaL_checkinteger(L, 1);
+    uint8_t i620 = (uint8_t)luaL_checkinteger(L, 2);
+    uint8_t i720 = (uint8_t)luaL_checkinteger(L, 3);
+    uint8_t ir   = (uint8_t)luaL_checkinteger(L, 4);
+    cmd_result_t res = cmd_ambit_set_currents(ch, i620, i720, ir);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* device.ambit_config_detector(ch) → true or nil,err */
+static int l_device_ambit_config_detector(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    cmd_result_t res = cmd_ambit_config_detector(ch);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* device.ambit_get_temp(ch) → {leaf=float, chip=float} or nil,err */
+static int l_device_ambit_get_temp(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    float leaf = 0, chip = 0;
+    cmd_result_t res = cmd_ambit_get_temp(ch, &leaf, &chip);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_newtable(L);
+    lua_pushnumber(L, (lua_Number)leaf);  lua_setfield(L, -2, "leaf");
+    lua_pushnumber(L, (lua_Number)chip);  lua_setfield(L, -2, "chip");
+    return 1;
+}
+
+/* device.ambit_get_spec(ch) → {spec={10 ints}, par=float} or nil,err */
+static int l_device_ambit_get_spec(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    uint16_t spec[10] = {0};
+    float par = 0;
+    cmd_result_t res = cmd_ambit_get_spec(ch, spec, &par);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_newtable(L);
+    lua_newtable(L);
+    for (int i = 0; i < 10; i++) {
+        lua_pushinteger(L, spec[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "spec");
+    lua_pushnumber(L, (lua_Number)par);
+    lua_setfield(L, -2, "par");
+    return 1;
+}
+
+/* device.ambit_get_temp_raw(ch) → {leaf,leaf1,chip,raw={4 ints}} or nil,err */
+static int l_device_ambit_get_temp_raw(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    float leaf = 0, leaf1 = 0, chip = 0;
+    int16_t raw[4] = {0};
+    cmd_result_t res = cmd_ambit_get_temp_raw(ch, &leaf, &leaf1, &chip, raw);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_newtable(L);
+    lua_pushnumber(L, (lua_Number)leaf);   lua_setfield(L, -2, "leaf");
+    lua_pushnumber(L, (lua_Number)leaf1);  lua_setfield(L, -2, "leaf1");
+    lua_pushnumber(L, (lua_Number)chip);   lua_setfield(L, -2, "chip");
+    lua_newtable(L);
+    for (int i = 0; i < 4; i++) {
+        lua_pushinteger(L, raw[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "raw");
+    return 1;
+}
+
+/* device.ambit_get_info(ch, type) → string (raw bytes) or nil,err */
+static int l_device_ambit_get_info(lua_State *L)
+{
+    uint8_t ch   = (uint8_t)luaL_checkinteger(L, 1);
+    uint8_t type = (uint8_t)luaL_checkinteger(L, 2);
+    uint8_t buf[256];
+    size_t len = 0;
+    cmd_result_t res = cmd_ambit_get_info(ch, type, buf, sizeof(buf), &len);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_pushlstring(L, (const char *)buf, len);
+    return 1;
+}
+
+/* device.ambit_run(ch, run_arr_table, led_persist, allow_interrupt, timeout_ms)
+ *   run_arr_table: flat table of integers (length must be multiple of 8)
+ *   Returns: response table (same as uart_query FSM mode) or nil,err */
+static int l_device_ambit_run(lua_State *L)
+{
+    uint8_t ch         = (uint8_t)luaL_checkinteger(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    uint8_t led_persist     = (uint8_t)luaL_checkinteger(L, 3);
+    bool    allow_interrupt = lua_toboolean(L, 4);
+    uint32_t timeout_ms     = (uint32_t)luaL_checkinteger(L, 5);
+
+    int n = (int)luaL_len(L, 2);
+    if (n <= 0 || n > 128 || (n % 8) != 0) {
+        return luaL_error(L, "run_arr must have 8-128 elements (multiple of 8)");
+    }
+    uint8_t arr_len = (uint8_t)(n / 8);
+    uint8_t *run_arr = malloc((size_t)n);
+    if (!run_arr) return luaL_error(L, "out of memory");
+    for (int i = 1; i <= n; i++) {
+        lua_rawgeti(L, 2, i);
+        run_arr[i - 1] = (uint8_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+    }
+
+    uart_sensor_response_t response;
+    cmd_result_t res = cmd_ambit_run(ch, run_arr, arr_len, led_persist,
+                                      allow_interrupt, &response, timeout_ms);
+    free(run_arr);
+    if (res.status != ESP_OK) {
+        uart_sensor_response_free(&response);
+        return lua_push_nil_reason(L, res.message);
+    }
+
+    /* Push FSM arrays as table */
+    lua_newtable(L);
+    lua_newtable(L);
+    for (uint8_t i = 0; i < response.array_count; i++) {
+        lua_newtable(L);
+        lua_pushinteger(L, response.arrays[i].index);
+        lua_setfield(L, -2, "index");
+        lua_newtable(L);
+        for (uint16_t j = 0; j < response.arrays[i].length; j++) {
+            lua_pushinteger(L, (lua_Integer)response.arrays[i].data[j]);
+            lua_rawseti(L, -2, (int)(j + 1));
+        }
+        lua_setfield(L, -2, "data");
+        lua_pushinteger(L, response.arrays[i].length);
+        lua_setfield(L, -2, "length");
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "arrays");
+    lua_pushinteger(L, response.array_count);
+    lua_setfield(L, -2, "array_count");
+    uart_sensor_response_free(&response);
+    return 1;
+}
+
+/* device.ambit_run_mpf(ch, length, interval, change_act, act, timeout_ms) → table */
+static int l_device_ambit_run_mpf(lua_State *L)
+{
+    uint8_t  ch         = (uint8_t)luaL_checkinteger(L, 1);
+    uint16_t length     = (uint16_t)luaL_checkinteger(L, 2);
+    uint8_t  interval   = (uint8_t)luaL_checkinteger(L, 3);
+    bool     change_act = lua_toboolean(L, 4);
+    uint8_t  act        = (uint8_t)luaL_checkinteger(L, 5);
+    uint32_t timeout_ms = (uint32_t)luaL_checkinteger(L, 6);
+
+    uart_sensor_response_t response;
+    cmd_result_t res = cmd_ambit_run_mpf(ch, length, interval, change_act,
+                                          act, &response, timeout_ms);
+    if (res.status != ESP_OK) {
+        uart_sensor_response_free(&response);
+        return lua_push_nil_reason(L, res.message);
+    }
+
+    lua_newtable(L);
+    lua_newtable(L);
+    for (uint8_t i = 0; i < response.array_count; i++) {
+        lua_newtable(L);
+        lua_pushinteger(L, response.arrays[i].index);
+        lua_setfield(L, -2, "index");
+        lua_newtable(L);
+        for (uint16_t j = 0; j < response.arrays[i].length; j++) {
+            lua_pushinteger(L, (lua_Integer)response.arrays[i].data[j]);
+            lua_rawseti(L, -2, (int)(j + 1));
+        }
+        lua_setfield(L, -2, "data");
+        lua_pushinteger(L, response.arrays[i].length);
+        lua_setfield(L, -2, "length");
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "arrays");
+    lua_pushinteger(L, response.array_count);
+    lua_setfield(L, -2, "array_count");
+    uart_sensor_response_free(&response);
+    return 1;
+}
+
+/* device.ambit_blink(ch, id, intensity) → true or nil,err */
+static int l_device_ambit_blink(lua_State *L)
+{
+    uint8_t ch        = (uint8_t)luaL_checkinteger(L, 1);
+    uint8_t id        = (uint8_t)luaL_checkinteger(L, 2);
+    uint8_t intensity = (uint8_t)luaL_checkinteger(L, 3);
+    cmd_result_t res = cmd_ambit_blink(ch, id, intensity);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* device.ambit_calibrate_baseline(ch) → true or nil,err */
+static int l_device_ambit_calibrate_baseline(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    cmd_result_t res = cmd_ambit_calibrate_baseline(ch);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* device.ambit_actinic(ch, type, var, var2) → true or nil,err */
+static int l_device_ambit_actinic(lua_State *L)
+{
+    uint8_t ch   = (uint8_t)luaL_checkinteger(L, 1);
+    uint8_t type = (uint8_t)luaL_checkinteger(L, 2);
+    uint8_t var  = (uint8_t)luaL_checkinteger(L, 3);
+    uint8_t var2 = (uint8_t)luaL_checkinteger(L, 4);
+    cmd_result_t res = cmd_ambit_actinic(ch, type, var, var2);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* device.ambit_set_metadata(ch, metadata_string) → true or nil,err */
+static int l_device_ambit_set_metadata(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    size_t len = 0;
+    const char *data = luaL_checklstring(L, 2, &len);
+    cmd_result_t res = cmd_ambit_set_metadata(ch, (const uint8_t *)data, len);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 /* ── db.* bindings ───────────────────────────────────────────────────── */
 
 static int l_db_store(lua_State *L)
@@ -445,15 +694,30 @@ static int l_mqtt_publish_unsynced(lua_State *L)
 static void lua_register_device_module(lua_State *L)
 {
     static const luaL_Reg device_api[] = {
-        {"set_rgb",      l_device_set_rgb},
-        {"read_rtc",     l_device_read_rtc},
-        {"status",       l_device_status},
-        {"read_env",     l_device_read_env},
-        {"sleep_ms",     l_device_sleep_ms},
-        {"log",          l_device_log},
-        {"uart_ping",    l_device_uart_ping},
-        {"uart_query",   l_device_uart_query},
-        {"uart_status",  l_device_uart_status},
+        {"set_rgb",                l_device_set_rgb},
+        {"read_rtc",               l_device_read_rtc},
+        {"status",                 l_device_status},
+        {"read_env",               l_device_read_env},
+        {"sleep_ms",               l_device_sleep_ms},
+        {"log",                    l_device_log},
+        /* UART raw */
+        {"uart_ping",              l_device_uart_ping},
+        {"uart_query",             l_device_uart_query},
+        {"uart_status",            l_device_uart_status},
+        /* Ambit typed commands */
+        {"ambit_set_gains",        l_device_ambit_set_gains},
+        {"ambit_set_currents",     l_device_ambit_set_currents},
+        {"ambit_config_detector",  l_device_ambit_config_detector},
+        {"ambit_get_temp",         l_device_ambit_get_temp},
+        {"ambit_get_spec",         l_device_ambit_get_spec},
+        {"ambit_get_temp_raw",     l_device_ambit_get_temp_raw},
+        {"ambit_get_info",         l_device_ambit_get_info},
+        {"ambit_run",              l_device_ambit_run},
+        {"ambit_run_mpf",          l_device_ambit_run_mpf},
+        {"ambit_blink",            l_device_ambit_blink},
+        {"ambit_calibrate_baseline", l_device_ambit_calibrate_baseline},
+        {"ambit_actinic",          l_device_ambit_actinic},
+        {"ambit_set_metadata",     l_device_ambit_set_metadata},
         {NULL, NULL},
     };
 

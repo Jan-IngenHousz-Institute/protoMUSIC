@@ -598,7 +598,7 @@ void app_main(void)
         .uart_status            = uart_available ? uart_sensors_get_status_fn() : NULL,
     };
     device_commands_init(&cmd_cfg);
-    device_commands_subscribe_inbound();
+    // device_commands_subscribe_inbound();
 
     /* ── Start application tasks ──────────────────────────────────── */
     app_start_lua_runner();

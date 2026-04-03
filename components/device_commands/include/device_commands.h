@@ -98,7 +98,7 @@ cmd_result_t cmd_mqtt_status(void);
 /* Cert status (Phase 6C) */
 cmd_result_t cmd_cert_status(void);
 
-/* UART sensor commands (Phase 7) */
+/* UART sensor commands — raw (Phase 7) */
 cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
                             const uint8_t *extra, size_t extra_len,
                             size_t expect_raw,
@@ -106,6 +106,40 @@ cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
                             uint32_t timeout_ms);
 cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected);
 cmd_result_t cmd_uart_status(void);
+
+/* Ambit sensor commands — typed wrappers (Phase 7) */
+
+/* Configuration (ack-only — no CMD_END) */
+cmd_result_t cmd_ambit_set_gains(uint8_t ch, uint8_t fluo, uint8_t fluoref,
+                                  uint8_t ir, uint8_t irref,
+                                  uint8_t sun, uint8_t leaf);
+cmd_result_t cmd_ambit_set_currents(uint8_t ch, uint8_t i620, uint8_t i720,
+                                     uint8_t ir);
+cmd_result_t cmd_ambit_config_detector(uint8_t ch);
+
+/* Queries (immediate raw response) */
+cmd_result_t cmd_ambit_get_temp(uint8_t ch, float *leaf_temp, float *chip_temp);
+cmd_result_t cmd_ambit_get_spec(uint8_t ch, uint16_t spec[10], float *par);
+cmd_result_t cmd_ambit_get_temp_raw(uint8_t ch, float *leaf, float *leaf1,
+                                     float *chip, int16_t raw[4]);
+cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
+                                 uint8_t *out, size_t out_size, size_t *out_len);
+
+/* Measurements (FSM response) */
+cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
+                            uint8_t led_persist, bool allow_interrupt,
+                            uart_sensor_response_t *response, uint32_t timeout_ms);
+cmd_result_t cmd_ambit_run_mpf(uint8_t ch, uint16_t length, uint8_t interval,
+                                bool change_act, uint8_t act,
+                                uart_sensor_response_t *response, uint32_t timeout_ms);
+
+/* Actions (wait for CMD_END, no response data) */
+cmd_result_t cmd_ambit_blink(uint8_t ch, uint8_t ambit_id, uint8_t intensity);
+cmd_result_t cmd_ambit_calibrate_baseline(uint8_t ch);
+cmd_result_t cmd_ambit_actinic(uint8_t ch, uint8_t type, uint8_t var, uint8_t var2);
+
+/* Write commands (extra data buffered, wait for CMD_END) */
+cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t len);
 
 /* Call from the Wi-Fi disconnect event handler to clear any in-flight publish slot */
 void device_commands_on_mqtt_disconnect(void);

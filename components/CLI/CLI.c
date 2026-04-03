@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 
+#include "ambit_protocol.h"
 #include "device_commands.h"
 #include "i2c_bus.h"
 #include "wifi_manager.h"
@@ -368,6 +369,123 @@ static int cli_cmd_uart_status(int argc, char **argv)
     return (res.status == ESP_OK) ? 0 : 1;
 }
 
+static int cli_cmd_ambit_temp(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("Usage: ambit_temp <channel 0-3>\r\n");
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    float leaf = 0, chip = 0;
+    cmd_result_t res = cmd_ambit_get_temp((uint8_t)ch, &leaf, &chip);
+    if (res.status != ESP_OK) {
+        printf("Error: %s\r\n", res.message);
+        return 1;
+    }
+    printf("AMBIT%d leaf=%.1fC  chip=%.1fC\r\n", ch + 1, leaf, chip);
+    return 0;
+}
+
+static int cli_cmd_ambit_spec(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("Usage: ambit_spec <channel 0-3>\r\n");
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    uint16_t spec[10] = {0};
+    float par = 0;
+    cmd_result_t res = cmd_ambit_get_spec((uint8_t)ch, spec, &par);
+    if (res.status != ESP_OK) {
+        printf("Error: %s\r\n", res.message);
+        return 1;
+    }
+    printf("AMBIT%d spectrum:", ch + 1);
+    for (int i = 0; i < 10; i++) printf(" %u", spec[i]);
+    printf("  PAR=%.2f\r\n", par);
+    return 0;
+}
+
+static int cli_cmd_ambit_info(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("Usage: ambit_info <channel 0-3> <1=cal|2=fw|3=meta>\r\n");
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    int type = atoi(argv[2]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS || type < 1 || type > 3) {
+        printf("Channel 0-%d, type 1-3\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    uint8_t buf[256];
+    size_t len = 0;
+    cmd_result_t res = cmd_ambit_get_info((uint8_t)ch, (uint8_t)type,
+                                           buf, sizeof(buf), &len);
+    if (res.status != ESP_OK) {
+        printf("Error: %s\r\n", res.message);
+        return 1;
+    }
+    printf("AMBIT%d info(%d): %u bytes\r\n", ch + 1, type, (unsigned)len);
+    if (type == AMBIT_INFO_CALIBRATION && len >= sizeof(ambit_calibration_t)) {
+        const ambit_calibration_t *cal = (const ambit_calibration_t *)buf;
+        printf("  Name:       %.20s\r\n", cal->ambit_name);
+        printf("  Actinic:    %.4f\r\n", cal->actinic_coef);
+        printf("  Spec coef:  %.4f\r\n", cal->spec_coef);
+        printf("  Emissivity: %.4f\r\n", cal->mlx_emissivity);
+        printf("  Sun coef:   %.4f\r\n", cal->sun_coef);
+        printf("  Temp off/slope: %.2f / %.2f\r\n", cal->temp_offset, cal->temp_slope);
+        printf("  ADPD offsets: %lu %lu %lu %lu %lu %lu\r\n",
+               (unsigned long)cal->adpd[0], (unsigned long)cal->adpd[1],
+               (unsigned long)cal->adpd[2], (unsigned long)cal->adpd[3],
+               (unsigned long)cal->adpd[4], (unsigned long)cal->adpd[5]);
+    }
+    if (type == AMBIT_INFO_FW && len >= sizeof(ambit_fw_info_t)) {
+        const ambit_fw_info_t *fw = (const ambit_fw_info_t *)buf;
+        printf("  FW version: %u.%u.%u\r\n", fw->major, fw->minor, fw->batch);
+        printf("  MAC:        %016llX\r\n", (unsigned long long)fw->mac);
+        printf("  Build date: %.12s\r\n", fw->fw_date);
+        printf("  Flash size: %lu\r\n", (unsigned long)fw->size);
+    }
+    if (type == AMBIT_INFO_METADATA && len >= sizeof(ambit_metadata_t)) {
+        const ambit_metadata_t *meta = (const ambit_metadata_t *)buf;
+        printf("  GPS:  lon=%.6f  lat=%.6f\r\n", meta->lon, meta->lat);
+        printf("  Alt:  %.1f m  (acc=%.1f  vacc=%.1f)\r\n",
+               meta->alt, meta->acc, meta->vacc);
+        printf("  Time: %lu\r\n", (unsigned long)meta->time);
+        printf("  Info: %.60s%s\r\n", meta->info1,
+               strlen(meta->info1) > 60 ? "..." : "");
+        printf("  EOF:  %u\r\n", meta->eof_mark);
+    }
+    return 0;
+}
+
+static int cli_cmd_ambit_blink(int argc, char **argv)
+{
+    if (argc != 4) {
+        printf("Usage: ambit_blink <channel 0-3> <ambit_id 0-3> <intensity 5-253>\r\n");
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    int id = atoi(argv[2]);
+    int intensity = atoi(argv[3]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    cmd_result_t res = cmd_ambit_blink((uint8_t)ch, (uint8_t)id, (uint8_t)intensity);
+    printf("%s\r\n", res.message);
+    return (res.status == ESP_OK) ? 0 : 1;
+}
+
 static int cli_cmd_wifi_reset(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -432,6 +550,26 @@ static esp_err_t cli_register_commands(void)
         .help    = "show connection state of all 4 UART sensor channels",
         .func    = cli_cmd_uart_status,
     };
+    static const esp_console_cmd_t ambit_temp_cmd = {
+        .command = "ambit_temp",
+        .help    = "ambit_temp <0-3>  read leaf+chip temperature from AMBIT sensor",
+        .func    = cli_cmd_ambit_temp,
+    };
+    static const esp_console_cmd_t ambit_spec_cmd = {
+        .command = "ambit_spec",
+        .help    = "ambit_spec <0-3>  read spectrum + PAR from AMBIT sensor",
+        .func    = cli_cmd_ambit_spec,
+    };
+    static const esp_console_cmd_t ambit_info_cmd = {
+        .command = "ambit_info",
+        .help    = "ambit_info <0-3> <1=cal|2=fw|3=meta>  read sensor info",
+        .func    = cli_cmd_ambit_info,
+    };
+    static const esp_console_cmd_t ambit_blink_cmd = {
+        .command = "ambit_blink",
+        .help    = "ambit_blink <0-3> <id> <brightness>  blink AMBIT LED",
+        .func    = cli_cmd_ambit_blink,
+    };
     static const esp_console_cmd_t wifi_reset_cmd = {
         .command = "wifi_reset",
         .help    = "clear Wi-Fi credentials + provisioning flag and reboot",
@@ -484,6 +622,26 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&uart_status_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_temp_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_spec_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_info_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_blink_cmd);
     if (err != ESP_OK) {
         return err;
     }
