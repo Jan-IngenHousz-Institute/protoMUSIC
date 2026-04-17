@@ -49,12 +49,15 @@ Only [components/littlefs](components/littlefs) is a submodule today. Its nested
 
 ## 3. Install ESP-IDF Python requirements
 
-PlatformIO creates an ESP-IDF venv at `~/.platformio/penv/.espidf-5.5.3/` but on some systems it's left empty. If builds fail with `ModuleNotFoundError: No module named 'idf_component_manager'`:
+PlatformIO creates an ESP-IDF venv at `~/.platformio/penv/.espidf-5.5.3/` but on some systems it's left empty. If builds fail with `ModuleNotFoundError: No module named 'idf_component_manager'`, use `uv` to populate it:
 
 ```sh
-~/.platformio/penv/.espidf-5.5.3/bin/python -m pip install \
+uv pip install \
+  --python ~/.platformio/penv/.espidf-5.5.3/bin/python \
   -r ~/.platformio/packages/framework-espidf/tools/requirements/requirements.core.txt
 ```
+
+We can't move the venv itself — PlatformIO's build scripts invoke that exact interpreter path — but `uv pip --python <path>` gives us a much faster resolver than plain `pip`.
 
 ## 4. Build
 
