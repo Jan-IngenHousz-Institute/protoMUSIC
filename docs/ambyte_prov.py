@@ -9,17 +9,19 @@ Sends over one BLE session (120-second window):
 
 After all three succeed the device reboots automatically (prov_ok || any_write).
 
-Usage (PowerShell):
-  python docs\\ambyte_prov.py `
-    --ssid       YOUR_WIFI `
-    --password   YOUR_WIFI_PASS `
-    --mqtt_uri   "mqtts://XXXX.iot.REGION.amazonaws.com:8883" `
-    --client_id  "thing-001" `
-    --topic_root "ambyte/prod" `
-    --device_id  "thing-001" `
-    --ca_cert    ca.pem `
-    --dev_cert   device.crt `
-    --dev_key    device.key
+Any field can be supplied via:
+  - CLI flag                 (--ssid YOUR_WIFI)
+  - Environment variable     (AMBYTE_SSID=YOUR_WIFI)
+  - Cached config file       (~/.ambyte_prov.json, auto-written after first run)
+  - Interactive prompt       (fallback for anything still missing)
+
+Precedence is top-down — CLI beats env beats cache beats prompt. Subsequent
+runs can therefore be just:
+
+  python docs/ambyte_prov.py
+
+and anything missing will be prompted. The Wi-Fi password is never cached on
+disk; it's always read from $AMBYTE_PASSWORD, --password, or a getpass prompt.
 
 Prerequisites (one-time):
   pip install bleak protobuf cryptography
@@ -29,13 +31,33 @@ Note: on Windows, run PowerShell as Administrator if BLE access is denied.
 
 import argparse
 import asyncio
+import getpass
 import json
 import os
 import struct
 import sys
+from pathlib import Path
+
+# ── Auto-load .env from repo root (no dotenv dependency) ─────────────
+def _load_dotenv() -> None:
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key   = key.strip()
+        value = value.strip().strip('"').strip("'")
+        # Existing shell env wins — .env only fills gaps.
+        os.environ.setdefault(key, value)
+
+_load_dotenv()
 
 # ── Locate esp_prov inside PlatformIO's bundled ESP-IDF ──────────────
-_IDF_PATH = os.path.expanduser("~/.platformio/packages/framework-espidf")
+_IDF_PATH = os.environ.get("IDF_PATH") or os.path.expanduser("~/.platformio/packages/framework-espidf")
+os.environ["IDF_PATH"] = _IDF_PATH
 sys.path.insert(0, os.path.join(_IDF_PATH, "tools", "esp_prov"))
 sys.path.insert(0, os.path.join(_IDF_PATH, "components", "protocomm", "python"))
 
@@ -182,12 +204,18 @@ async def run(args) -> None:
 
     try:
         # 2. Wi-Fi credentials (standard endpoint)
-        if args.ssid is not None:
+        if args.skip_wifi:
+            print("[1/3] Skipping Wi-Fi credentials (--skip-wifi)")
+        elif args.ssid is not None:
             print("[1/3] Wi-Fi credentials...")
             if not await esp_prov.send_wifi_config(tp, sec, args.ssid, args.password):
                 raise RuntimeError("Wi-Fi config rejected by device")
             if not await esp_prov.apply_wifi_config(tp, sec):
-                raise RuntimeError("Wi-Fi apply failed")
+                raise RuntimeError(
+                    "Wi-Fi apply failed — the device likely already has Wi-Fi\n"
+                    "  configured from a previous run. To re-provision, either:\n"
+                    "    • erase flash and reflash:  pio run -e esp32-s3-devkitm-1 -t erase_flash -t upload\n"
+                    "    • or skip Wi-Fi and update only MQTT/certs:  --skip-wifi")
             print("  prov-config: OK")
         else:
             print("[1/3] Skipping Wi-Fi credentials (none provided)")
@@ -219,41 +247,137 @@ async def run(args) -> None:
     print("All done. The device will reboot and connect to AWS IoT Core with TLS.")
 
 
+# ── Config resolution ────────────────────────────────────────────────
+#
+# Each field resolves in this precedence order:
+#   1. CLI flag                  (--ssid foo)
+#   2. Environment variable      (AMBYTE_SSID=foo)
+#   3. Cached config file        (~/.ambyte_prov.json)
+#   4. Interactive prompt        (input() / getpass for secrets)
+#
+# After all fields are resolved, non-secret values are written back to the
+# config file so the next run offers them as defaults.
+
+CONFIG_PATH = Path.home() / ".ambyte_prov.json"
+
+# (cli_name, prompt_label, is_secret, is_path)
+FIELDS = [
+    ("ssid",             "Wi-Fi SSID",                                    False, False),
+    ("password",         "Wi-Fi password",                                True,  False),
+    ("mqtt_uri",         "MQTT broker URI (mqtts://...:8883)",            False, False),
+    ("client_id",        "MQTT client ID",                                False, False),
+    ("topic_root",       "MQTT topic root prefix",                        False, False),
+    ("device_id",        "Device ID (embedded in MQTT topics)",           False, False),
+    ("protocol_id",      "MultispeQ protocol ID",                         False, False),
+    ("device_name",      "Device name (e.g. AmbyteOnAir)",                False, False),
+    ("device_version",   "Device hardware version",                       False, False),
+    ("device_firmware",  "Device firmware version",                       False, False),
+    ("firmware_version", "Firmware version",                              False, False),
+    ("ca_cert",          "Path to AWS root CA PEM",                       False, True),
+    ("dev_cert",         "Path to device certificate PEM",                False, True),
+    ("dev_key",          "Path to device private key PEM",                False, True),
+]
+
+
+def _load_cached() -> dict:
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_cached(values: dict) -> None:
+    safe = {k: v for k, v in values.items()
+            if v is not None and not any(n == k and secret for n, _, secret, _ in FIELDS)}
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(safe, f, indent=2)
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError as e:
+        print(f"(warning: could not save {CONFIG_PATH}: {e})", file=sys.stderr)
+
+
+def _normalize_path(value: str) -> str:
+    # Accept Windows-style backslash paths too (from PowerShell one-liners).
+    return os.path.normpath(value.replace("\\", "/"))
+
+
+def _prompt(label: str, default: str | None, secret: bool) -> str:
+    if not sys.stdin.isatty():
+        raise SystemExit(f"missing required value for '{label}' and no TTY for prompting")
+    if secret:
+        shown = " [press enter to keep saved]" if default else ""
+        val = getpass.getpass(f"{label}{shown}: ")
+        return val or (default or "")
+    suffix = f" [{default}]" if default else ""
+    val = input(f"{label}{suffix}: ").strip()
+    return val or (default or "")
+
+
+def resolve_config(cli: argparse.Namespace) -> argparse.Namespace:
+    cached  = _load_cached()
+    final   = {}
+    changed = False
+
+    for name, label, secret, is_path in FIELDS:
+        value = getattr(cli, name, None)
+        if value is None:
+            value = os.environ.get(f"AMBYTE_{name.upper()}")
+        if value is None:
+            value = cached.get(name)
+        if value is None or value == "":
+            value = _prompt(label, cached.get(name), secret)
+            changed = True
+        if not value:
+            raise SystemExit(f"'{label}' is required")
+        if is_path:
+            value = _normalize_path(value)
+        final[name] = value
+
+    # Fail fast on bad cert paths so we don't burn a 120s BLE session.
+    for name, _, _, is_path in FIELDS:
+        if is_path and not os.path.isfile(final[name]):
+            raise SystemExit(
+                f"{name}: file not found: {final[name]}\n"
+                f"Check your .env / {CONFIG_PATH} / CLI flag.")
+
+    if changed:
+        _save_cached(final)
+
+    # Preserve non-FIELD args (e.g. --skip-wifi) passed through untouched.
+    for k, v in vars(cli).items():
+        final.setdefault(k, v)
+
+    return argparse.Namespace(**final)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Ambyte full BLE provisioning: WiFi + MQTT config + TLS certs",
+        description="Ambyte full BLE provisioning: WiFi + MQTT config + TLS certs.\n"
+                    "Any flag omitted falls back to $AMBYTE_<FIELD>, then .env in the\n"
+                    f"repo root, then {CONFIG_PATH}, then an interactive prompt.",
         formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("--ssid",        required=True,
-                   help="Wi-Fi SSID")
-    p.add_argument("--password",    required=True,
-                   help="Wi-Fi password")
-    p.add_argument("--mqtt_uri",    required=True,
-                   help="MQTT broker URI\n"
-                        "e.g. mqtts://XXXX.iot.REGION.amazonaws.com:8883")
-    p.add_argument("--client_id",   required=True,
-                   help="MQTT client ID (e.g. thing-001)")
-    p.add_argument("--topic_root",  required=True,
-                   help="MQTT topic root prefix (e.g. ambyte/prod)")
-    p.add_argument("--device_id",   required=True,
-                   help="Device ID embedded in MQTT topics (e.g. thing-001)")
-    p.add_argument("--protocol_id", required=True,
-                   help="MultispeQ protocol ID (e.g. 3517)")
-    p.add_argument("--device_name", required=True,
-                   help="Device name reported in payload (e.g. AmbyteOnAir)")
-    p.add_argument("--device_version", required=True,
-                   help="Device hardware version string (e.g. 1)")
-    p.add_argument("--device_firmware", required=True,
-                   help="Device firmware version string (e.g. 1)")
-    p.add_argument("--firmware_version", required=True,
-                   help="Firmware version string (e.g. 1)")
-    p.add_argument("--ca_cert",     required=True,
-                   help="Path to AWS root CA certificate PEM file")
-    p.add_argument("--dev_cert",    required=True,
-                   help="Path to device certificate PEM file")
-    p.add_argument("--dev_key",     required=True,
-                   help="Path to device private key PEM file")
+    p.add_argument("--ssid",             help="Wi-Fi SSID")
+    p.add_argument("--password",         help="Wi-Fi password")
+    p.add_argument("--mqtt_uri",         help="MQTT broker URI (mqtts://...:8883)")
+    p.add_argument("--client_id",        help="MQTT client ID")
+    p.add_argument("--topic_root",       help="MQTT topic root prefix")
+    p.add_argument("--device_id",        help="Device ID embedded in MQTT topics")
+    p.add_argument("--protocol_id",      help="MultispeQ protocol ID")
+    p.add_argument("--device_name",      help="Device name reported in payload")
+    p.add_argument("--device_version",   help="Device hardware version")
+    p.add_argument("--device_firmware",  help="Device firmware version")
+    p.add_argument("--firmware_version", help="Firmware version")
+    p.add_argument("--ca_cert",          help="Path to AWS root CA PEM")
+    p.add_argument("--dev_cert",         help="Path to device certificate PEM")
+    p.add_argument("--dev_key",          help="Path to device private key PEM")
+    p.add_argument("--skip-wifi", action="store_true",
+                   default=os.environ.get("AMBYTE_SKIP_WIFI", "").lower() in ("1", "true", "yes"),
+                   help="Skip step 1 (Wi-Fi apply). Use when the device already has\n"
+                        "Wi-Fi from a previous run and you only want to update MQTT/certs.")
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    asyncio.run(run(parse_args()))
+    asyncio.run(run(resolve_config(parse_args())))

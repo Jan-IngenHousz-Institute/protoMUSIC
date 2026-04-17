@@ -1,4 +1,5 @@
 .*/
+.env
 build/
 temp_inipreview.txt
 dom_ludo_prototype_ambyte_thing_certs/
