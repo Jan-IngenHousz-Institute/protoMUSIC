@@ -12,24 +12,21 @@ ESP32-S3 firmware for the Ambyte IoT device: BLE-provisioned Wi-Fi + MQTT-over-T
 ## Quick start
 
 ```sh
-# 1. Clone with submodules
+# 1. Clone + init the littlefs submodule (sqlite3 and certs.c are vendored in-tree)
 git clone <repo-url>
 cd ambyte-iot-ludo
-git submodule update --init --recursive
+git submodule update --init --recursive   # pulls components/littlefs and its nested lfs
 
-# 2. Drop in the gitignored certs component implementation (see §4)
-cp /path/to/your/certs.c components/certs/certs.c
-
-# 3. Build & flash
+# 2. Build & flash
 pio run -e esp32-s3-devkitm-1 -t upload
 pio device monitor -b 115200
 
-# 4. Provision (first-time only)
+# 3. Provision (first-time only)
 cp .env.example .env && $EDITOR .env
 uv run docs/ambyte_prov.py
 ```
 
-Everything below is the long-form version of those four steps plus troubleshooting.
+Everything below is the long-form version of those three steps plus troubleshooting.
 
 ---
 
@@ -37,7 +34,7 @@ Everything below is the long-form version of those four steps plus troubleshooti
 
 - [PlatformIO Core](https://platformio.org/install) (VS Code extension or `pio` CLI)
 - [`uv`](https://docs.astral.sh/uv/) for the Python side (provisioning script + lockfile)
-- Python 3.13 (auto-managed by `uv`); the PlatformIO/ESP-IDF side tolerates 3.9–3.13
+- Python 3.13 (auto-managed by `uv`); the PlatformIO/ESP-IDF side tolerates 3.9-3.13
 - Git with submodule support
 
 ## 2. Clone with submodules
@@ -48,7 +45,7 @@ cd ambyte-iot-ludo
 git submodule update --init --recursive
 ```
 
-If `components/sqlite3` fails with `not our ref`, the recorded commit was force-pushed away upstream — see [§5](#5-sqlite3-submodule-compat-patches).
+Only [components/littlefs](components/littlefs) is a submodule today. Its nested `littlefs/src/littlefs` submodule is pulled by `--recursive`. `components/sqlite3` and `components/certs/certs.c` are vendored directly in the tree.
 
 ## 3. Install ESP-IDF Python requirements
 
@@ -59,46 +56,13 @@ PlatformIO creates an ESP-IDF venv at `~/.platformio/penv/.espidf-5.5.3/` but on
   -r ~/.platformio/packages/framework-espidf/tools/requirements/requirements.core.txt
 ```
 
-## 4. Provide `components/certs/certs.c`
-
-This file is `.gitignore`'d (may embed device-specific code or credentials). It implements the API declared in [components/certs/include/certs.h](components/certs/include/certs.h):
-
-- `certs_init()` — open NVS namespace `"certs"` and load PEM buffers
-- `certs_are_provisioned()` — true iff CA, device cert, device key all present
-- `certs_get_*()` — non-NULL PEM string getters
-- `certs_set_*()` — persist PEM to NVS and update the in-memory buffer
-
-Obtain from a teammate or restore from backup. Without it, the build fails at CMake-configure time.
-
-## 5. sqlite3 submodule compat patches
-
-Upstream `siara-cc/esp32-idf-sqlite3` master is not ESP-IDF 5.x-compatible. Two local patches are committed in-tree; re-apply if the submodule gets reset:
-
-**[components/sqlite3/esp32.c](components/sqlite3/esp32.c)** — swap the obsolete header:
-
-```diff
--#include <esp_spi_flash.h>
- #include <esp_system.h>
-+#include <esp_random.h>
-+#include <spi_flash_mmap.h>
-```
-
-**[components/sqlite3/CMakeLists.txt](components/sqlite3/CMakeLists.txt)** — add the deps needed by the header swap:
-
-```diff
--                       PRIV_REQUIRES console spiffs)
-+                       PRIV_REQUIRES console spiffs spi_flash esp_system)
-```
-
-The submodule is pinned to upstream master `6919392` (the originally recorded commit was force-pushed away upstream).
-
-## 6. Build
+## 4. Build
 
 ```sh
 pio run -e esp32-s3-devkitm-1
 ```
 
-## 7. Flash + monitor
+## 5. Flash + monitor
 
 Connect the ESP32-S3 via USB. PlatformIO auto-detects the port; override with `--upload-port` if needed.
 
@@ -117,7 +81,7 @@ pio run -e esp32-s3-devkitm-1 -t erase_flash -t upload
 
 Without this, re-running the provisioning script will fail at "Wi-Fi apply" because the device is already connected. Alternatively, pass `--skip-wifi` to the provisioning script to update only MQTT config and certs.
 
-## 8. BLE provisioning
+## 6. BLE provisioning
 
 After first flash the device waits for BLE provisioning. The helper script [docs/ambyte_prov.py](docs/ambyte_prov.py) sends Wi-Fi creds, MQTT config, and TLS certs in one 120-second BLE session.
 
@@ -183,8 +147,6 @@ uv run docs/ambyte_prov.py \
 | Symptom | Fix |
 |---|---|
 | `No module named 'idf_component_manager'` | §3 |
-| `Failed to resolve component 'sqlite3'` | §2 (submodules) + §5 |
-| `components/certs/certs.c: No such file` | §4 |
 | `littlefs/lfs.h: No such file` | `git submodule update --init --recursive` |
 | `KeyError: 'IDF_PATH'` from `esp_prov` | Pull latest `docs/ambyte_prov.py` (self-sets `IDF_PATH`) |
 | `ModuleNotFoundError: No module named 'google'` from `esp_prov` | Run via `uv run docs/ambyte_prov.py` (not bare `python`) |
@@ -194,10 +156,10 @@ uv run docs/ambyte_prov.py \
 
 ```
 components/          # ESP-IDF components
-  certs/             # (private) TLS cert store, certs.c is gitignored
+  certs/             # TLS cert store (NVS-backed)
   hal/               # board HAL (i2c_bus, ...)
   littlefs/          # submodule — flash filesystem
-  sqlite3/           # submodule — local DB (patched for IDF 5.x)
+  sqlite3/           # vendored — local DB (siara-cc/esp32-idf-sqlite3, patched for IDF 5.x)
   ambyte_status/     # LED/status indicators
   bme280/            # temp/humidity/pressure sensor
   device_commands/   # remote command dispatcher
