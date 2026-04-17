@@ -9,5 +9,6 @@ requires-python = ">=3.13"
 dependencies = [
     "bleak>=3.0.1",
     "cryptography>=46.0.7",
+    "paho-mqtt>=2.1.0",
     "protobuf>=7.34.1",
 ]

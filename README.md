@@ -116,9 +116,32 @@ chmod 600 .env
 
 After that, `uv run docs/ambyte_prov.py` alone will prompt for anything missing. The Wi-Fi password is **never** cached to disk — it's read only from `$AMBYTE_PASSWORD`, `--password`, or a one-shot `getpass` prompt.
 
-### Device certs
+### Device certs — bundle layout
 
-Put your AWS IoT Core PEM files under [device_certs/](device_certs/) (gitignored). `.env.example` assumes that location. Paths accept both `/` and `\` separators, so PowerShell-pasted paths work on Linux.
+Put each thing's AWS IoT Core PEM files in its own subdirectory under [device_certs/](device_certs/) (gitignored). The subdirectory name **must match the AWS IoT thing name** — it doubles as `AMBYTE_CLIENT_ID`.
+
+```
+device_certs/
+  <thing-name-a>/
+    AmazonRootCA1.pem
+    <hash>-certificate.pem.crt
+    <hash>-private.pem.key
+  <thing-name-b>/
+    ...
+```
+
+Pick the bundle via `AMBYTE_CERT_BUNDLE` in `.env`:
+
+```sh
+AMBYTE_CERT_BUNDLE=dom_ludo_prototype_ambyte_thing_v2
+```
+
+- `AMBYTE_CLIENT_ID` auto-derives from the bundle name — AWS IoT binds each cert to a specific thing and rejects any mismatched client id, so linking them makes the common case foolproof. Uncomment the `AMBYTE_CLIENT_ID` line in `.env` only if you deliberately need a different value.
+- With only one subfolder, it's auto-selected silently. With several, the scripts list them and prompt on a TTY.
+- Explicit `AMBYTE_CA_CERT` / `AMBYTE_DEV_CERT` / `AMBYTE_DEV_KEY` override bundle auto-discovery for their slot.
+- `AMBYTE_TOPIC_ROOT` is **not** auto-derived; if the thing name appears inside it, update it by hand when switching bundles (AWS IoT policy scopes typically restrict publish/subscribe topics to strings containing the thing name).
+
+Paths accept both `/` and `\` separators, so PowerShell-pasted paths work on Linux.
 
 ### Full CLI example (first run, everything explicit)
 
@@ -145,6 +168,23 @@ uv run docs/ambyte_prov.py \
 - **Linux:** if `bleak` permission-denies, grant cap_net_raw to the venv python: `sudo setcap cap_net_raw,cap_net_admin+eip $(readlink -f .venv/bin/python)`.
 - **Windows PowerShell:** run as Administrator for BLE access. Use backticks (`` ` ``) for line continuation instead of backslashes.
 
+## 7. MQTT TLS test client
+
+[docs/mqtt_tls_test_client.py](docs/mqtt_tls_test_client.py) is a host-side paho-mqtt client that connects to your AWS IoT endpoint with the same device cert + key you provisioned — useful for reproducing issues without the firmware in the loop. It auto-loads `.env` (host, cert paths, client id, topic root), so no connection flags are needed:
+
+```sh
+# Subscribe to everything under your topic root (defaults to $AMBYTE_TOPIC_ROOT/#)
+uv run docs/mqtt_tls_test_client.py --subscribe
+
+# Publish a dummy measurement to $AMBYTE_TOPIC_ROOT (dummy JSON built from AMBYTE_* env)
+uv run docs/mqtt_tls_test_client.py --publish --mqtt5
+
+# Publish a custom message to a specific topic
+uv run docs/mqtt_tls_test_client.py --publish some/topic --message 'hello from python'
+```
+
+Any flag overrides its `.env` counterpart. Remember AWS IoT Core's 7-slash limit on topic filters — see the device's publish topic shape at [components/device_commands/device_commands.c](components/device_commands/device_commands.c).
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -154,6 +194,7 @@ uv run docs/ambyte_prov.py \
 | `KeyError: 'IDF_PATH'` from `esp_prov` | Pull latest `docs/ambyte_prov.py` (self-sets `IDF_PATH`) |
 | `ModuleNotFoundError: No module named 'google'` from `esp_prov` | Run via `uv run docs/ambyte_prov.py` (not bare `python`) |
 | `RuntimeError: Wi-Fi apply failed` | Device already provisioned. Either `pio run -t erase_flash -t upload` or re-run with `--skip-wifi` |
+| MQTT connects then immediately disconnects (AWS kicks the client) | `AMBYTE_CLIENT_ID` doesn't match the thing the cert is bound to — align `AMBYTE_CERT_BUNDLE` with the thing name and let client_id auto-derive |
 
 ## Repository layout
 
@@ -178,7 +219,8 @@ components/          # ESP-IDF components
   wifi_manager/      # Wi-Fi provisioning + reconnect
 
 main/                # app entry point
-docs/                # provisioning script + protocol notes
+docs/                # host-side scripts: BLE provisioner, MQTT TLS test client
+planning/            # LLM prompts, phase plans, hardware-test notes
 device_certs/        # (gitignored) AWS IoT PEM files
 .env / .env.example  # provisioning defaults
 pyproject.toml       # Python deps (uv)
