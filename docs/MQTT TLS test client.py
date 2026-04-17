@@ -31,8 +31,8 @@ python mqtt_test.py ... --mqtt5
 
 use as:
 
-python '..\MQTT TLS test client.py' --ca .\AmazonRootCA1.pem --cert .\5981af399524454b9af0055c6f48a6d69e98c1088d4c29cc42177961a1f9ac8c-certificate.pem.crt --key .\5981af399524454b9af0055c6f48a6d69e98c1088d4c29cc42177961a1f9ac8c-private.pem.key --host a2s5vvyojsnl53-ats.iot.eu-central-1.amazonaws.com --mqtt5 --publish experiment/data_ingest/v1/8d044362-8719-4823-847a-61073f8c8f97/multispeq/v1.0/dom_ludo_prototype_ambyte_thing/test_server  --client-id dom_ludo_prototype_ambyte_thing
-
+////// old ///// python '..\MQTT TLS test client.py' --ca .\AmazonRootCA1.pem --cert .\5981af399524454b9af0055c6f48a6d69e98c1088d4c29cc42177961a1f9ac8c-certificate.pem.crt --key .\5981af399524454b9af0055c6f48a6d69e98c1088d4c29cc42177961a1f9ac8c-private.pem.key --host a2s5vvyojsnl53-ats.iot.eu-central-1.amazonaws.com --mqtt5 --publish experiment/data_ingest/v1/8d044362-8719-4823-847a-61073f8c8f97/multispeq/v1.0/dom_ludo_prototype_ambyte_thing/test_server  --client-id dom_ludo_prototype_ambyte_thing
+python 'docs\MQTT TLS test client.py' --message "hello again from python" --ca device_certs\AmazonRootCA1.pem --cert device_certs\5981af399524454b9af0055c6f48a6d69e98c1088d4c29cc42177961a1f9ac8c-certificate.pem.crt --key device_certs\5981af399524454b9af0055c6f48a6d69e98c1088d4c29cc42177961a1f9ac8c-private.pem.key --host a2s5vvyojsnl53-ats.iot.eu-central-1.amazonaws.com --mqtt5 --publish experiment/data_ingest/v1/8d044362-8719-4823-847a-61073f8c8f97/multispeq/v1.0/dom_ludo_prototype_ambyte_thing/test_server  --client-id dom_ludo_prototype_ambyte_thing
 """
 
 import argparse

@@ -1,11 +1,8 @@
 .*/
 build/
 temp_inipreview.txt
-include/certs.c
-components/certs/certs.c
-components/certs/certs.h
-include/certs/
 dom_ludo_prototype_ambyte_thing_certs/
 docs/ble-provisioning-cmd.txt
 open-jii/
 ambit-1/
+device_certs/
