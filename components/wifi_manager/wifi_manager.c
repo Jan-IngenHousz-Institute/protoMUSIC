@@ -15,21 +15,23 @@
 #include "freertos/event_groups.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "wifi_provisioning/manager.h"
-#include "wifi_provisioning/scheme_ble.h"
 
 #include "wifi_manager.h"
 
 #define WIFI_MANAGER_CONNECTED_BIT BIT0
 #define WIFI_MANAGER_FAILED_BIT BIT1
-#define WIFI_MANAGER_PROV_DONE_BIT BIT2
-#define WIFI_MANAGER_PROV_ABORT_BIT BIT3
 #define WIFI_MANAGER_INITIAL_CONNECT_TIMEOUT_MS 10000
-#define WIFI_MANAGER_PROV_TIMEOUT_MS 1200000
 #define WIFI_MANAGER_STA_IFKEY "WIFI_STA_DEF"
 #define WIFI_MANAGER_UNPROVISIONED_PLACEHOLDER "__UNPROVISIONED__"
 #define WIFI_MANAGER_PROV_NVS_NAMESPACE "wifi_prov"
 #define WIFI_MANAGER_PROV_NVS_KEY "provisioned"
+/* Host-side provisioning seeds Wi-Fi credentials into this namespace; on the
+ * first boot after pre-pop they're copied into esp_wifi's internal NVS via
+ * esp_wifi_set_config(), then the namespace is erased. See
+ * tools/build_nvs_image.py. */
+#define WIFI_MANAGER_CREDS_NVS_NAMESPACE "wifi_creds"
+#define WIFI_MANAGER_CREDS_NVS_KEY_SSID  "ssid"
+#define WIFI_MANAGER_CREDS_NVS_KEY_PASS  "pass"
 
 /* Reconnect backoff: attempt 1 is immediate, then BASE, 2*BASE, 4*BASE ...
  * doubling until capped at MAX. Retries continue indefinitely at MAX so the
@@ -146,6 +148,8 @@ static void wifi_manager_cancel_reconnect(void)
         esp_timer_stop(s_wifi.reconnect_timer);
     }
 }
+
+static esp_err_t wifi_manager_apply_seeded_creds(void);
 
 static bool wifi_manager_config_value_is_placeholder(const char *value)
 {
@@ -492,6 +496,11 @@ esp_err_t wifi_manager_connect_stored(void)
         return err;
     }
 
+    /* First-boot-after-pre-pop: copy host-seeded SSID/password into esp_wifi
+     * NVS, then erase the seed. esp_wifi_connect() below uses the applied
+     * config; on later boots the seed is gone and this is a no-op. */
+    (void)wifi_manager_apply_seeded_creds();
+
     s_wifi.reconnect_count = 0;
     wifi_manager_cancel_reconnect();
     xEventGroupClearBits(s_wifi.event_group,
@@ -531,64 +540,7 @@ bool wifi_manager_is_connected(void)
     return (xEventGroupGetBits(s_wifi.event_group) & WIFI_MANAGER_CONNECTED_BIT) != 0;
 }
 
-/* ── Provisioning ────────────────────────────────────────────────────── */
-
-static esp_err_t wifi_manager_mark_provisioned(void);
-
-static void wifi_prov_event_handler(
-    void *arg,
-    esp_event_base_t event_base,
-    int32_t event_id,
-    void *event_data)
-{
-    (void)arg;
-
-    if (event_base == WIFI_PROV_EVENT) {
-        switch (event_id) {
-            case WIFI_PROV_START:
-                ESP_LOGI(TAG, "Provisioning started — waiting for BLE client");
-                break;
-
-            case WIFI_PROV_CRED_RECV: {
-                const wifi_sta_config_t *cfg = (const wifi_sta_config_t *)event_data;
-                ESP_LOGI(TAG, "Received credentials for SSID: %s", (const char *)cfg->ssid);
-                /* Persist the "provisioned" flag the moment credentials arrive —
-                 * not after a confirmed connection. wifi_prov_mgr has already
-                 * written the SSID/password to Wi-Fi NVS via esp_wifi_set_config,
-                 * so the next boot can join on the (BLE-free) stored-creds path
-                 * even if the join below never succeeds during this BLE session. */
-                esp_err_t mark_err = wifi_manager_mark_provisioned();
-                if (mark_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Could not persist provisioned flag: %s",
-                             esp_err_to_name(mark_err));
-                }
-                break;
-            }
-
-            case WIFI_PROV_CRED_FAIL: {
-                const wifi_prov_sta_fail_reason_t *reason =
-                    (const wifi_prov_sta_fail_reason_t *)event_data;
-                ESP_LOGE(TAG, "Provisioning credential failure: %d",
-                         reason ? (int)*reason : -1);
-                break;
-            }
-
-            case WIFI_PROV_CRED_SUCCESS:
-                ESP_LOGI(TAG, "Provisioning credential success");
-                break;
-
-            case WIFI_PROV_END:
-                ESP_LOGI(TAG, "Provisioning ended");
-                if (s_wifi.event_group != NULL) {
-                    xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_PROV_DONE_BIT);
-                }
-                break;
-
-            default:
-                break;
-        }
-    }
-}
+/* ── Provisioning state (NVS-backed; host-seeded) ────────────────────── */
 
 esp_err_t wifi_manager_is_provisioned(bool *out_provisioned)
 {
@@ -634,128 +586,65 @@ static esp_err_t wifi_manager_mark_provisioned(void)
     return err;
 }
 
-void wifi_manager_finish_provisioning(void)
+/* If host-side provisioning has seeded an SSID/password into the wifi_creds
+ * namespace, copy them into esp_wifi's internal config and erase the seed so
+ * the apply is one-shot. Idempotent: a no-op when the namespace is empty
+ * (e.g. on every subsequent boot after the first). */
+static esp_err_t wifi_manager_apply_seeded_creds(void)
 {
-    if (s_wifi.event_group != NULL) {
-        xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_PROV_ABORT_BIT);
-    }
-}
-
-esp_err_t wifi_manager_start_provisioning(
-    const char *device_name, const char *pop,
-    const wifi_prov_extra_endpoint_t *extra_endpoints,
-    size_t num_extra_endpoints)
-{
-    if (device_name == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t err = wifi_manager_ensure_event_group();
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = esp_event_handler_register(
-        WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
-        &wifi_prov_event_handler, NULL);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    wifi_prov_mgr_config_t prov_cfg = {
-        .scheme = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE,
-    };
-
-    err = wifi_prov_mgr_init(prov_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wifi_prov_mgr_init failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    /* Register custom endpoint names before start (protocomm requires this order) */
-    for (size_t i = 0; i < num_extra_endpoints; i++) {
-        if (extra_endpoints[i].name != NULL) {
-            wifi_prov_mgr_endpoint_create(extra_endpoints[i].name);
-        }
-    }
-
-    wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
-    const char *service_key = NULL;
-
-    xEventGroupClearBits(s_wifi.event_group,
-                         WIFI_MANAGER_CONNECTED_BIT |
-                         WIFI_MANAGER_FAILED_BIT |
-                         WIFI_MANAGER_PROV_DONE_BIT |
-                         WIFI_MANAGER_PROV_ABORT_BIT);
-
-    err = wifi_prov_mgr_start_provisioning(security, pop, device_name, service_key);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wifi_prov_mgr_start_provisioning failed: %s", esp_err_to_name(err));
-        wifi_prov_mgr_deinit();
-        return err;
-    }
-
-    /* Register handlers after start (protocomm session is now live) */
-    for (size_t i = 0; i < num_extra_endpoints; i++) {
-        if (extra_endpoints[i].name != NULL && extra_endpoints[i].handler != NULL) {
-            wifi_prov_mgr_endpoint_register(extra_endpoints[i].name,
-                                            extra_endpoints[i].handler,
-                                            extra_endpoints[i].ctx);
-        }
-    }
-
-    ESP_LOGI(TAG, "BLE provisioning started as \"%s\"", device_name);
-
-    const EventBits_t bits = xEventGroupWaitBits(
-        s_wifi.event_group,
-        WIFI_MANAGER_PROV_DONE_BIT | WIFI_MANAGER_PROV_ABORT_BIT,
-        pdTRUE,
-        pdFALSE,
-        pdMS_TO_TICKS(WIFI_MANAGER_PROV_TIMEOUT_MS));
-
-    if ((bits & (WIFI_MANAGER_PROV_DONE_BIT | WIFI_MANAGER_PROV_ABORT_BIT)) == 0) {
-        ESP_LOGW(TAG, "Provisioning timed out after %d ms", WIFI_MANAGER_PROV_TIMEOUT_MS);
-        wifi_prov_mgr_stop_provisioning();
-        wifi_prov_mgr_deinit();
-        return ESP_ERR_TIMEOUT;
-    }
-
-    /* Early-finish path: a caller signalled (via wifi_manager_finish_provisioning)
-     * that all provisioning data has been received over BLE. Tear down BLE and
-     * return without attempting a Wi-Fi join — joining now would race the BLE
-     * radio (coexistence) and routinely fails at the auth handshake. Credentials
-     * were already persisted on WIFI_PROV_CRED_RECV; the caller reboots and the
-     * next boot joins with BLE off. */
-    if ((bits & WIFI_MANAGER_PROV_ABORT_BIT) != 0) {
-        ESP_LOGI(TAG, "Provisioning data received — stopping BLE, reboot to connect");
-        wifi_prov_mgr_stop_provisioning();
-        wifi_prov_mgr_deinit();
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(WIFI_MANAGER_CREDS_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
         return ESP_OK;
     }
+    if (err != ESP_OK) {
+        return err;
+    }
 
-    /* Normal path: wifi_prov_mgr reported WIFI_PROV_END (Wi-Fi joined during the
-     * BLE session). */
-    wifi_prov_mgr_deinit();
+    char ssid[33] = {0};
+    char pass[65] = {0};
+    size_t ssid_len = sizeof(ssid);
+    size_t pass_len = sizeof(pass);
+
+    err = nvs_get_str(nvs, WIFI_MANAGER_CREDS_NVS_KEY_SSID, ssid, &ssid_len);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(nvs);
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi_creds: read ssid failed: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    err = nvs_get_str(nvs, WIFI_MANAGER_CREDS_NVS_KEY_PASS, pass, &pass_len);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        pass[0] = '\0';
+        err = ESP_OK;
+    } else if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi_creds: read pass failed: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "wifi_creds: applying seeded credentials for SSID \"%s\"", ssid);
+    err = wifi_manager_apply_config(ssid, pass);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_creds: apply failed: %s — leaving seed in NVS for retry",
+                 esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    /* Erase the seed only after a successful apply, so a partial flash can be
+     * retried without re-running the host script. */
+    nvs_erase_key(nvs, WIFI_MANAGER_CREDS_NVS_KEY_SSID);
+    nvs_erase_key(nvs, WIFI_MANAGER_CREDS_NVS_KEY_PASS);
+    nvs_commit(nvs);
+    nvs_close(nvs);
 
     wifi_manager_mark_provisioned();
-
-    ESP_LOGI(TAG, "Provisioning complete, waiting for WiFi connection...");
-
-    const EventBits_t conn_bits = xEventGroupWaitBits(
-        s_wifi.event_group,
-        WIFI_MANAGER_CONNECTED_BIT | WIFI_MANAGER_FAILED_BIT,
-        pdFALSE,
-        pdFALSE,
-        pdMS_TO_TICKS(WIFI_MANAGER_INITIAL_CONNECT_TIMEOUT_MS));
-
-    if ((conn_bits & WIFI_MANAGER_CONNECTED_BIT) != 0) {
-        ESP_LOGI(TAG, "WiFi connected after provisioning");
-        return ESP_OK;
-    }
-
-    ESP_LOGW(TAG, "WiFi connection after provisioning did not complete in time");
-    return ESP_ERR_TIMEOUT;
+    return ESP_OK;
 }
 
 esp_err_t wifi_manager_clear_provisioning(void)

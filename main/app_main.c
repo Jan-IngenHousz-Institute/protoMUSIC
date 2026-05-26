@@ -5,7 +5,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "cJSON.h"
 #include "CLI.h"
 #include "ambyte_mqtt_client.h"
 #include "ambyte_status.h"
@@ -19,7 +18,6 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
-#include "wifi_provisioning/manager.h"
 #include "i2c_bus.h"
 #include "lua_runner.h"
 #include "nvs_flash.h"
@@ -50,179 +48,6 @@ static esp_err_t app_init_nvs(void)
     }
 
     return err;
-}
-
-/* ── BLE provisioning endpoint: chunked cert upload ──────────────── */
-
-#define CERT_PROV_MAX_PAYLOAD 8192  /* 3 PEM blobs + JSON overhead */
-
-typedef enum { CERT_PROV_IDLE, CERT_PROV_RECEIVING } cert_prov_state_t;
-
-static cert_prov_state_t s_cert_state = CERT_PROV_IDLE;
-static char             *s_cert_buf   = NULL;
-static size_t            s_cert_cap   = 0;
-static size_t            s_cert_fill  = 0;
-
-/* Provisioning completion tracking. Each flag is set by exactly one source:
- * the cert-prov endpoint, the dev-cfg endpoint, and the WIFI_PROV_CRED_RECV
- * event. Once all three provisioning payloads have arrived, provisioning is
- * finished early (prov_maybe_finish) so the device can reboot and join Wi-Fi
- * with BLE off — joining under BLE coexistence routinely fails the auth
- * handshake. */
-static bool s_certs_written       = false;
-static bool s_config_written      = false;
-static bool s_wifi_creds_received = false;
-
-static void prov_maybe_finish(void)
-{
-    if (s_certs_written && s_config_written && s_wifi_creds_received) {
-        wifi_manager_finish_provisioning();
-    }
-}
-
-static esp_err_t cert_prov_respond(uint8_t **outbuf, ssize_t *outlen, const char *json)
-{
-    size_t len = strlen(json);
-    *outbuf = (uint8_t *)malloc(len + 1);
-    if (*outbuf == NULL) {
-        *outlen = 0;
-        return ESP_ERR_NO_MEM;
-    }
-    memcpy(*outbuf, json, len + 1);
-    *outlen = (ssize_t)len;
-    return ESP_OK;
-}
-
-void cert_prov_handler_reset(void)
-{
-    free(s_cert_buf);
-    s_cert_buf   = NULL;
-    s_cert_cap   = 0;
-    s_cert_fill  = 0;
-    s_cert_state = CERT_PROV_IDLE;
-}
-
-static esp_err_t cert_prov_handler(uint32_t session_id,
-                                    const uint8_t *inbuf, ssize_t inlen,
-                                    uint8_t **outbuf, ssize_t *outlen,
-                                    void *priv_data)
-{
-    (void)session_id;
-
-    if (s_cert_state == CERT_PROV_IDLE) {
-        /* First chunk: 4-byte big-endian total_len header */
-        if (inlen < 4) {
-            return cert_prov_respond(outbuf, outlen, "{\"error\":\"short header\"}");
-        }
-        uint32_t total_len = ((uint32_t)inbuf[0] << 24) |
-                             ((uint32_t)inbuf[1] << 16) |
-                             ((uint32_t)inbuf[2] <<  8) |
-                             ((uint32_t)inbuf[3]);
-        if (total_len == 0 || total_len > CERT_PROV_MAX_PAYLOAD) {
-            return cert_prov_respond(outbuf, outlen, "{\"error\":\"invalid length\"}");
-        }
-        s_cert_buf = malloc(total_len + 1);
-        if (s_cert_buf == NULL) {
-            return cert_prov_respond(outbuf, outlen, "{\"error\":\"OOM\"}");
-        }
-        s_cert_cap   = total_len;
-        s_cert_fill  = 0;
-        s_cert_state = CERT_PROV_RECEIVING;
-        inbuf += 4;
-        inlen -= 4;
-    }
-
-    /* Append chunk (clamp to avoid overrun on broker misbehaviour) */
-    size_t chunk = (size_t)(inlen > 0 ? inlen : 0);
-    if (s_cert_fill + chunk > s_cert_cap) {
-        chunk = s_cert_cap - s_cert_fill;
-    }
-    if (chunk > 0) {
-        memcpy(s_cert_buf + s_cert_fill, inbuf, chunk);
-        s_cert_fill += chunk;
-    }
-
-    if (s_cert_fill < s_cert_cap) {
-        return cert_prov_respond(outbuf, outlen, "{\"complete\":false}");
-    }
-
-    /* All data received — parse and store */
-    s_cert_buf[s_cert_fill] = '\0';
-    cJSON *root = cJSON_Parse(s_cert_buf);
-    cert_prov_handler_reset();
-
-    if (root == NULL) {
-        return cert_prov_respond(outbuf, outlen, "{\"ok\":false,\"error\":\"JSON parse failed\"}");
-    }
-
-    cJSON *ca   = cJSON_GetObjectItemCaseSensitive(root, "ca_cert");
-    cJSON *cert = cJSON_GetObjectItemCaseSensitive(root, "dev_cert");
-    cJSON *key  = cJSON_GetObjectItemCaseSensitive(root, "dev_key");
-
-    esp_err_t err = ESP_OK;
-    if (cJSON_IsString(ca)   && ca->valuestring   != NULL) {
-        err = certs_set_ca_cert(ca->valuestring);
-    }
-    if (err == ESP_OK && cJSON_IsString(cert) && cert->valuestring != NULL) {
-        err = certs_set_device_cert(cert->valuestring);
-    }
-    if (err == ESP_OK && cJSON_IsString(key)  && key->valuestring  != NULL) {
-        err = certs_set_device_key(key->valuestring);
-    }
-
-    cJSON_Delete(root);
-
-    if (err != ESP_OK) {
-        return cert_prov_respond(outbuf, outlen, "{\"ok\":false,\"error\":\"NVS write failed\"}");
-    }
-    if (priv_data != NULL) {
-        *(bool *)priv_data = true;
-    }
-    prov_maybe_finish();
-    return cert_prov_respond(outbuf, outlen, "{\"ok\":true}");
-}
-
-/* ── BLE provisioning endpoint: device config ────────────────────── */
-
-static esp_err_t dev_cfg_prov_handler(uint32_t session_id,
-                                       const uint8_t *inbuf, ssize_t inlen,
-                                       uint8_t **outbuf, ssize_t *outlen,
-                                       void *priv_data)
-{
-    (void)session_id;
-
-    cJSON *root = cJSON_ParseWithLength((const char *)inbuf, (size_t)inlen);
-    if (root == NULL) {
-        return cert_prov_respond(outbuf, outlen, "{\"ok\":false,\"error\":\"JSON parse failed\"}");
-    }
-
-    cJSON *uri    = cJSON_GetObjectItemCaseSensitive(root, "mqtt_uri");
-    cJSON *cid    = cJSON_GetObjectItemCaseSensitive(root, "mqtt_client_id");
-    cJSON *topic  = cJSON_GetObjectItemCaseSensitive(root, "mqtt_topic_root");
-    cJSON *dev_id = cJSON_GetObjectItemCaseSensitive(root, "device_id");
-
-    cJSON *prot_id   = cJSON_GetObjectItemCaseSensitive(root, "protocol_id");
-    cJSON *dev_name  = cJSON_GetObjectItemCaseSensitive(root, "device_name");
-    cJSON *dev_ver   = cJSON_GetObjectItemCaseSensitive(root, "device_version");
-    cJSON *dev_firm  = cJSON_GetObjectItemCaseSensitive(root, "device_firmware");
-    cJSON *firm_ver  = cJSON_GetObjectItemCaseSensitive(root, "firmware_version");
-
-    if (cJSON_IsString(uri)      && uri->valuestring)      device_config_set_mqtt_uri(uri->valuestring);
-    if (cJSON_IsString(cid)      && cid->valuestring)      device_config_set_mqtt_client_id(cid->valuestring);
-    if (cJSON_IsString(topic)    && topic->valuestring)    device_config_set_mqtt_topic_root(topic->valuestring);
-    if (cJSON_IsString(dev_id)   && dev_id->valuestring)   device_config_set_device_id(dev_id->valuestring);
-    if (cJSON_IsString(prot_id)  && prot_id->valuestring)  device_config_set_protocol_id(prot_id->valuestring);
-    if (cJSON_IsString(dev_name) && dev_name->valuestring) device_config_set_device_name(dev_name->valuestring);
-    if (cJSON_IsString(dev_ver)  && dev_ver->valuestring)  device_config_set_device_version(dev_ver->valuestring);
-    if (cJSON_IsString(dev_firm) && dev_firm->valuestring) device_config_set_device_firmware(dev_firm->valuestring);
-    if (cJSON_IsString(firm_ver) && firm_ver->valuestring) device_config_set_firmware_version(firm_ver->valuestring);
-
-    cJSON_Delete(root);
-    if (priv_data != NULL) {
-        *(bool *)priv_data = true;
-    }
-    prov_maybe_finish();
-    return cert_prov_respond(outbuf, outlen, "{\"ok\":true}");
 }
 
 /* ── Wi-Fi init + start (provisioning/connect logic in app_main) ─── */
@@ -339,30 +164,6 @@ static void app_start_cli(void)
     ESP_LOGI(APP_TAG, "CLI started");
 }
 
-/* ── BLE provisioning LED feedback handler ───────────────────────── */
-
-static void prov_led_event_handler(void *arg, esp_event_base_t base,
-                                   int32_t id, void *data)
-{
-    (void)arg; (void)base; (void)data;
-    switch ((wifi_prov_cb_event_t)id) {
-    case WIFI_PROV_CRED_RECV:
-        /* Wi-Fi credentials delivered — one of the three provisioning payloads.
-         * Finish provisioning early once the config and certs have also landed. */
-        s_wifi_creds_received = true;
-        prov_maybe_finish();
-        break;
-    case WIFI_PROV_CRED_FAIL:
-        ambyte_status_set_rgb(20, 0, 0);  /* red = wrong password */
-        break;
-    case WIFI_PROV_CRED_SUCCESS:
-        ambyte_status_set_rgb(0, 20, 0);  /* green = credentials accepted */
-        break;
-    default:
-        break;
-    }
-}
-
 /* ── Wi-Fi → MQTT lifecycle handlers ─────────────────────────────── */
 
 static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -394,7 +195,7 @@ void app_main(void)
     ESP_LOGI(APP_TAG, "NVS initialized");
     ESP_LOGI(APP_TAG, "Free heap after NVS: %lu", (unsigned long)esp_get_free_heap_size());
 
-    /* ── Status LED (early init — needed before BLE provisioning) ── */
+    /* ── Status LED ─────────────────────────────────────────────── */
     err = ambyte_status_init();
     if (err != ESP_OK) {
         ESP_LOGW(APP_TAG, "Status LED init failed: %s", esp_err_to_name(err));
@@ -473,44 +274,28 @@ void app_main(void)
     }
     ESP_LOGI(APP_TAG, "Free heap after WiFi: %lu", (unsigned long)esp_get_free_heap_size());
 
-    /* ── Provisioning or connect ─────────────────────────────────── */
+    /* ── Connect using NVS-stored credentials ─────────────────────── *
+     * Provisioning is now delivered out-of-band by tools/build_nvs_image.py
+     * flashing the NVS partition alongside the firmware. If the NVS hasn't
+     * been pre-populated (or wifi_creds was not seeded), Wi-Fi simply fails
+     * to connect and the device keeps running for CLI debugging. */
     bool provisioned = false;
     err = wifi_manager_is_provisioned(&provisioned);
     if (err != ESP_OK) {
         ESP_LOGW(APP_TAG, "Provisioning check failed: %s", esp_err_to_name(err));
     }
-
     if (!provisioned) {
-        ESP_LOGI(APP_TAG, "Device not provisioned — starting BLE provisioning");
-        /* s_certs_written / s_config_written are file-scope (see prov_maybe_finish). */
-        wifi_prov_extra_endpoint_t endpoints[] = {
-            { "cert-prov", cert_prov_handler,    &s_certs_written  },
-            { "dev-cfg",   dev_cfg_prov_handler, &s_config_written },
-        };
-        /* Register LED handler for provisioning events and signal BLE active */
-        esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
-                                   prov_led_event_handler, NULL);
-        ambyte_status_set_rgb(0, 0, 20);  /* dim blue = BLE advertising */
-        esp_err_t prov_err = wifi_manager_start_provisioning("AMBYTE", "ambyte123",
-                                                              endpoints, 2);
-        cert_prov_handler_reset();  /* free any partial cert buffer */
-        bool any_write = s_certs_written || s_config_written;
-        bool prov_ok   = (prov_err == ESP_OK);
-        if (prov_ok || any_write) {
-            ESP_LOGI(APP_TAG, "Provisioning complete — rebooting to apply");
-            esp_restart();
-        }
-        ambyte_status_set_rgb(0, 0, 0);   /* LED off — continuing without reboot */
-        ESP_LOGW(APP_TAG, "BLE provisioning timed out with no writes — continuing");
+        ambyte_status_set_rgb(20, 0, 0);  /* red = unprovisioned */
+        ESP_LOGE(APP_TAG, "Device not provisioned — run tools/build_nvs_image.py and re-flash NVS");
+    }
+
+    err = wifi_manager_connect_stored();
+    if (err == ESP_OK) {
+        ESP_LOGI(APP_TAG, "Wi-Fi connected");
+    } else if (err == ESP_ERR_TIMEOUT) {
+        ESP_LOGW(APP_TAG, "Wi-Fi initial connect timed out; reconnect continues in background");
     } else {
-        err = wifi_manager_connect_stored();
-        if (err == ESP_OK) {
-            ESP_LOGI(APP_TAG, "Wi-Fi connected");
-        } else if (err == ESP_ERR_TIMEOUT) {
-            ESP_LOGW(APP_TAG, "Wi-Fi initial connect timed out; reconnect continues in background");
-        } else {
-            ESP_LOGW(APP_TAG, "Wi-Fi connect failed: %s", esp_err_to_name(err));
-        }
+        ESP_LOGW(APP_TAG, "Wi-Fi connect failed: %s", esp_err_to_name(err));
     }
 
     /* ── Wi-Fi → MQTT lifecycle event handlers ────────────────────── */

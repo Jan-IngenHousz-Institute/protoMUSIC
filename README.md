@@ -1,10 +1,10 @@
 # Ambyte IoT Ludo
 
-ESP32-S3 firmware for the Ambyte IoT device: BLE-provisioned Wi-Fi + MQTT-over-TLS telemetry to AWS IoT Core, with local buffering (LittleFS + SQLite) and Lua-scriptable handlers.
+ESP32-S3 firmware for the Ambyte IoT device: MQTT-over-TLS telemetry to AWS IoT Core, with local buffering (LittleFS + SQLite) and Lua-scriptable handlers. Provisioning data (Wi-Fi, MQTT, TLS certs) is generated on the host from `.env` + `device_certs/<bundle>/` and flashed into the NVS partition next to the firmware — no BLE companion app, no runtime provisioning round-trip.
 
 - **Hardware target:** ESP32-S3 DevKitM-1 (16 MB flash), secondary target for Adafruit Feather ESP32-S3.
 - **Framework:** ESP-IDF 5.5 via PlatformIO.
-- **Transport:** MQTTS → AWS IoT Core, mutual TLS (device-cert + private key provisioned over BLE).
+- **Transport:** MQTTS → AWS IoT Core, mutual TLS (device-cert + private key delivered via NVS pre-pop).
 - **Storage:** LittleFS for logs, SQLite for structured persistence, NVS for credentials.
 
 ---
@@ -17,16 +17,16 @@ git clone <repo-url>
 cd ambyte-iot-ludo
 git submodule update --init --recursive   # pulls components/littlefs and its nested lfs
 
-# 2. Build & flash
+# 2. Set up provisioning data (first time only)
+cp .env.example .env && $EDITOR .env       # Wi-Fi creds, MQTT URI, topic root, ...
+# Drop your AWS IoT thing's PEM bundle into device_certs/<thing-name>/
+
+# 3. Build & flash (NVS pre-pop happens automatically via tools/extra_script.py)
 pio run -e esp32-s3-devkitm-1 -t upload
 pio device monitor -b 115200
-
-# 3. Provision (first-time only)
-cp .env.example .env && $EDITOR .env
-uv run docs/ambyte_prov.py
 ```
 
-Everything below is the long-form version of those three steps plus troubleshooting.
+Everything below is the long-form version plus troubleshooting.
 
 ---
 
@@ -59,6 +59,20 @@ uv pip install \
 
 We can't move the venv itself — PlatformIO's build scripts invoke that exact interpreter path — but `uv pip --python <path>` gives us a much faster resolver than plain `pip`.
 
+The NVS pre-pop step (see §6) also needs `esp_idf_nvs_partition_gen` in that same env. Install it once:
+
+```sh
+# Linux/macOS
+uv pip install --python ~/.platformio/penv/.espidf-5.5.0/bin/python esp_idf_nvs_partition_gen
+```
+
+```powershell
+# Windows PowerShell
+uv pip install --python "$env:USERPROFILE\.platformio\penv\.espidf-5.5.0\Scripts\python.exe" esp_idf_nvs_partition_gen
+```
+
+Adjust `.espidf-5.5.0` to whatever version PlatformIO created under `~/.platformio/penv/`. Symptom if you skip this: build fails with `No module named esp_idf_nvs_partition_gen`.
+
 ## 4. Build
 
 ```sh
@@ -74,37 +88,37 @@ pio run -e esp32-s3-devkitm-1 -t upload
 pio device monitor -b 115200
 ```
 
-### Factory reset
+### Factory reset / re-provision
 
-To re-provision a device that's already been through BLE provisioning (Wi-Fi, MQTT, and certs stored in NVS), erase flash first:
+To re-provision a device, edit `.env` (or swap the bundle) and re-flash. The NVS image is regenerated on every build:
 
 ```sh
 pio run -e esp32-s3-devkitm-1 -t erase_flash -t upload
 ```
 
-Without this, re-running the provisioning script will fail at "Wi-Fi apply" because the device is already connected. Alternatively, pass `--skip-wifi` to the provisioning script to update only MQTT config and certs.
+`erase_flash` is strictly only needed if you want to wipe the persistence layer (SQLite / LittleFS). To update provisioning **without** wiping data, a plain `pio run -t upload` is enough — the new NVS image overwrites the old.
 
-## 6. BLE provisioning
+To intentionally flash stock firmware **without** any provisioning data, set `AMBYTE_NVS_SKIP=1` for the build. The device will boot, log `Device not provisioned`, and continue running for CLI debugging (Wi-Fi won't connect).
 
-After first flash the device waits for BLE provisioning. The helper script [docs/ambyte_prov.py](docs/ambyte_prov.py) sends Wi-Fi creds, MQTT config, and TLS certs in one 120-second BLE session.
+## 6. Provisioning (host-side NVS pre-pop)
 
-The repo root is a `uv` project ([pyproject.toml](pyproject.toml), [uv.lock](uv.lock)). All Python deps (`bleak`, `protobuf`, `cryptography`) are declared there:
+Provisioning runs as a PlatformIO `pre:` hook ([tools/extra_script.py](tools/extra_script.py)) every build. It calls [tools/build_nvs_image.py](tools/build_nvs_image.py), which:
 
-```sh
-uv run docs/ambyte_prov.py
-```
+1. Loads `.env` from the repo root and resolves a cert bundle under `device_certs/`.
+2. Generates an NVS CSV with namespaces `device_cfg`, `certs`, `wifi_prov`, `wifi_creds` — keyed exactly as the firmware expects.
+3. Runs ESP-IDF's `nvs_partition_gen.py` to produce a 24 KB binary that PlatformIO flashes to offset `0x9000` alongside the firmware.
 
-`uv` auto-creates `.venv/` from the lockfile on first run. No manual `pip install` needed.
+On first boot the device picks up the seeded Wi-Fi credentials, applies them via `esp_wifi_set_config()`, erases the seed, and connects.
+
+The repo root is a `uv` project ([pyproject.toml](pyproject.toml), [uv.lock](uv.lock)). `uv` auto-creates `.venv/` from the lockfile on first run.
 
 ### Config resolution order
 
 Each field resolves top-down (first wins):
 
-1. CLI flag — `--ssid foo`
-2. Shell env var — `AMBYTE_SSID=foo`
-3. `.env` file at the repo root — auto-loaded, gitignored
-4. `~/.ambyte_prov.json` — auto-written after the first successful run, chmod 600
-5. Interactive prompt
+1. Shell env var — `AMBYTE_SSID=foo`
+2. `.env` file at the repo root — auto-loaded, gitignored
+3. Cert paths can also be set explicitly via `AMBYTE_CA_CERT` / `AMBYTE_DEV_CERT` / `AMBYTE_DEV_KEY`, otherwise the bundle resolver picks them up automatically.
 
 Bootstrap your `.env` once:
 
@@ -114,7 +128,7 @@ $EDITOR .env
 chmod 600 .env
 ```
 
-After that, `uv run docs/ambyte_prov.py` alone will prompt for anything missing. The Wi-Fi password is **never** cached to disk — it's read only from `$AMBYTE_PASSWORD`, `--password`, or a one-shot `getpass` prompt.
+The build fails loudly with the list of missing `AMBYTE_*` values if anything required isn't set — better than burning a flash cycle on a half-provisioned device.
 
 ### Device certs — bundle layout
 
@@ -143,30 +157,15 @@ AMBYTE_CERT_BUNDLE=dom_ludo_prototype_ambyte_thing_v2
 
 Paths accept both `/` and `\` separators, so PowerShell-pasted paths work on Linux.
 
-### Full CLI example (first run, everything explicit)
+### Manual NVS image build (no flashing)
+
+To inspect what would be flashed without actually uploading, run the generator directly:
 
 ```sh
-uv run docs/ambyte_prov.py \
-  --ssid       "YOUR_WIFI" \
-  --password   "YOUR_WIFI_PASS" \
-  --mqtt_uri   "mqtts://XXXX.iot.REGION.amazonaws.com:8883" \
-  --client_id  "thing-001" \
-  --topic_root "ambyte/prod" \
-  --device_id  "thing-001" \
-  --device_name     "AmbyteOnAir" \
-  --device_version  "1" \
-  --device_firmware "1" \
-  --firmware_version "1" \
-  --protocol_id     "3517" \
-  --ca_cert   device_certs/AmazonRootCA1.pem \
-  --dev_cert  device_certs/<thing>-certificate.pem.crt \
-  --dev_key   device_certs/<thing>-private.pem.key
+uv run python tools/build_nvs_image.py --out /tmp/nvs.bin
+# inspect with ESP-IDF's decoder
+python $IDF_PATH/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py decode /tmp/nvs.bin
 ```
-
-### Platform notes
-
-- **Linux:** if `bleak` permission-denies, grant cap_net_raw to the venv python: `sudo setcap cap_net_raw,cap_net_admin+eip $(readlink -f .venv/bin/python)`.
-- **Windows PowerShell:** run as Administrator for BLE access. Use backticks (`` ` ``) for line continuation instead of backslashes.
 
 ## 7. MQTT TLS test client
 
@@ -191,9 +190,9 @@ Any flag overrides its `.env` counterpart. Remember AWS IoT Core's 7-slash limit
 |---|---|
 | `No module named 'idf_component_manager'` | §3 |
 | `littlefs/lfs.h: No such file` | `git submodule update --init --recursive` |
-| `KeyError: 'IDF_PATH'` from `esp_prov` | Pull latest `docs/ambyte_prov.py` (self-sets `IDF_PATH`) |
-| `ModuleNotFoundError: No module named 'google'` from `esp_prov` | Run via `uv run docs/ambyte_prov.py` (not bare `python`) |
-| `RuntimeError: Wi-Fi apply failed` | Device already provisioned. Either `pio run -t erase_flash -t upload` or re-run with `--skip-wifi` |
+| `ambyte-nvs: missing required value(s)` at build time | Add the listed `AMBYTE_*` keys to `.env`, or set `AMBYTE_NVS_SKIP=1` to flash without provisioning |
+| `nvs_partition_gen.py not found at ...` | Point `IDF_PATH` at your ESP-IDF install (PlatformIO normally provides `~/.platformio/packages/framework-espidf`) |
+| Device boots and logs `Device not provisioned` | NVS image wasn't flashed. Confirm `extra_scripts = pre:tools/extra_script.py` is set in `platformio.ini` and that `.env` resolves to non-empty values |
 | MQTT connects then immediately disconnects (AWS kicks the client) | `AMBYTE_CLIENT_ID` doesn't match the thing the cert is bound to — align `AMBYTE_CERT_BUNDLE` with the thing name and let client_id auto-derive |
 
 ## Repository layout
@@ -216,10 +215,11 @@ components/          # ESP-IDF components
   persistence/       # DB-backed persistence layer
   sd_card/           # SD card driver
   uart_sensors/      # UART-attached sensors
-  wifi_manager/      # Wi-Fi provisioning + reconnect
+  wifi_manager/      # Wi-Fi connect + reconnect (NVS-seeded)
 
 main/                # app entry point
-docs/                # host-side scripts: BLE provisioner, MQTT TLS test client
+tools/               # host-side scripts: NVS image builder + PlatformIO hook
+docs/                # MQTT TLS test client (BLE provisioner is deprecated)
 planning/            # LLM prompts, phase plans, hardware-test notes
 device_certs/        # (gitignored) AWS IoT PEM files
 .env / .env.example  # provisioning defaults
