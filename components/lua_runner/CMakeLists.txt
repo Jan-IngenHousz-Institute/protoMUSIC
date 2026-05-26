@@ -8,7 +8,6 @@ if (HAVE_LOCAL_LUA)
     idf_component_register(
         SRCS
             "lua_runner.c"
-            "lua_script_blob.c"
         INCLUDE_DIRS
             "include"
         REQUIRES
@@ -32,7 +31,6 @@ else()
     idf_component_register(
         SRCS
             "lua_runner.c"
-            "lua_script_blob.c"
         INCLUDE_DIRS
             "include"
         REQUIRES

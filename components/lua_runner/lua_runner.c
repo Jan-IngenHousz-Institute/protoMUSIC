@@ -22,12 +22,9 @@
 #define LUA_RUNNER_TASK_STACK 8192
 #define LUA_RUNNER_TASK_PRIORITY 5
 #define LUA_QUERY_MAX_RECORDS 64
-
-extern const uint8_t g_lua_script[];
-extern const size_t g_lua_script_len;
+#define LUA_SCRIPT_PATH "/sdcard/main.lua"
 
 static TaskHandle_t s_lua_task_handle = NULL;
-static const uint8_t *const s_lua_script_start = g_lua_script;
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
@@ -779,10 +776,8 @@ static void lua_runner_task(void *arg)
     lua_register_db_module(L);
     lua_register_mqtt_module(L);
 
-    const char *script = (const char *)s_lua_script_start;
-    size_t script_len = g_lua_script_len;
-    if (script_len == 0 || luaL_loadbuffer(L, script, script_len, "lua_script.lua") != LUA_OK) {
-        log_lua_error(L, "failed to load embedded script");
+    if (luaL_loadfile(L, LUA_SCRIPT_PATH) != LUA_OK) {
+        log_lua_error(L, "failed to load " LUA_SCRIPT_PATH);
         lua_close(L);
         s_lua_task_handle = NULL;
         vTaskDelete(NULL);

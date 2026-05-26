@@ -1,0 +1,19 @@
+-- GPIO4 PWM demo: cycle duty 50 -> 100 -> 0 -> 50, five times.
+--
+-- Copy this file to the SD card root as `main.lua`. The firmware reads
+-- /sdcard/main.lua at boot via luaL_loadfile (see components/lua_runner/lua_runner.c).
+-- Edit on the host, swap the card, reset the board — no reflash.
+
+device.log("Lua runner started")
+
+for i = 1, 5 do
+    device.GPIO4_PWM(10000, 50, true)
+    device.sleep_ms(2000)
+    device.GPIO4_PWM(10000, 100, true)
+    device.sleep_ms(2000)
+    device.GPIO4_PWM(10000, 0, false)
+    device.sleep_ms(2000)
+    device.GPIO4_PWM(10000, 50, true)
+    device.sleep_ms(2000)
+    device.log("Cycle done")
+end

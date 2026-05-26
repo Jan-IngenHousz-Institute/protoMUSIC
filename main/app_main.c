@@ -142,8 +142,16 @@ static esp_err_t app_init_littlefs(void)
     return ESP_OK;
 }
 
-static void app_start_lua_runner(void)
+static void app_start_lua_runner(bool sd_available)
 {
+    /* Lua script lives on the SD card (/sdcard/main.lua). Without SD the
+     * loader would fail with a confusing "file not found"; skip cleanly
+     * instead and surface the real reason in one line. */
+    if (!sd_available) {
+        ESP_LOGW(APP_TAG, "Lua runner not started: SD card not mounted");
+        return;
+    }
+
     const esp_err_t err = lua_runner_start();
     if (err != ESP_OK) {
         ESP_LOGE(APP_TAG, "Lua runner failed to start: %s", esp_err_to_name(err));
@@ -410,7 +418,7 @@ void app_main(void)
     // device_commands_subscribe_inbound();
 
     /* ── Start application tasks ──────────────────────────────────── */
-    app_start_lua_runner();
+    app_start_lua_runner(sd_available);
     app_start_cli();
 
     ESP_LOGI(APP_TAG, "Startup sequence complete, free heap: %lu",

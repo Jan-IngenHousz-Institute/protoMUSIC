@@ -184,6 +184,21 @@ uv run docs/mqtt_tls_test_client.py --publish some/topic --message 'hello from p
 
 Any flag overrides its `.env` counterpart. Remember AWS IoT Core's 7-slash limit on topic filters — see the device's publish topic shape at [components/device_commands/device_commands.c](components/device_commands/device_commands.c).
 
+## 8. Lua script on SD card
+
+The Lua script is no longer compiled into the firmware. At boot, [components/lua_runner/lua_runner.c](components/lua_runner/lua_runner.c) reads `/sdcard/main.lua` via `luaL_loadfile()` and runs it. To iterate, edit the file on the host, swap the SD card back, and reset the board — no reflash.
+
+```sh
+cp docs/main.lua.example /Volumes/AMBYTE_SD/main.lua   # macOS — adjust path for your OS
+```
+
+Behaviour when the script is missing:
+
+- No SD card mounted at boot → `app_main` logs `Lua runner not started: SD card not mounted` and skips the Lua task entirely. CLI, sensors, and MQTT continue normally.
+- SD mounted but `main.lua` absent → the Lua task starts, fails the load with `failed to load /sdcard/main.lua`, and exits cleanly.
+
+Functions available to scripts are defined in the `device`, `db`, and `mqtt` Lua tables — see the `luaL_Reg` arrays at the bottom of [components/lua_runner/lua_runner.c](components/lua_runner/lua_runner.c). The starter script in [docs/main.lua.example](docs/main.lua.example) drives PWM on GPIO4 and is a good template for any new script.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -194,6 +209,8 @@ Any flag overrides its `.env` counterpart. Remember AWS IoT Core's 7-slash limit
 | `nvs_partition_gen.py not found at ...` | Point `IDF_PATH` at your ESP-IDF install (PlatformIO normally provides `~/.platformio/packages/framework-espidf`) |
 | Device boots and logs `Device not provisioned` | NVS image wasn't flashed. Confirm `extra_scripts = pre:tools/extra_script.py` is set in `platformio.ini` and that `.env` resolves to non-empty values |
 | MQTT connects then immediately disconnects (AWS kicks the client) | `AMBYTE_CLIENT_ID` doesn't match the thing the cert is bound to — align `AMBYTE_CERT_BUNDLE` with the thing name and let client_id auto-derive |
+| `Lua runner not started: SD card not mounted` | Insert an SD card with `main.lua` at the root, or copy [docs/main.lua.example](docs/main.lua.example) onto it |
+| `failed to load /sdcard/main.lua` | SD is mounted but the file is missing or unreadable. Check the card has `main.lua` at the root with no extension casing surprises |
 
 ## Repository layout
 
@@ -209,7 +226,7 @@ components/          # ESP-IDF components
   device_config/     # NVS-backed device config
   domain/            # domain models
   CLI/               # serial CLI
-  lua/ lua_runner/   # embedded Lua
+  lua/ lua_runner/   # Lua VM + bindings; script loaded from /sdcard/main.lua at boot
   mqtt_client/       # AWS IoT MQTT client
   pcf2131tfy_rtc/    # RTC driver
   persistence/       # DB-backed persistence layer
