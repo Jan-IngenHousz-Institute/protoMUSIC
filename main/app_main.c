@@ -63,6 +63,23 @@ static char             *s_cert_buf   = NULL;
 static size_t            s_cert_cap   = 0;
 static size_t            s_cert_fill  = 0;
 
+/* Provisioning completion tracking. Each flag is set by exactly one source:
+ * the cert-prov endpoint, the dev-cfg endpoint, and the WIFI_PROV_CRED_RECV
+ * event. Once all three provisioning payloads have arrived, provisioning is
+ * finished early (prov_maybe_finish) so the device can reboot and join Wi-Fi
+ * with BLE off — joining under BLE coexistence routinely fails the auth
+ * handshake. */
+static bool s_certs_written       = false;
+static bool s_config_written      = false;
+static bool s_wifi_creds_received = false;
+
+static void prov_maybe_finish(void)
+{
+    if (s_certs_written && s_config_written && s_wifi_creds_received) {
+        wifi_manager_finish_provisioning();
+    }
+}
+
 static esp_err_t cert_prov_respond(uint8_t **outbuf, ssize_t *outlen, const char *json)
 {
     size_t len = strlen(json);
@@ -161,6 +178,7 @@ static esp_err_t cert_prov_handler(uint32_t session_id,
     if (priv_data != NULL) {
         *(bool *)priv_data = true;
     }
+    prov_maybe_finish();
     return cert_prov_respond(outbuf, outlen, "{\"ok\":true}");
 }
 
@@ -203,6 +221,7 @@ static esp_err_t dev_cfg_prov_handler(uint32_t session_id,
     if (priv_data != NULL) {
         *(bool *)priv_data = true;
     }
+    prov_maybe_finish();
     return cert_prov_respond(outbuf, outlen, "{\"ok\":true}");
 }
 
@@ -327,6 +346,12 @@ static void prov_led_event_handler(void *arg, esp_event_base_t base,
 {
     (void)arg; (void)base; (void)data;
     switch ((wifi_prov_cb_event_t)id) {
+    case WIFI_PROV_CRED_RECV:
+        /* Wi-Fi credentials delivered — one of the three provisioning payloads.
+         * Finish provisioning early once the config and certs have also landed. */
+        s_wifi_creds_received = true;
+        prov_maybe_finish();
+        break;
     case WIFI_PROV_CRED_FAIL:
         ambyte_status_set_rgb(20, 0, 0);  /* red = wrong password */
         break;
@@ -457,8 +482,7 @@ void app_main(void)
 
     if (!provisioned) {
         ESP_LOGI(APP_TAG, "Device not provisioned — starting BLE provisioning");
-        static bool s_certs_written  = false;
-        static bool s_config_written = false;
+        /* s_certs_written / s_config_written are file-scope (see prov_maybe_finish). */
         wifi_prov_extra_endpoint_t endpoints[] = {
             { "cert-prov", cert_prov_handler,    &s_certs_written  },
             { "dev-cfg",   dev_cfg_prov_handler, &s_config_written },
