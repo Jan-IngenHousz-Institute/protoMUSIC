@@ -78,6 +78,13 @@ cmd_result_t cmd_set_rgb(uint8_t r, uint8_t g, uint8_t b);
 cmd_result_t cmd_read_rtc(time_t *out_time);
 cmd_result_t cmd_device_status(bool *bme_ready, bool *rtc_ready, time_t *rtc_time);
 cmd_result_t cmd_read_env(float *temp, float *hum, float *pres);
+
+/* Read BME280 and persist temperature/humidity/pressure as three separate
+ * measurement groups (one measure_id each, all sharing the same RTC timestamp).
+ * Each group is left in PENDING state, ready for the background sync task to
+ * publish. Out-params receive the allocated measure_ids; pass NULL to ignore. */
+cmd_result_t cmd_record_env(int64_t *out_temp_id, int64_t *out_hum_id,
+                            int64_t *out_pres_id);
 cmd_result_t cmd_log(const char *msg);
 cmd_result_t cmd_sleep_ms(uint32_t ms);
 cmd_result_t cmd_store_measurement(const measurement_record_t *records, size_t count);

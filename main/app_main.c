@@ -24,6 +24,7 @@
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
 #include "sqlite_persistence.h"
+#include "sync_runner.h"
 #include "uart_sensors.h"
 #include "wifi_manager.h"
 
@@ -416,6 +417,14 @@ void app_main(void)
     };
     device_commands_init(&cmd_cfg);
     // device_commands_subscribe_inbound();
+
+    /* ── Background MQTT sync (publishes PENDING measurements every 10s) ── */
+    if (persistence_available) {
+        esp_err_t sr_err = sync_runner_start();
+        if (sr_err != ESP_OK) {
+            ESP_LOGW(APP_TAG, "sync_runner_start failed: %s", esp_err_to_name(sr_err));
+        }
+    }
 
     /* ── Start application tasks ──────────────────────────────────── */
     app_start_lua_runner(sd_available);

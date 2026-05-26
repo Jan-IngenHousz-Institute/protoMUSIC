@@ -104,6 +104,25 @@ static int l_device_read_env(lua_State *L)
     return 1;
 }
 
+/* device.record_env() — read BME280 + persist T/H/P as three PENDING records.
+ * Returns { temperature_id, humidity_id, pressure_id } or nil,err. */
+static int l_device_record_env(lua_State *L)
+{
+    int64_t id_t = 0, id_h = 0, id_p = 0;
+    cmd_result_t res = cmd_record_env(&id_t, &id_h, &id_p);
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer)id_t);
+    lua_setfield(L, -2, "temperature_id");
+    lua_pushinteger(L, (lua_Integer)id_h);
+    lua_setfield(L, -2, "humidity_id");
+    lua_pushinteger(L, (lua_Integer)id_p);
+    lua_setfield(L, -2, "pressure_id");
+    return 1;
+}
+
 static int l_device_sleep_ms(lua_State *L)
 {
     lua_Integer ms = luaL_checkinteger(L, 1);
@@ -695,6 +714,7 @@ static void lua_register_device_module(lua_State *L)
         {"read_rtc",               l_device_read_rtc},
         {"status",                 l_device_status},
         {"read_env",               l_device_read_env},
+        {"record_env",             l_device_record_env},
         {"sleep_ms",               l_device_sleep_ms},
         {"log",                    l_device_log},
         /* UART raw */

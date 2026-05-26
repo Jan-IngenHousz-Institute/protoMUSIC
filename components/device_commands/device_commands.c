@@ -168,6 +168,71 @@ cmd_result_t cmd_read_env(float *temp, float *hum, float *pres)
                        m.temperature_c, m.humidity_percent, m.pressure_pa);
 }
 
+/* Helper: populate a record with sensor_id=1, the shared timestamp, and PENDING
+ * sync state. Caller fills in measure_id, measure_type, and value. */
+static void fill_env_record(measurement_record_t *r, int64_t measure_id,
+                            const char *measure_type, time_t timestamp,
+                            float value)
+{
+    memset(r, 0, sizeof(*r));
+    r->sensor_id  = 1;
+    r->measure_id = measure_id;
+    strncpy(r->measure_type, measure_type, sizeof(r->measure_type) - 1);
+    r->timestamp  = timestamp;
+    strncpy(r->data_type, "float", sizeof(r->data_type) - 1);
+    r->value      = value;
+    r->sync_state = MEASUREMENT_SYNC_PENDING;
+}
+
+cmd_result_t cmd_record_env(int64_t *out_temp_id, int64_t *out_hum_id,
+                            int64_t *out_pres_id)
+{
+    if (!s_initialized || s_cfg.read_env == NULL ||
+        s_cfg.store == NULL || s_cfg.next_id == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED,
+                           "env/persistence not available");
+    }
+
+    measurement_t m;
+    esp_err_t err = s_cfg.read_env(&m);
+    if (err != ESP_OK) {
+        return make_result(err, "env read failed: %s", esp_err_to_name(err));
+    }
+
+    /* Best-effort timestamp; if RTC isn't ready we still record (ts=0). */
+    time_t ts = 0;
+    if (s_cfg.read_clock != NULL) {
+        (void)s_cfg.read_clock(&ts);
+    }
+
+    int64_t id_t = 0, id_h = 0, id_p = 0;
+    if ((err = s_cfg.next_id(&id_t)) != ESP_OK ||
+        (err = s_cfg.next_id(&id_h)) != ESP_OK ||
+        (err = s_cfg.next_id(&id_p)) != ESP_OK) {
+        return make_result(err, "next_id failed: %s", esp_err_to_name(err));
+    }
+
+    measurement_record_t records[3];
+    fill_env_record(&records[0], id_t, "temperature", ts, m.temperature_c);
+    fill_env_record(&records[1], id_h, "humidity",    ts, m.humidity_percent);
+    fill_env_record(&records[2], id_p, "pressure",    ts, m.pressure_pa);
+
+    err = s_cfg.store(records, 3);
+    if (err != ESP_OK) {
+        return make_result(err, "store failed: %s", esp_err_to_name(err));
+    }
+
+    if (out_temp_id) *out_temp_id = id_t;
+    if (out_hum_id)  *out_hum_id  = id_h;
+    if (out_pres_id) *out_pres_id = id_p;
+
+    return make_result(ESP_OK,
+                       "recorded env: T=%.2fC(%lld) H=%.1f%%(%lld) P=%.0fPa(%lld)",
+                       m.temperature_c, (long long)id_t,
+                       m.humidity_percent, (long long)id_h,
+                       m.pressure_pa,    (long long)id_p);
+}
+
 cmd_result_t cmd_log(const char *msg)
 {
     if (msg == NULL) {
@@ -311,13 +376,13 @@ static cmd_result_t build_and_publish(int64_t measure_id)
                            "query_by_id failed for measure_id=%lld", (long long)measure_id);
     }
 
-    /* Build topic: <root>/<device_id>/<measure_type>/<measure_id> */
+    /* Build topic: <root>/1234. The trailing segment is fixed so every publish
+     * lands on the same topic the server is configured to ingest. measure_id
+     * and measure_type are still carried by the payload (set[].key and the
+     * implicit sample structure) so the receiver can demultiplex there. */
     char topic[MQTT_TOPIC_MAX];
-    snprintf(topic, sizeof(topic), "%s/%s/%s/%lld",
-             s_cfg.topic_root ? s_cfg.topic_root : "",
-             s_cfg.device_id  ? s_cfg.device_id  : "",
-             records[0].measure_type,
-             (long long)measure_id);
+    snprintf(topic, sizeof(topic), "%s/1234",
+             s_cfg.topic_root ? s_cfg.topic_root : "");
 
     /* Build set[] array: [{"key":"<data_type>","value":<float>}, …] */
     char set_buf[512];

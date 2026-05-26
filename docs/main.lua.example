@@ -1,19 +1,38 @@
--- GPIO4 PWM demo: cycle duty 50 -> 100 -> 0 -> 50, five times.
+-- Records BME280 temperature to the local DB every 5 seconds.
+--
+-- The sync_runner background task (period 10 s) picks up PENDING rows from
+-- the DB on its own cadence and publishes them via MQTT, so this script only
+-- has to do the read + store half. Humidity and pressure are read at the
+-- same time as a side-effect of the BME280 I2C transaction — they're just
+-- discarded here because the requirement is "temperature only".
 --
 -- Copy this file to the SD card root as `main.lua`. The firmware reads
--- /sdcard/main.lua at boot via luaL_loadfile (see components/lua_runner/lua_runner.c).
--- Edit on the host, swap the card, reset the board — no reflash.
+-- /sdcard/main.lua at boot via luaL_loadfile (see components/lua_runner).
 
-device.log("Lua runner started")
+device.log("env loop: temperature every 5s")
 
-for i = 1, 5 do
-    device.GPIO4_PWM(10000, 50, true)
-    device.sleep_ms(2000)
-    device.GPIO4_PWM(10000, 100, true)
-    device.sleep_ms(2000)
-    device.GPIO4_PWM(10000, 0, false)
-    device.sleep_ms(2000)
-    device.GPIO4_PWM(10000, 50, true)
-    device.sleep_ms(2000)
-    device.log("Cycle done")
+while true do
+    local env, err = device.read_env()
+    if env then
+        local ts = device.read_rtc() or 0
+        local id = db.next_id()
+        local ok, store_err = db.store({
+            {
+                sensor_id    = 1,
+                measure_id   = id,
+                measure_type = "temperature",
+                timestamp    = ts,
+                data_type    = "float",
+                value        = env.temperature_c,
+            },
+        })
+        if ok then
+            device.log(string.format("stored T=%.2fC id=%d", env.temperature_c, id))
+        else
+            device.log("store failed: " .. (store_err or "unknown"))
+        end
+    else
+        device.log("read_env failed: " .. (err or "unknown"))
+    end
+    device.sleep_ms(5000)
 end
