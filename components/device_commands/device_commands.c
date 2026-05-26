@@ -11,6 +11,7 @@
 
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -872,6 +873,106 @@ cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t 
 {
     uint8_t cmd[8] = { AMBIT_CMD_SET_METADATA, 0, 0, 0, 0, 0, 0, 0 };
     return ambit_action(ch, cmd, metadata, len, 5000);
+}
+
+/* ── GPIO4 PWM (LEDC) ────────────────────────────────────────────── *
+ *
+ * Drives a software-controllable PWM on GPIO4 using the LEDC peripheral.
+ * Uses LEDC_TIMER_0 / LEDC_CHANNEL_0 in low-speed mode (ESP32-S3 has no
+ * high-speed mode). Duty resolution is picked so that
+ * 2^res ≤ src_clk / freq_hz, capped at 14 bits.
+ * ────────────────────────────────────────────────────────────────── */
+
+#define PWM_GPIO4_GPIO     GPIO_NUM_4
+#define PWM_GPIO4_TIMER    LEDC_TIMER_0
+#define PWM_GPIO4_CHANNEL  LEDC_CHANNEL_0
+#define PWM_GPIO4_MODE     LEDC_LOW_SPEED_MODE
+#define PWM_GPIO4_SRC_CLK_HZ 80000000U  /* APB clock */
+
+static bool s_pwm_gpio4_ch_initialized = false;
+static int  s_pwm_gpio4_res_bits = 0;
+
+static int pwm_pick_resolution_bits(uint32_t freq_hz)
+{
+    if (freq_hz == 0) return 0;
+    uint32_t max_div = PWM_GPIO4_SRC_CLK_HZ / freq_hz;
+    int bits = 1;
+    while (bits < 14 && (1U << (bits + 1)) <= max_div) {
+        bits++;
+    }
+    return bits;
+}
+
+cmd_result_t cmd_gpio4_pwm(uint32_t freq_hz, float duty_pct, bool active)
+{
+    if (freq_hz < 1 || freq_hz > PWM_GPIO4_SRC_CLK_HZ / 2) {
+        return make_result(ESP_ERR_INVALID_ARG,
+                           "freq must be 1..%u Hz", PWM_GPIO4_SRC_CLK_HZ / 2);
+    }
+    if (duty_pct < 0.0f || duty_pct > 100.0f) {
+        return make_result(ESP_ERR_INVALID_ARG, "duty must be 0..100");
+    }
+
+    int res_bits = pwm_pick_resolution_bits(freq_hz);
+    if (res_bits < 1) {
+        return make_result(ESP_ERR_INVALID_ARG, "freq out of range for LEDC");
+    }
+
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode      = PWM_GPIO4_MODE,
+        .timer_num       = PWM_GPIO4_TIMER,
+        .duty_resolution = (ledc_timer_bit_t)res_bits,
+        .freq_hz         = freq_hz,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    esp_err_t err = ledc_timer_config(&timer_cfg);
+    if (err != ESP_OK) {
+        return make_result(err, "ledc_timer_config: %s", esp_err_to_name(err));
+    }
+    s_pwm_gpio4_res_bits = res_bits;
+
+    if (!s_pwm_gpio4_ch_initialized) {
+        ledc_channel_config_t ch_cfg = {
+            .gpio_num   = PWM_GPIO4_GPIO,
+            .speed_mode = PWM_GPIO4_MODE,
+            .channel    = PWM_GPIO4_CHANNEL,
+            .intr_type  = LEDC_INTR_DISABLE,
+            .timer_sel  = PWM_GPIO4_TIMER,
+            .duty       = 0,
+            .hpoint     = 0,
+        };
+        err = ledc_channel_config(&ch_cfg);
+        if (err != ESP_OK) {
+            return make_result(err, "ledc_channel_config: %s", esp_err_to_name(err));
+        }
+        s_pwm_gpio4_ch_initialized = true;
+    }
+
+    if (!active) {
+        err = ledc_stop(PWM_GPIO4_MODE, PWM_GPIO4_CHANNEL, 0);
+        if (err != ESP_OK) {
+            return make_result(err, "ledc_stop: %s", esp_err_to_name(err));
+        }
+        return make_result(ESP_OK, "PWM GPIO4: stopped");
+    }
+
+    uint32_t max_duty = (1U << res_bits) - 1U;
+    uint32_t duty_raw = (uint32_t)((duty_pct / 100.0f) * (float)max_duty + 0.5f);
+    if (duty_raw > max_duty) duty_raw = max_duty;
+
+    err = ledc_set_duty(PWM_GPIO4_MODE, PWM_GPIO4_CHANNEL, duty_raw);
+    if (err != ESP_OK) {
+        return make_result(err, "ledc_set_duty: %s", esp_err_to_name(err));
+    }
+    err = ledc_update_duty(PWM_GPIO4_MODE, PWM_GPIO4_CHANNEL);
+    if (err != ESP_OK) {
+        return make_result(err, "ledc_update_duty: %s", esp_err_to_name(err));
+    }
+
+    return make_result(ESP_OK,
+                       "PWM GPIO4: %u Hz, %.2f%% (res=%d bits, duty=%u/%u)",
+                       (unsigned)freq_hz, duty_pct, res_bits,
+                       (unsigned)duty_raw, (unsigned)max_duty);
 }
 
 /* ── inbound command dispatch ────────────────────────────────────── */

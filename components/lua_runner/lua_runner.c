@@ -478,6 +478,26 @@ static int l_device_ambit_actinic(lua_State *L)
     return 1;
 }
 
+/* device.GPIO4_PWM(freq_hz, duty_pct, active)
+ *   freq_hz  : integer, 1..40_000_000
+ *   duty_pct : number, 0..100 (percent; floats allowed for fine-grained duty)
+ *   active   : boolean — true starts/updates PWM, false stops it
+ * Returns true on success or nil,err on failure. */
+static int l_device_gpio4_pwm(lua_State *L)
+{
+    lua_Integer freq = luaL_checkinteger(L, 1);
+    lua_Number  duty = luaL_checknumber(L, 2);
+    bool        active = lua_toboolean(L, 3);
+
+    if (freq <= 0) {
+        return luaL_error(L, "freq must be > 0");
+    }
+    cmd_result_t res = cmd_gpio4_pwm((uint32_t)freq, (float)duty, active);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 /* device.ambit_set_metadata(ch, metadata_string) → true or nil,err */
 static int l_device_ambit_set_metadata(lua_State *L)
 {
@@ -718,6 +738,8 @@ static void lua_register_device_module(lua_State *L)
         {"ambit_calibrate_baseline", l_device_ambit_calibrate_baseline},
         {"ambit_actinic",          l_device_ambit_actinic},
         {"ambit_set_metadata",     l_device_ambit_set_metadata},
+        /* GPIO PWM */
+        {"GPIO4_PWM",              l_device_gpio4_pwm},
         {NULL, NULL},
     };
 

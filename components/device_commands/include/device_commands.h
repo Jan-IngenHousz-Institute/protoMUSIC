@@ -141,6 +141,12 @@ cmd_result_t cmd_ambit_actinic(uint8_t ch, uint8_t type, uint8_t var, uint8_t va
 /* Write commands (extra data buffered, wait for CMD_END) */
 cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t len);
 
+/* GPIO4 PWM via LEDC. `duty_pct` is 0..100 (percentage).
+ * `active=false` stops the output (drives line low); `active=true` (re)starts
+ * it with the given frequency and duty. Duty resolution is chosen
+ * automatically from `freq_hz` (up to 14 bits). */
+cmd_result_t cmd_gpio4_pwm(uint32_t freq_hz, float duty_pct, bool active);
+
 /* Call from the Wi-Fi disconnect event handler to clear any in-flight publish slot */
 void device_commands_on_mqtt_disconnect(void);
 
