@@ -164,7 +164,63 @@ static int l_device_uart_status(lua_State *L)
     return 1;
 }
 
-/* device.uart_query(channel, cmd_bytes, extra_bytes_or_nil, expect_raw, timeout_ms)
+/* device.uart_query(ch, cmd, timeout_ms, opts) — ASCII line-oriented query.
+ *
+ *   ch          : channel index 0..3
+ *   cmd         : ASCII command string (terminator appended by the runtime)
+ *   timeout_ms  : total budget for send + read in ms
+ *   opts        : optional table:
+ *                   lineterminator = "\n"           -- default
+ *                   save           = true           -- default; persist row
+ *
+ * Returns the response string (terminator stripped) or "" on timeout. On a
+ * hard error returns nil, err. Echo handling: if the first line read back
+ * equals `cmd` verbatim, it is dropped and the next line is returned. */
+static int l_device_uart_query(lua_State *L)
+{
+    lua_Integer ch = luaL_checkinteger(L, 1);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        return luaL_error(L, "channel must be 0-%d", UART_SENSOR_NUM_CHANNELS - 1);
+    }
+    const char *cmd        = luaL_checkstring(L, 2);
+    lua_Integer timeout_ms = luaL_checkinteger(L, 3);
+
+    const char *terminator = "\n";
+    bool save = true;
+    if (lua_istable(L, 4)) {
+        lua_getfield(L, 4, "lineterminator");
+        if (lua_isstring(L, -1)) {
+            terminator = lua_tostring(L, -1);
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 4, "save");
+        if (lua_isboolean(L, -1)) {
+            save = lua_toboolean(L, -1);
+        }
+        lua_pop(L, 1);
+    }
+
+    char   response[256];
+    size_t resp_len = 0;
+    cmd_result_t res = cmd_uart_text_query((uint8_t)ch, cmd, terminator,
+                                           (uint32_t)timeout_ms, save,
+                                           response, sizeof(response), &resp_len);
+
+    /* Hard error (anything other than success or pure timeout). */
+    if (res.status != ESP_OK && res.status != ESP_ERR_TIMEOUT) {
+        return lua_push_nil_reason(L, res.message);
+    }
+
+    /* On both success and timeout, return the response (possibly empty). */
+    lua_pushlstring(L, response, resp_len);
+    return 1;
+}
+
+/* ambit.uart_query(channel, cmd_bytes, extra_bytes_or_nil, expect_raw, timeout_ms)
+ *
+ * AMBIT binary protocol — sends the 8-byte ESP command with optional `extra`
+ * payload, waits for CMD_DONE + either a fixed-size raw response or the FSM
+ * data-transfer arrays. See cmd_uart_query in device_commands.c.
  *
  *   cmd_bytes  : table of 8 integers (the 8-byte command)
  *   extra_bytes: string of extra payload bytes (or nil)
@@ -176,7 +232,7 @@ static int l_device_uart_status(lua_State *L)
  *   Raw mode  → { raw = "binary string", raw_len = N }
  *   Error     → nil, error_message
  */
-static int l_device_uart_query(lua_State *L)
+static int l_ambit_uart_query(lua_State *L)
 {
     lua_Integer ch         = luaL_checkinteger(L, 1);
     luaL_checktype(L, 2, LUA_TTABLE);
@@ -852,6 +908,21 @@ static void lua_register_mqtt_module(lua_State *L)
     lua_setglobal(L, "mqtt");
 }
 
+/* ── ambit.* bindings ────────────────────────────────────────────────
+ * For now this module exposes only the AMBIT binary uart_query (moved from
+ * device.uart_query). The other ambit_* functions still live under device.
+ * Consolidating them all here is a separate cleanup. */
+static void lua_register_ambit_module(lua_State *L)
+{
+    static const luaL_Reg ambit_api[] = {
+        {"uart_query", l_ambit_uart_query},
+        {NULL, NULL},
+    };
+
+    luaL_newlib(L, ambit_api);
+    lua_setglobal(L, "ambit");
+}
+
 /* ── task ────────────────────────────────────────────────────────────── */
 
 static void log_lua_error(lua_State *L, const char *phase)
@@ -877,6 +948,7 @@ static void lua_runner_task(void *arg)
     lua_register_device_module(L);
     lua_register_db_module(L);
     lua_register_mqtt_module(L);
+    lua_register_ambit_module(L);
 
     if (luaL_loadfile(L, LUA_SCRIPT_PATH) != LUA_OK) {
         log_lua_error(L, "failed to load " LUA_SCRIPT_PATH);

@@ -67,9 +67,10 @@ typedef struct {
     const char                         *firmware_version;
 
     /* UART sensor ports (Phase 7) */
-    uart_sensor_query_fn                uart_query;
+    uart_sensor_query_fn                uart_query;        /* AMBIT binary */
     uart_sensor_ping_fn                 uart_ping;
     uart_sensor_status_fn               uart_status;
+    uart_sensor_text_query_fn           uart_text_query;   /* generic ASCII line */
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);
@@ -112,6 +113,27 @@ cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
                             uint32_t timeout_ms);
 cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected);
 cmd_result_t cmd_uart_status(void);
+
+/* Generic ASCII line-oriented UART query.
+ *
+ * Sends `cmd` followed by `terminator` over UART channel `channel`, then
+ * reads one line (until `terminator` again) into `out_resp` or aborts after
+ * `timeout_ms`. If the first line echoes the sent command verbatim it is
+ * discarded and the next line is returned.
+ *
+ * When `save` is true, the response (or an empty string on timeout) is
+ * stored as a single measurement row tagged
+ *   sensor   = "uart_ch<N>"
+ *   quantity = "response"
+ *   device   = NULL (onboard)
+ * via the existing cmd_store_measurement path. `out_resp` is always set
+ * (NUL-terminated, possibly empty) on return.
+ */
+cmd_result_t cmd_uart_text_query(uint8_t channel,
+                                 const char *cmd, const char *terminator,
+                                 uint32_t timeout_ms, bool save,
+                                 char *out_resp, size_t resp_cap,
+                                 size_t *resp_len);
 
 /* Ambit sensor commands — typed wrappers (Phase 7) */
 

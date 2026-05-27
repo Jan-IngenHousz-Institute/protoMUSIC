@@ -13,6 +13,7 @@
 
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -680,6 +681,106 @@ cmd_result_t cmd_uart_status(void)
         }
     }
     return make_result(ESP_OK, "%s", buf);
+}
+
+/* Generic ASCII line-oriented query — sends "<cmd><terminator>", reads one
+ * line back, discards the first line if it echoes the command verbatim, and
+ * optionally stores the response in the measurements DB. See
+ * cmd_uart_text_query() in device_commands.h for the contract. */
+cmd_result_t cmd_uart_text_query(uint8_t channel,
+                                 const char *cmd, const char *terminator,
+                                 uint32_t timeout_ms, bool save,
+                                 char *out_resp, size_t resp_cap,
+                                 size_t *resp_len)
+{
+    if (!s_initialized || s_cfg.uart_text_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    if (channel >= UART_SENSOR_NUM_CHANNELS) {
+        return make_result(ESP_ERR_INVALID_ARG, "invalid channel %u", channel);
+    }
+    if (cmd == NULL || terminator == NULL || out_resp == NULL ||
+        resp_len == NULL || resp_cap < 2) {
+        return make_result(ESP_ERR_INVALID_ARG, "bad args");
+    }
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t start_ms_val = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    int64_t t0_us = esp_timer_get_time();  /* monotonic, for echo-retry budget */
+    *resp_len = 0;
+    out_resp[0] = '\0';
+
+    /* First attempt — full timeout budget. */
+    esp_err_t err = s_cfg.uart_text_query(channel, cmd, terminator,
+                                          out_resp, resp_cap, resp_len, timeout_ms);
+
+    /* Echo handling: if the first line equals the sent cmd, throw it away and
+     * read the next line with whatever budget is left. The line we just read
+     * is already in out_resp without the terminator. */
+    if (err == ESP_OK) {
+        size_t cmd_len = strlen(cmd);
+        if (*resp_len == cmd_len && memcmp(out_resp, cmd, cmd_len) == 0) {
+            int64_t elapsed_us = esp_timer_get_time() - t0_us;
+            int64_t remaining_ms = ((int64_t)timeout_ms * 1000 - elapsed_us) / 1000;
+            if (remaining_ms <= 0) {
+                err = ESP_ERR_TIMEOUT;
+                *resp_len = 0;
+                out_resp[0] = '\0';
+            } else {
+                /* Read another line — pass an empty cmd so nothing is re-sent. */
+                *resp_len = 0;
+                out_resp[0] = '\0';
+                err = s_cfg.uart_text_query(channel, "", terminator,
+                                            out_resp, resp_cap, resp_len,
+                                            (uint32_t)remaining_ms);
+            }
+        }
+    }
+
+    /* On hard error (other than timeout) propagate without saving. */
+    if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+        return make_result(err, "uart_text_query ch%u failed: %s",
+                           channel, esp_err_to_name(err));
+    }
+
+    /* save=true: write one row tagged sensor=uart_chN, quantity=response.
+     * On timeout the row carries value_text="" (empty string) to indicate
+     * "queried but nothing came back". */
+    if (save && s_cfg.store != NULL && s_cfg.next_id != NULL) {
+        int64_t mid = 0;
+        if (s_cfg.next_id(&mid) == ESP_OK) {
+            gettimeofday(&tv, NULL);
+            int64_t end_ms_val = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+            measurement_record_t r;
+            memset(&r, 0, sizeof(r));
+            r.measure_id      = mid;
+            snprintf(r.quantity, sizeof(r.quantity), "response");
+            r.start_ticks_ms  = start_ms_val;
+            r.end_ticks_ms    = end_ms_val;
+            r.device[0]       = '\0';                       /* onboard */
+            snprintf(r.sensor, sizeof(r.sensor), "uart_ch%u", channel);
+            r.sensor_id       = MEASUREMENT_SENSOR_ID_NONE;
+            r.metadata[0]     = '\0';
+            r.value_is_string = true;
+            /* On timeout, value_text stays "" — copy whatever we have (could
+             * still be empty if no data came in). Truncate to fit. */
+            strncpy(r.value_text, out_resp, sizeof(r.value_text) - 1);
+            r.sync_state      = MEASUREMENT_SYNC_PENDING;
+
+            esp_err_t store_err = s_cfg.store(&r, 1);
+            if (store_err != ESP_OK) {
+                ESP_LOGW(TAG, "uart_text_query: save failed: %s", esp_err_to_name(store_err));
+            }
+        }
+    }
+
+    if (err == ESP_ERR_TIMEOUT) {
+        return make_result(ESP_ERR_TIMEOUT, "ch%u: no response within %ums",
+                           channel, (unsigned)timeout_ms);
+    }
+    return make_result(ESP_OK, "ch%u: %u bytes", channel, (unsigned)*resp_len);
 }
 
 /* ── Typed Ambit commands ────────────────────────────────────────── *

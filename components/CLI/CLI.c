@@ -372,6 +372,60 @@ static int cli_cmd_uart_status(int argc, char **argv)
     return (res.status == ESP_OK) ? 0 : 1;
 }
 
+/* uart_query <ch> <timeout_ms> <cmd...>
+ *   Sends an ASCII command line over channel <ch>, default terminator "\n",
+ *   prints the response (empty line on timeout). Always passes save=false
+ *   from the CLI so manual probing doesn't pollute the measurements DB. */
+static int cli_cmd_uart_query(int argc, char **argv)
+{
+    if (argc < 4) {
+        printf("Usage: uart_query <channel 0-3> <timeout_ms> <cmd ...>\r\n");
+        return 1;
+    }
+
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+
+    int timeout_ms = atoi(argv[2]);
+    if (timeout_ms <= 0) {
+        printf("timeout_ms must be > 0\r\n");
+        return 1;
+    }
+
+    /* Join argv[3..argc-1] with single spaces — preserves multi-word commands
+     * like `*IDN?` or `MEAS:VOLT?` typed at the prompt. */
+    char cmd[192];
+    size_t pos = 0;
+    for (int i = 3; i < argc; i++) {
+        int n = snprintf(cmd + pos, sizeof(cmd) - pos, (i == 3) ? "%s" : " %s", argv[i]);
+        if (n <= 0 || (size_t)n >= sizeof(cmd) - pos) {
+            printf("command too long\r\n");
+            return 1;
+        }
+        pos += (size_t)n;
+    }
+
+    char   resp[256];
+    size_t resp_len = 0;
+    cmd_result_t res = cmd_uart_text_query((uint8_t)ch, cmd, "\n",
+                                           (uint32_t)timeout_ms, false,
+                                           resp, sizeof(resp), &resp_len);
+
+    if (res.status == ESP_ERR_TIMEOUT) {
+        printf("ch%d: timeout after %dms (no response)\r\n", ch, timeout_ms);
+        return 1;
+    }
+    if (res.status != ESP_OK) {
+        printf("ch%d: %s\r\n", ch, res.message);
+        return 1;
+    }
+    printf("ch%d (%u bytes): %s\r\n", ch, (unsigned)resp_len, resp);
+    return 0;
+}
+
 static int cli_cmd_ambit_temp(int argc, char **argv)
 {
     if (argc != 2) {
@@ -553,6 +607,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "show connection state of all 4 UART sensor channels",
         .func    = cli_cmd_uart_status,
     };
+    static const esp_console_cmd_t uart_query_cmd = {
+        .command = "uart_query",
+        .help    = "uart_query <0-3> <timeout_ms> <cmd...>  ASCII line query (LF-terminated, save=false)",
+        .func    = cli_cmd_uart_query,
+    };
     static const esp_console_cmd_t ambit_temp_cmd = {
         .command = "ambit_temp",
         .help    = "ambit_temp <0-3>  read leaf+chip temperature from AMBIT sensor",
@@ -625,6 +684,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&uart_status_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&uart_query_cmd);
     if (err != ESP_OK) {
         return err;
     }

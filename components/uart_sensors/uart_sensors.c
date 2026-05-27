@@ -604,8 +604,88 @@ esp_err_t uart_sensors_init(void)
     return ESP_OK;
 }
 
+/* ── ASCII line-oriented query (generic UART sensors) ─────────────── *
+ *
+ * Generic alternative to do_query() above. Sends `cmd` followed by
+ * `terminator`, then accumulates incoming bytes until `terminator` is seen
+ * (the terminator itself is stripped from the response) or `timeout_ms`
+ * elapses. Use for sensors that speak line-oriented ASCII (SCPI, AT-style,
+ * custom NMEA-ish protocols) — not for the AMBIT binary framing.
+ */
+static esp_err_t do_text_query(uint8_t channel,
+                               const char *cmd, const char *terminator,
+                               char *out_resp, size_t resp_cap, size_t *resp_len,
+                               uint32_t timeout_ms)
+{
+    if (channel >= UART_SENSOR_NUM_CHANNELS || cmd == NULL || terminator == NULL
+            || out_resp == NULL || resp_cap < 2 || resp_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *resp_len = 0;
+    out_resp[0] = '\0';
+
+    size_t term_len = strlen(terminator);
+    if (term_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
+
+    esp_err_t err = channel_acquire(channel, pdMS_TO_TICKS(timeout_ms));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uart_port_t port = s_ch[channel].uart_num;
+    uart_flush_input(port);
+
+    /* Send: cmd + terminator, atomically inside the lock. */
+    size_t cmd_len = strlen(cmd);
+    if (cmd_len > 0) {
+        uart_write_bytes(port, cmd, cmd_len);
+    }
+    uart_write_bytes(port, terminator, term_len);
+
+    /* Read byte-by-byte until terminator suffix is hit or the deadline trips. */
+    while (*resp_len + 1 < resp_cap) {
+        int64_t remain_us = deadline - now_us();
+        if (remain_us <= 0) break;
+
+        TickType_t ticks = pdMS_TO_TICKS((uint32_t)(remain_us / 1000));
+        if (ticks == 0) ticks = 1;
+
+        uint8_t b;
+        int n = uart_read_bytes(port, &b, 1, ticks);
+        if (n <= 0) {
+            continue; /* no byte yet; loop and re-check deadline */
+        }
+
+        out_resp[(*resp_len)++] = (char)b;
+
+        /* Suffix-match against the terminator. */
+        if (*resp_len >= term_len &&
+            memcmp(out_resp + *resp_len - term_len, terminator, term_len) == 0) {
+            *resp_len -= term_len;
+            out_resp[*resp_len] = '\0';
+            s_ch[channel].state = UART_SENSOR_CONNECTED;
+            channel_release(channel);
+            return ESP_OK;
+        }
+    }
+
+    out_resp[*resp_len] = '\0';
+    s_ch[channel].state = UART_SENSOR_DISCONNECTED;
+    channel_release(channel);
+    return ESP_ERR_TIMEOUT;
+}
+
 /* ── Port-adapter getters ──────────────────────────────────────────── */
 
-uart_sensor_query_fn  uart_sensors_get_query_fn(void)  { return do_query;  }
-uart_sensor_ping_fn   uart_sensors_get_ping_fn(void)   { return do_ping;   }
-uart_sensor_status_fn uart_sensors_get_status_fn(void)  { return do_status; }
+uart_sensor_query_fn       uart_sensors_get_query_fn(void)       { return do_query;      }
+uart_sensor_ping_fn        uart_sensors_get_ping_fn(void)        { return do_ping;       }
+uart_sensor_status_fn      uart_sensors_get_status_fn(void)      { return do_status;     }
+uart_sensor_text_query_fn  uart_sensors_get_text_query_fn(void)  { return do_text_query; }
