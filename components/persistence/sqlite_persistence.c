@@ -3,7 +3,9 @@
 #include "sd_card.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -15,9 +17,15 @@
 
 #define TAG "sqlite_persist"
 #define DB_PATH "/sdcard/measurements.db"
+#define SCHEMA_VERSION 2
 #define FLUSH_INTERVAL_MS 5000
 #define FLUSH_BATCH_SIZE  16
-#define FLUSH_TASK_STACK  6144
+/* 8 KiB. The entries buffer (FLUSH_BATCH_SIZE × pending_entry_t) used to live
+ * on this stack and was ~1.8 KiB with the old struct; with the new ~380 B
+ * record it would be ~6 KiB and overflow even before SQLite is touched. The
+ * buffer is now heap-allocated, but bumping the stack gives headroom for
+ * SQLite's own deep call chain and any cJSON/format helpers down the line. */
+#define FLUSH_TASK_STACK  8192
 #define FLUSH_ERROR_CHECK_THRESHOLD    3   /* run quick_check after N consecutive flush failures */
 #define FLUSH_ERROR_DISABLE_THRESHOLD 10   /* disable DB after N consecutive flush failures */
 #define INTEGRITY_CHECK_INTERVAL     100   /* run quick_check every N successful flush cycles (~8 min) */
@@ -69,6 +77,32 @@ static int integrity_callback(void *arg, int ncols, char **values, char **names)
     return 0;
 }
 
+/* Read PRAGMA user_version; returns 0 on a fresh DB. */
+static int read_user_version(sqlite3 *db)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return 0;
+    int version = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        version = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return version;
+}
+
+static bool table_exists(sqlite3 *db, const char *name)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return false;
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+    bool found = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 /* Run PRAGMA quick_check inside an already-held mutex.
  * If corrupt: close DB, rename to .corrupt, reopen fresh.
  * Returns true if DB is healthy, false if recovery was attempted. */
@@ -105,55 +139,48 @@ static bool run_quick_check_locked(void)
     return false;
 }
 
-/* Ensure the 'syncState' column exists, migrating from legacy names if needed */
-static void migrate_schema(void)
+/* If a pre-v2 schema is detected (table `measurements` from the float-only era),
+ * archive the entire DB file out of the way and start fresh. Bytes are
+ * preserved on disk under a timestamped filename for manual recovery. */
+static esp_err_t maybe_archive_legacy_db(void)
 {
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(s_db, "PRAGMA table_info(measurements);", -1, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        return;
+    /* Need to open the file briefly just to detect what's inside. */
+    sqlite3 *probe = NULL;
+    if (sqlite3_open(DB_PATH, &probe) != SQLITE_OK) {
+        if (probe) sqlite3_close(probe);
+        return ESP_OK; /* fresh file — nothing to archive */
     }
 
-    bool has_synced    = false;
-    bool has_syncState = false;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *col = (const char *)sqlite3_column_text(stmt, 1);
-        if (col == NULL) continue;
-        if (strcmp(col, "synced")    == 0) has_synced    = true;
-        if (strcmp(col, "syncState") == 0) has_syncState = true;
-    }
-    sqlite3_finalize(stmt);
+    int version = read_user_version(probe);
+    bool has_legacy = table_exists(probe, "measurements");
+    bool has_v2     = table_exists(probe, "measurements_v2");
+    sqlite3_close(probe);
 
-    if (has_syncState) {
-        return; /* already correct */
+    if (version >= SCHEMA_VERSION || has_v2) {
+        return ESP_OK; /* current schema present — no migration needed */
+    }
+    if (!has_legacy) {
+        return ESP_OK; /* fresh DB without our tables — let CREATE TABLE handle it */
     }
 
-    char *err = NULL;
-    if (has_synced) {
-        rc = sqlite3_exec(s_db,
-                          "ALTER TABLE measurements RENAME COLUMN synced TO syncState;",
-                          NULL, NULL, &err);
-        if (rc != SQLITE_OK) {
-            ESP_LOGE(TAG, "Schema migration (rename) failed: %s", err ? err : "");
-        } else {
-            ESP_LOGI(TAG, "Migrated schema: column 'synced' -> 'syncState'");
-            sqlite3_free(err);
-            return;
-        }
-        sqlite3_free(err);
-        err = NULL;
-    }
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    char archive_path[96];
+    snprintf(archive_path, sizeof(archive_path),
+             DB_PATH ".legacy_%lld", (long long)tv.tv_sec);
 
-    /* syncState missing and rename not possible — add the column */
-    rc = sqlite3_exec(s_db,
-                      "ALTER TABLE measurements ADD COLUMN syncState INTEGER NOT NULL DEFAULT 0;",
-                      NULL, NULL, &err);
-    if (rc != SQLITE_OK) {
-        ESP_LOGE(TAG, "Schema migration (add column) failed: %s", err ? err : "");
+    if (rename(DB_PATH, archive_path) != 0) {
+        ESP_LOGW(TAG, "Failed to archive legacy DB; removing instead");
+        remove(DB_PATH);
     } else {
-        ESP_LOGI(TAG, "Schema migration: added 'syncState' column with DEFAULT 0");
+        ESP_LOGW(TAG, "Legacy schema archived to %s", archive_path);
     }
-    sqlite3_free(err);
+
+    /* Also move WAL / journal sidecars out of the way so the fresh open is clean. */
+    rename(DB_PATH "-wal",      DB_PATH "-wal.legacy");
+    rename(DB_PATH "-shm",      DB_PATH "-shm.legacy");
+    rename(DB_PATH "-journal",  DB_PATH "-journal.legacy");
+    return ESP_OK;
 }
 
 static esp_err_t db_open_and_configure(void)
@@ -191,15 +218,11 @@ static esp_err_t db_open_and_configure(void)
         }
     }
 
-    /* PRAGMAs — crash-safe configuration for SD card
-     *
-     * TRUNCATE mode: journal file is truncated to zero on commit (not deleted).
-     * Avoids FAT32 directory entry create/delete churn on every transaction.
-     * On crash: SQLite replays the journal on next open → DB rolled back cleanly.
-     *
-     * synchronous = FULL: journal is fsynced to SD before any main DB page is
-     * modified. This is the cornerstone of crash safety — without it, a power
-     * loss can leave the DB with half-written pages and no valid journal. */
+    /* Extended result codes give us SQLITE_IOERR_* sub-causes instead of just
+     * SQLITE_IOERR=10. Set before any prepare/step. */
+    sqlite3_extended_result_codes(s_db, 1);
+
+    /* PRAGMAs — crash-safe configuration for SD card */
     exec_pragma(s_db, "PRAGMA journal_mode = TRUNCATE;");
     exec_pragma(s_db, "PRAGMA locking_mode = EXCLUSIVE;");
     exec_pragma(s_db, "PRAGMA synchronous = FULL;");
@@ -207,18 +230,22 @@ static esp_err_t db_open_and_configure(void)
     exec_pragma(s_db, "PRAGMA cache_size = -64;");
     exec_pragma(s_db, "PRAGMA temp_store = MEMORY;");
 
-    /* Schema */
+    /* Schema (v2) */
     const char *create_table =
-        "CREATE TABLE IF NOT EXISTS measurements ("
-        "sensorID INTEGER NOT NULL, "
-        "measureID INTEGER NOT NULL, "
-        "measureType TEXT NOT NULL, "
-        "timestamp INTEGER NOT NULL, "
-        "dataType TEXT NOT NULL, "
-        "dataValue REAL, "
-        "syncState INTEGER NOT NULL DEFAULT 0, "
-        "PRIMARY KEY (measureID, dataType));";
-
+        "CREATE TABLE IF NOT EXISTS measurements_v2 ("
+        "measure_id  INTEGER NOT NULL, "
+        "quantity    TEXT    NOT NULL, "
+        "start_ticks INTEGER NOT NULL, "
+        "end_ticks   INTEGER NOT NULL, "
+        "device      TEXT, "
+        "sensor      TEXT    NOT NULL, "
+        "sensor_id   INTEGER, "
+        "metadata    TEXT, "
+        "value_real  REAL, "
+        "value_text  TEXT, "
+        "sync_state  INTEGER NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (measure_id, quantity), "
+        "CHECK ( (value_real IS NULL) <> (value_text IS NULL) ));";
     rc = sqlite3_exec(s_db, create_table, NULL, NULL, &err_msg);
     if (rc != SQLITE_OK) {
         ESP_LOGE(TAG, "CREATE TABLE failed: %s", err_msg ? err_msg : "");
@@ -227,25 +254,34 @@ static esp_err_t db_open_and_configure(void)
         s_db = NULL;
         return ESP_FAIL;
     }
-
-    const char *create_idx_type_ts =
-        "CREATE INDEX IF NOT EXISTS idx_type_ts ON measurements (measureType, timestamp);";
-    rc = sqlite3_exec(s_db, create_idx_type_ts, NULL, NULL, &err_msg);
     sqlite3_free(err_msg);
 
-    const char *create_idx_sync =
-        "CREATE INDEX IF NOT EXISTS idx_sync_type "
-        "ON measurements (syncState, measureType, timestamp);";
-    rc = sqlite3_exec(s_db, create_idx_sync, NULL, NULL, &err_msg);
+    const char *create_idx =
+        "CREATE INDEX IF NOT EXISTS idx_v2_sync_start "
+        "ON measurements_v2 (sync_state, start_ticks);";
+    err_msg = NULL;
+    rc = sqlite3_exec(s_db, create_idx, NULL, NULL, &err_msg);
     sqlite3_free(err_msg);
 
-    /* Migrate old 'synced' column if present from a previous schema version */
-    migrate_schema();
+    /* Anchor for future migrations */
+    char pragma[64];
+    snprintf(pragma, sizeof(pragma), "PRAGMA user_version = %d;", SCHEMA_VERSION);
+    exec_pragma(s_db, pragma);
 
-    /* Reset stale INFLIGHT rows left by a previous interrupted session */
+    /* Crash-recovery: anything left INFLIGHT by a previous interrupted session
+     * goes back to PENDING. Single statement, transactional. */
+    err_msg = NULL;
     rc = sqlite3_exec(s_db,
-                      "UPDATE measurements SET syncState = 0 WHERE syncState = 1;",
+                      "UPDATE measurements_v2 SET sync_state = 0 WHERE sync_state = 1;",
                       NULL, NULL, &err_msg);
+    if (rc == SQLITE_OK) {
+        int n = sqlite3_changes(s_db);
+        if (n > 0) {
+            ESP_LOGW(TAG, "Crash recovery: reset %d INFLIGHT rows to PENDING", n);
+        }
+    } else {
+        ESP_LOGW(TAG, "Crash-recovery UPDATE failed: %s", err_msg ? err_msg : "");
+    }
     sqlite3_free(err_msg);
 
     return ESP_OK;
@@ -258,7 +294,7 @@ static int64_t db_get_max_measure_id(void)
     }
 
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(s_db, "SELECT MAX(measureID) FROM measurements;",
+    int rc = sqlite3_prepare_v2(s_db, "SELECT MAX(measure_id) FROM measurements_v2;",
                                 -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         return 0;
@@ -270,6 +306,79 @@ static int64_t db_get_max_measure_id(void)
     }
     sqlite3_finalize(stmt);
     return max_id;
+}
+
+/* ── row <-> SQL marshalling ─────────────────────────────────────────── */
+
+/* Populate `r` from the current row of `stmt`. Column order must match the
+ * SELECT list used by all reader queries below. */
+static void read_row(sqlite3_stmt *stmt, measurement_record_t *r)
+{
+    memset(r, 0, sizeof(*r));
+    r->measure_id      = sqlite3_column_int64(stmt, 0);
+    const unsigned char *q = sqlite3_column_text(stmt, 1);
+    if (q) strncpy(r->quantity, (const char *)q, sizeof(r->quantity) - 1);
+    r->start_ticks_ms  = sqlite3_column_int64(stmt, 2);
+    r->end_ticks_ms    = sqlite3_column_int64(stmt, 3);
+    if (sqlite3_column_type(stmt, 4) != SQLITE_NULL) {
+        const unsigned char *d = sqlite3_column_text(stmt, 4);
+        if (d) strncpy(r->device, (const char *)d, sizeof(r->device) - 1);
+    }
+    const unsigned char *s = sqlite3_column_text(stmt, 5);
+    if (s) strncpy(r->sensor, (const char *)s, sizeof(r->sensor) - 1);
+    r->sensor_id = (sqlite3_column_type(stmt, 6) == SQLITE_NULL)
+                   ? MEASUREMENT_SENSOR_ID_NONE
+                   : sqlite3_column_int64(stmt, 6);
+    if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+        const unsigned char *m = sqlite3_column_text(stmt, 7);
+        if (m) strncpy(r->metadata, (const char *)m, sizeof(r->metadata) - 1);
+    }
+    if (sqlite3_column_type(stmt, 8) != SQLITE_NULL) {
+        r->value_is_string = false;
+        r->value_real      = (float)sqlite3_column_double(stmt, 8);
+    } else {
+        r->value_is_string = true;
+        const unsigned char *v = sqlite3_column_text(stmt, 9);
+        if (v) strncpy(r->value_text, (const char *)v, sizeof(r->value_text) - 1);
+    }
+    r->sync_state = (measurement_sync_state_t)sqlite3_column_int(stmt, 10);
+}
+
+#define READ_COLUMNS \
+    "measure_id, quantity, start_ticks, end_ticks, device, sensor, " \
+    "sensor_id, metadata, value_real, value_text, sync_state"
+
+/* Bind one record into a prepared INSERT (column order matches insert_sql below). */
+static void bind_record(sqlite3_stmt *stmt, const measurement_record_t *r)
+{
+    sqlite3_bind_int64(stmt, 1, r->measure_id);
+    sqlite3_bind_text (stmt, 2, r->quantity, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, r->start_ticks_ms);
+    sqlite3_bind_int64(stmt, 4, r->end_ticks_ms);
+    if (r->device[0] == '\0') {
+        sqlite3_bind_null(stmt, 5);
+    } else {
+        sqlite3_bind_text(stmt, 5, r->device, -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_text (stmt, 6, r->sensor, -1, SQLITE_TRANSIENT);
+    if (r->sensor_id == MEASUREMENT_SENSOR_ID_NONE) {
+        sqlite3_bind_null(stmt, 7);
+    } else {
+        sqlite3_bind_int64(stmt, 7, r->sensor_id);
+    }
+    if (r->metadata[0] == '\0') {
+        sqlite3_bind_null(stmt, 8);
+    } else {
+        sqlite3_bind_text(stmt, 8, r->metadata, -1, SQLITE_TRANSIENT);
+    }
+    if (r->value_is_string) {
+        sqlite3_bind_null(stmt, 9);
+        sqlite3_bind_text(stmt, 10, r->value_text, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_double(stmt, 9, (double)r->value_real);
+        sqlite3_bind_null  (stmt, 10);
+    }
+    sqlite3_bind_int(stmt, 11, (int)r->sync_state);
 }
 
 /* ── flush logic ─────────────────────────────────────────────────────── */
@@ -291,9 +400,10 @@ static esp_err_t flush_batch_to_sqlite(const pending_entry_t *entries, size_t co
     sqlite3_free(err_msg);
 
     const char *insert_sql =
-        "INSERT OR REPLACE INTO measurements "
-        "(sensorID, measureID, measureType, timestamp, dataType, dataValue, syncState) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?);";
+        "INSERT OR REPLACE INTO measurements_v2 "
+        "(measure_id, quantity, start_ticks, end_ticks, device, sensor, "
+        " sensor_id, metadata, value_real, value_text, sync_state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(s_db, insert_sql, -1, &stmt, NULL);
@@ -303,21 +413,18 @@ static esp_err_t flush_batch_to_sqlite(const pending_entry_t *entries, size_t co
         return ESP_FAIL;
     }
 
+    size_t inserted = 0;
     for (size_t i = 0; i < count; i++) {
-        const measurement_record_t *r = &entries[i].record;
-
-        sqlite3_bind_int64(stmt, 1, r->sensor_id);
-        sqlite3_bind_int64(stmt, 2, r->measure_id);
-        sqlite3_bind_text(stmt, 3, r->measure_type, -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt, 4, (int64_t)r->timestamp);
-        sqlite3_bind_text(stmt, 5, r->data_type, -1, SQLITE_STATIC);
-        sqlite3_bind_double(stmt, 6, (double)r->value);
-        sqlite3_bind_int(stmt, 7, (int)r->sync_state);
+        bind_record(stmt, &entries[i].record);
 
         rc = sqlite3_step(stmt);
-        if (rc != SQLITE_DONE) {
-            ESP_LOGW(TAG, "INSERT failed for measure_id %lld: %s",
-                     (long long)r->measure_id, sqlite3_errmsg(s_db));
+        if (rc == SQLITE_DONE) {
+            inserted++;
+        } else {
+            ESP_LOGW(TAG, "INSERT failed for measure_id %lld / quantity %s: %s",
+                     (long long)entries[i].record.measure_id,
+                     entries[i].record.quantity,
+                     sqlite3_errmsg(s_db));
         }
         sqlite3_reset(stmt);
     }
@@ -333,12 +440,23 @@ static esp_err_t flush_batch_to_sqlite(const pending_entry_t *entries, size_t co
         return ESP_FAIL;
     }
     sqlite3_free(err_msg);
+    ESP_LOGI(TAG, "flush: %u/%u rows committed", (unsigned)inserted, (unsigned)count);
     return ESP_OK;
 }
 
 static void drain_pending_to_sqlite(void)
 {
     if (!s_db_available) {
+        return;
+    }
+
+    /* One heap-allocated buffer per drain, reused across batches. With the new
+     * measurement_record_t the entries buffer is ~6 KiB — too big to live on
+     * the task stack (see FLUSH_TASK_STACK note). */
+    pending_entry_t *entries = calloc(FLUSH_BATCH_SIZE, sizeof(*entries));
+    if (entries == NULL) {
+        ESP_LOGE(TAG, "drain: entries buffer alloc failed (%u bytes)",
+                 (unsigned)(FLUSH_BATCH_SIZE * sizeof(*entries)));
         return;
     }
 
@@ -349,12 +467,13 @@ static void drain_pending_to_sqlite(void)
         }
 
         size_t batch = (pending < FLUSH_BATCH_SIZE) ? pending : FLUSH_BATCH_SIZE;
-        pending_entry_t entries[FLUSH_BATCH_SIZE];
         size_t read_count = 0;
 
         if (pending_store_read(entries, batch, &read_count) != ESP_OK || read_count == 0) {
             break;
         }
+        ESP_LOGI(TAG, "drain: pulled %u entries from ring (still %u in ring)",
+                 (unsigned)read_count, (unsigned)(pending - read_count));
 
         if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
             break;
@@ -370,13 +489,11 @@ static void drain_pending_to_sqlite(void)
 
         if (err == ESP_OK) {
             s_flush_errors = 0;
-
-            /* Periodic integrity check (~every 8 minutes) */
             if (++s_flush_cycles >= INTEGRITY_CHECK_INTERVAL) {
                 s_flush_cycles = 0;
                 if (!run_quick_check_locked()) {
                     xSemaphoreGive(s_sqlite_mutex);
-                    break;  /* DB was recreated — retry from fresh state next cycle */
+                    break;
                 }
             }
             xSemaphoreGive(s_sqlite_mutex);
@@ -394,20 +511,21 @@ static void drain_pending_to_sqlite(void)
             if (s_flush_errors >= FLUSH_ERROR_CHECK_THRESHOLD) {
                 ESP_LOGW(TAG, "Running integrity check after %d errors", s_flush_errors);
                 if (!run_quick_check_locked()) {
-                    s_flush_errors = 0;  /* DB was recreated, reset counter */
+                    s_flush_errors = 0;
                 }
             }
             xSemaphoreGive(s_sqlite_mutex);
-            break;  /* retry next cycle */
+            break;
         }
     }
+
+    free(entries);
 }
 
 static void flush_task(void *arg)
 {
     (void)arg;
 
-    /* Startup drain */
     drain_pending_to_sqlite();
 
     for (;;) {
@@ -436,16 +554,18 @@ esp_err_t sqlite_persistence_init(void)
         return err;
     }
 
-    /* Open SQLite if SD card is mounted */
     if (sdcard_is_mounted()) {
         sqlite3_initialize();
+        /* Archive pre-v2 schemas before opening for real. */
+        maybe_archive_legacy_db();
+
         err = db_open_and_configure();
         if (err == ESP_OK) {
             s_db_available = true;
             int64_t sqlite_max = db_get_max_measure_id();
             pending_store_seed_max_id(sqlite_max);
-            ESP_LOGI(TAG, "SQLite DB ready, max measureID = %lld",
-                     (long long)sqlite_max);
+            ESP_LOGI(TAG, "SQLite DB ready (schema v%d), max measure_id = %lld",
+                     (int)SCHEMA_VERSION, (long long)sqlite_max);
         } else {
             ESP_LOGW(TAG, "SQLite unavailable, buffering to LittleFS only");
         }
@@ -453,7 +573,6 @@ esp_err_t sqlite_persistence_init(void)
         ESP_LOGW(TAG, "SD card not mounted, buffering to LittleFS only");
     }
 
-    /* Start flush task */
     BaseType_t ret = xTaskCreatePinnedToCore(
         flush_task, "persist_flush", FLUSH_TASK_STACK, NULL, 2, &s_flush_task, 0);
     if (ret != pdPASS) {
@@ -470,26 +589,24 @@ esp_err_t sqlite_persistence_store(const measurement_record_t *records, size_t c
     return pending_store_append(records, count);
 }
 
-esp_err_t sqlite_persistence_query(const char *measure_type, time_t from, time_t to,
-                                   measurement_record_t *out, size_t max, size_t *count)
+esp_err_t sqlite_persistence_query(const char *quantity, int64_t from_ms, int64_t to_ms,
+                                    measurement_record_t *out, size_t max, size_t *count)
 {
-    if (measure_type == NULL || out == NULL || count == NULL) {
+    if (quantity == NULL || out == NULL || count == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-
     if (!s_db_available) {
         *count = 0;
         return ESP_ERR_NOT_SUPPORTED;
     }
-
     if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
 
     const char *sql =
-        "SELECT sensorID, measureID, measureType, timestamp, dataType, dataValue, syncState "
-        "FROM measurements WHERE measureType = ? AND timestamp BETWEEN ? AND ? "
-        "ORDER BY measureID, dataType;";
+        "SELECT " READ_COLUMNS " FROM measurements_v2 "
+        "WHERE quantity = ? AND start_ticks BETWEEN ? AND ? "
+        "ORDER BY measure_id, quantity;";
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
@@ -498,24 +615,13 @@ esp_err_t sqlite_persistence_query(const char *measure_type, time_t from, time_t
         return ESP_FAIL;
     }
 
-    sqlite3_bind_text(stmt, 1, measure_type, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 2, (int64_t)from);
-    sqlite3_bind_int64(stmt, 3, (int64_t)to);
+    sqlite3_bind_text (stmt, 1, quantity, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, from_ms);
+    sqlite3_bind_int64(stmt, 3, to_ms);
 
     size_t n = 0;
     while (n < max && sqlite3_step(stmt) == SQLITE_ROW) {
-        measurement_record_t *r = &out[n];
-        r->sensor_id = sqlite3_column_int64(stmt, 0);
-        r->measure_id = sqlite3_column_int64(stmt, 1);
-        strncpy(r->measure_type, (const char *)sqlite3_column_text(stmt, 2),
-                sizeof(r->measure_type) - 1);
-        r->measure_type[sizeof(r->measure_type) - 1] = '\0';
-        r->timestamp = (time_t)sqlite3_column_int64(stmt, 3);
-        strncpy(r->data_type, (const char *)sqlite3_column_text(stmt, 4),
-                sizeof(r->data_type) - 1);
-        r->data_type[sizeof(r->data_type) - 1] = '\0';
-        r->value = (float)sqlite3_column_double(stmt, 5);
-        r->sync_state = (measurement_sync_state_t)sqlite3_column_int(stmt, 6);
+        read_row(stmt, &out[n]);
         n++;
     }
 
@@ -525,22 +631,20 @@ esp_err_t sqlite_persistence_query(const char *measure_type, time_t from, time_t
     return ESP_OK;
 }
 
-esp_err_t sqlite_persistence_count(const char *measure_type, size_t *count)
+esp_err_t sqlite_persistence_count(const char *quantity, size_t *count)
 {
-    if (measure_type == NULL || count == NULL) {
+    if (quantity == NULL || count == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-
     if (!s_db_available) {
         *count = 0;
         return ESP_ERR_NOT_SUPPORTED;
     }
-
     if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
 
-    const char *sql = "SELECT COUNT(DISTINCT measureID) FROM measurements WHERE measureType = ?;";
+    const char *sql = "SELECT COUNT(DISTINCT measure_id) FROM measurements_v2 WHERE quantity = ?;";
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -548,7 +652,7 @@ esp_err_t sqlite_persistence_count(const char *measure_type, size_t *count)
         return ESP_FAIL;
     }
 
-    sqlite3_bind_text(stmt, 1, measure_type, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, quantity, -1, SQLITE_STATIC);
 
     *count = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -565,27 +669,25 @@ esp_err_t sqlite_persistence_next_id(int64_t *out_id)
     return pending_store_next_id(out_id);
 }
 
-esp_err_t sqlite_persistence_query_unsynced(const char *measure_type,
-                                            measurement_record_t *out, size_t max,
-                                            size_t *count)
+esp_err_t sqlite_persistence_query_unsynced(const char *quantity,
+                                             measurement_record_t *out, size_t max,
+                                             size_t *count)
 {
-    if (measure_type == NULL || out == NULL || count == NULL) {
+    if (quantity == NULL || out == NULL || count == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-
     if (!s_db_available) {
         *count = 0;
         return ESP_ERR_NOT_SUPPORTED;
     }
-
     if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
 
     const char *sql =
-        "SELECT sensorID, measureID, measureType, timestamp, dataType, dataValue, syncState "
-        "FROM measurements WHERE measureType = ? AND syncState = 0 "
-        "ORDER BY measureID, dataType;";
+        "SELECT " READ_COLUMNS " FROM measurements_v2 "
+        "WHERE quantity = ? AND sync_state = 0 "
+        "ORDER BY measure_id, quantity;";
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
@@ -594,22 +696,11 @@ esp_err_t sqlite_persistence_query_unsynced(const char *measure_type,
         return ESP_FAIL;
     }
 
-    sqlite3_bind_text(stmt, 1, measure_type, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, quantity, -1, SQLITE_STATIC);
 
     size_t n = 0;
     while (n < max && sqlite3_step(stmt) == SQLITE_ROW) {
-        measurement_record_t *r = &out[n];
-        r->sensor_id = sqlite3_column_int64(stmt, 0);
-        r->measure_id = sqlite3_column_int64(stmt, 1);
-        strncpy(r->measure_type, (const char *)sqlite3_column_text(stmt, 2),
-                sizeof(r->measure_type) - 1);
-        r->measure_type[sizeof(r->measure_type) - 1] = '\0';
-        r->timestamp = (time_t)sqlite3_column_int64(stmt, 3);
-        strncpy(r->data_type, (const char *)sqlite3_column_text(stmt, 4),
-                sizeof(r->data_type) - 1);
-        r->data_type[sizeof(r->data_type) - 1] = '\0';
-        r->value = (float)sqlite3_column_double(stmt, 5);
-        r->sync_state = (measurement_sync_state_t)sqlite3_column_int(stmt, 6);
+        read_row(stmt, &out[n]);
         n++;
     }
 
@@ -617,85 +708,6 @@ esp_err_t sqlite_persistence_query_unsynced(const char *measure_type,
     *count = n;
     xSemaphoreGive(s_sqlite_mutex);
     return ESP_OK;
-}
-
-esp_err_t sqlite_persistence_mark_synced(int64_t measure_id)
-{
-    if (!s_db_available) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    const char *sql =
-        "UPDATE measurements SET syncState = 2 WHERE measureID = ? AND syncState = 1;";
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        xSemaphoreGive(s_sqlite_mutex);
-        return ESP_FAIL;
-    }
-
-    sqlite3_bind_int64(stmt, 1, measure_id);
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    xSemaphoreGive(s_sqlite_mutex);
-
-    return (rc == SQLITE_DONE) ? ESP_OK : ESP_FAIL;
-}
-
-esp_err_t sqlite_persistence_mark_inflight(int64_t measure_id)
-{
-    if (!s_db_available) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    const char *sql =
-        "UPDATE measurements SET syncState = 1 WHERE measureID = ? AND syncState = 0;";
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        xSemaphoreGive(s_sqlite_mutex);
-        return ESP_FAIL;
-    }
-
-    sqlite3_bind_int64(stmt, 1, measure_id);
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    xSemaphoreGive(s_sqlite_mutex);
-
-    return (rc == SQLITE_DONE) ? ESP_OK : ESP_FAIL;
-}
-
-esp_err_t sqlite_persistence_mark_pending(int64_t measure_id)
-{
-    if (!s_db_available) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    const char *sql =
-        "UPDATE measurements SET syncState = 0 WHERE measureID = ? AND syncState = 1;";
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        xSemaphoreGive(s_sqlite_mutex);
-        return ESP_FAIL;
-    }
-
-    sqlite3_bind_int64(stmt, 1, measure_id);
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    xSemaphoreGive(s_sqlite_mutex);
-
-    return (rc == SQLITE_DONE) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t sqlite_persistence_query_by_id(int64_t measure_id,
@@ -714,8 +726,8 @@ esp_err_t sqlite_persistence_query_by_id(int64_t measure_id,
     }
 
     const char *sql =
-        "SELECT sensorID, measureID, measureType, timestamp, dataType, dataValue, syncState "
-        "FROM measurements WHERE measureID = ? ORDER BY dataType;";
+        "SELECT " READ_COLUMNS " FROM measurements_v2 "
+        "WHERE measure_id = ? ORDER BY quantity;";
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
@@ -728,18 +740,7 @@ esp_err_t sqlite_persistence_query_by_id(int64_t measure_id,
 
     size_t n = 0;
     while (n < max && sqlite3_step(stmt) == SQLITE_ROW) {
-        measurement_record_t *r = &out[n];
-        r->sensor_id = sqlite3_column_int64(stmt, 0);
-        r->measure_id = sqlite3_column_int64(stmt, 1);
-        strncpy(r->measure_type, (const char *)sqlite3_column_text(stmt, 2),
-                sizeof(r->measure_type) - 1);
-        r->measure_type[sizeof(r->measure_type) - 1] = '\0';
-        r->timestamp = (time_t)sqlite3_column_int64(stmt, 3);
-        strncpy(r->data_type, (const char *)sqlite3_column_text(stmt, 4),
-                sizeof(r->data_type) - 1);
-        r->data_type[sizeof(r->data_type) - 1] = '\0';
-        r->value = (float)sqlite3_column_double(stmt, 5);
-        r->sync_state = (measurement_sync_state_t)sqlite3_column_int(stmt, 6);
+        read_row(stmt, &out[n]);
         n++;
     }
 
@@ -749,12 +750,16 @@ esp_err_t sqlite_persistence_query_by_id(int64_t measure_id,
     return ESP_OK;
 }
 
-esp_err_t sqlite_persistence_claim_next_pending(const char *measure_type,
-                                                  int64_t *out_measure_id)
+/* ── batch claim / mark ─────────────────────────────────────────────── */
+
+esp_err_t sqlite_persistence_claim_next_pending_batch(measurement_record_t *out,
+                                                       size_t max_rows,
+                                                       size_t *out_count)
 {
-    if (measure_type == NULL || out_measure_id == NULL) {
+    if (out == NULL || out_count == NULL || max_rows == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    *out_count = 0;
     if (!s_db_available) {
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -765,58 +770,94 @@ esp_err_t sqlite_persistence_claim_next_pending(const char *measure_type,
     char *err = NULL;
     int rc = sqlite3_exec(s_db, "BEGIN IMMEDIATE;", NULL, NULL, &err);
     sqlite3_free(err);
+    err = NULL;
     if (rc != SQLITE_OK) {
         xSemaphoreGive(s_sqlite_mutex);
         return ESP_FAIL;
     }
 
-    /* Find the oldest PENDING group for this measure_type */
-    const char *select_sql =
-        "SELECT measureID FROM measurements "
-        "WHERE measureType = ? AND syncState = 0 "
-        "ORDER BY timestamp, measureID LIMIT 1;";
-
+    /* 1. Find the oldest pending measure_id. No GROUP BY / no aggregates -
+     * an index walk on the PK is the only cost. The previous GROUP BY query
+     * triggered an internal temp B-tree which the vendored SQLite 3.25.2
+     * tries to write to disk even with temp_store=MEMORY, returning
+     * SQLITE_IOERR on the SD. measure_id is monotonic from pending_store, so
+     * ORDER BY measure_id ASC is "oldest first". */
+    const char *candidate_sql =
+        "SELECT measure_id FROM measurements_v2 "
+        "WHERE sync_state = 0 "
+        "ORDER BY measure_id "
+        "LIMIT 1;";
     sqlite3_stmt *stmt = NULL;
-    rc = sqlite3_prepare_v2(s_db, select_sql, -1, &stmt, NULL);
+    rc = sqlite3_prepare_v2(s_db, candidate_sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
+        ESP_LOGE(TAG, "claim_batch candidate prepare failed (%d/%d): %s",
+                 rc, sqlite3_extended_errcode(s_db), sqlite3_errmsg(s_db));
         sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
         xSemaphoreGive(s_sqlite_mutex);
         return ESP_FAIL;
     }
 
-    sqlite3_bind_text(stmt, 1, measure_type, -1, SQLITE_STATIC);
-
     int64_t claimed_id = -1;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
+    int step_rc = sqlite3_step(stmt);
+    if (step_rc == SQLITE_ROW) {
         claimed_id = sqlite3_column_int64(stmt, 0);
     }
     sqlite3_finalize(stmt);
 
     if (claimed_id < 0) {
+        if (step_rc != SQLITE_DONE) {
+            ESP_LOGW(TAG, "claim_batch: candidate step_rc=%d/%d: %s",
+                     step_rc, sqlite3_extended_errcode(s_db), sqlite3_errmsg(s_db));
+        }
         sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
         xSemaphoreGive(s_sqlite_mutex);
         return ESP_ERR_NOT_FOUND;
     }
 
-    /* Mark all rows of this group INFLIGHT atomically */
+    /* 2. Mark all rows of that group INFLIGHT. */
     const char *update_sql =
-        "UPDATE measurements SET syncState = 1 WHERE measureID = ? AND syncState = 0;";
+        "UPDATE measurements_v2 SET sync_state = 1 "
+        "WHERE measure_id = ? AND sync_state = 0;";
     rc = sqlite3_prepare_v2(s_db, update_sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
+        ESP_LOGE(TAG, "claim_batch update prepare failed (%d/%d): %s",
+                 rc, sqlite3_extended_errcode(s_db), sqlite3_errmsg(s_db));
         sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
         xSemaphoreGive(s_sqlite_mutex);
         return ESP_FAIL;
     }
-
     sqlite3_bind_int64(stmt, 1, claimed_id);
-    rc = sqlite3_step(stmt);
+    int upd_rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-
-    if (rc != SQLITE_DONE) {
+    if (upd_rc != SQLITE_DONE) {
+        ESP_LOGE(TAG, "claim_batch update step failed (%d/%d): %s",
+                 upd_rc, sqlite3_extended_errcode(s_db), sqlite3_errmsg(s_db));
         sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
         xSemaphoreGive(s_sqlite_mutex);
         return ESP_FAIL;
     }
+
+    /* 3. Read back the claimed rows. */
+    const char *select_sql =
+        "SELECT " READ_COLUMNS " FROM measurements_v2 "
+        "WHERE measure_id = ? AND sync_state = 1 "
+        "ORDER BY quantity;";
+    rc = sqlite3_prepare_v2(s_db, select_sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        ESP_LOGE(TAG, "claim_batch select prepare failed (%d/%d): %s",
+                 rc, sqlite3_extended_errcode(s_db), sqlite3_errmsg(s_db));
+        sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_FAIL;
+    }
+    sqlite3_bind_int64(stmt, 1, claimed_id);
+
+    size_t n = 0;
+    while (n < max_rows && sqlite3_step(stmt) == SQLITE_ROW) {
+        read_row(stmt, &out[n]);
+        n++;
+    }
+    sqlite3_finalize(stmt);
 
     rc = sqlite3_exec(s_db, "COMMIT;", NULL, NULL, &err);
     sqlite3_free(err);
@@ -826,58 +867,78 @@ esp_err_t sqlite_persistence_claim_next_pending(const char *measure_type,
         return ESP_FAIL;
     }
 
-    *out_measure_id = claimed_id;
+    *out_count = n;
     return ESP_OK;
+}
+
+static esp_err_t mark_batch_state(const int64_t *measure_ids, size_t count, int new_state)
+{
+    if (measure_ids == NULL || count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_db_available) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (xSemaphoreTake(s_sqlite_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    char *err = NULL;
+    int rc = sqlite3_exec(s_db, "BEGIN TRANSACTION;", NULL, NULL, &err);
+    sqlite3_free(err);
+    err = NULL;
+    if (rc != SQLITE_OK) {
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_FAIL;
+    }
+
+    const char *sql =
+        "UPDATE measurements_v2 SET sync_state = ? "
+        "WHERE measure_id = ? AND sync_state = 1;";
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
+        xSemaphoreGive(s_sqlite_mutex);
+        return ESP_FAIL;
+    }
+    for (size_t i = 0; i < count; i++) {
+        sqlite3_bind_int  (stmt, 1, new_state);
+        sqlite3_bind_int64(stmt, 2, measure_ids[i]);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            sqlite3_finalize(stmt);
+            sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
+            xSemaphoreGive(s_sqlite_mutex);
+            return ESP_FAIL;
+        }
+        sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+
+    rc = sqlite3_exec(s_db, "COMMIT;", NULL, NULL, &err);
+    sqlite3_free(err);
+    xSemaphoreGive(s_sqlite_mutex);
+    return (rc == SQLITE_OK) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t sqlite_persistence_mark_batch_synced(const int64_t *measure_ids, size_t count)
+{
+    return mark_batch_state(measure_ids, count, (int)MEASUREMENT_SYNC_SYNCED);
+}
+
+esp_err_t sqlite_persistence_mark_batch_pending(const int64_t *measure_ids, size_t count)
+{
+    return mark_batch_state(measure_ids, count, (int)MEASUREMENT_SYNC_PENDING);
 }
 
 /* ── fn getters ──────────────────────────────────────────────────────── */
 
-measurement_store_fn sqlite_persistence_get_store_fn(void)
-{
-    return sqlite_persistence_store;
-}
-
-measurement_query_fn sqlite_persistence_get_query_fn(void)
-{
-    return sqlite_persistence_query;
-}
-
-measurement_count_fn sqlite_persistence_get_count_fn(void)
-{
-    return sqlite_persistence_count;
-}
-
-measurement_next_id_fn sqlite_persistence_get_next_id_fn(void)
-{
-    return sqlite_persistence_next_id;
-}
-
-measurement_query_unsynced_fn sqlite_persistence_get_query_unsynced_fn(void)
-{
-    return sqlite_persistence_query_unsynced;
-}
-
-measurement_mark_synced_fn sqlite_persistence_get_mark_synced_fn(void)
-{
-    return sqlite_persistence_mark_synced;
-}
-
-measurement_mark_inflight_fn sqlite_persistence_get_mark_inflight_fn(void)
-{
-    return sqlite_persistence_mark_inflight;
-}
-
-measurement_mark_pending_fn sqlite_persistence_get_mark_pending_fn(void)
-{
-    return sqlite_persistence_mark_pending;
-}
-
-measurement_query_by_id_fn sqlite_persistence_get_query_by_id_fn(void)
-{
-    return sqlite_persistence_query_by_id;
-}
-
-measurement_claim_next_pending_fn sqlite_persistence_get_claim_next_pending_fn(void)
-{
-    return sqlite_persistence_claim_next_pending;
-}
+measurement_store_fn sqlite_persistence_get_store_fn(void)               { return sqlite_persistence_store; }
+measurement_query_fn sqlite_persistence_get_query_fn(void)               { return sqlite_persistence_query; }
+measurement_count_fn sqlite_persistence_get_count_fn(void)               { return sqlite_persistence_count; }
+measurement_next_id_fn sqlite_persistence_get_next_id_fn(void)           { return sqlite_persistence_next_id; }
+measurement_query_unsynced_fn sqlite_persistence_get_query_unsynced_fn(void) { return sqlite_persistence_query_unsynced; }
+measurement_query_by_id_fn sqlite_persistence_get_query_by_id_fn(void)   { return sqlite_persistence_query_by_id; }
+measurement_claim_next_pending_batch_fn sqlite_persistence_get_claim_next_pending_batch_fn(void) { return sqlite_persistence_claim_next_pending_batch; }
+measurement_mark_batch_synced_fn sqlite_persistence_get_mark_batch_synced_fn(void) { return sqlite_persistence_mark_batch_synced; }
+measurement_mark_batch_pending_fn sqlite_persistence_get_mark_batch_pending_fn(void) { return sqlite_persistence_mark_batch_pending; }

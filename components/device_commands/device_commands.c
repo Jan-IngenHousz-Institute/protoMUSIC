@@ -3,26 +3,45 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include "ambit_protocol.h"
 #include "cJSON.h"
 
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #define TAG "dev_cmd"
+
+#define MQTT_TOPIC_MAX        256
+#define MQTT_PAYLOAD_MAX     (128U * 1024U)   /* AWS IoT max payload */
+#define MAX_BATCH_GROUPS      16              /* must match sqlite_persistence */
+/* 32 rows = up to ~10 BME280 groups (T/H/P each) per publish. Bigger numbers
+ * blow the heap budget once Lua/MQTT/SQLite have run for a bit (free heap is
+ * ~60 KiB steady-state on this build; the per-row record is ~380 B). */
+#define MAX_BATCH_ROWS        32
 
 static device_commands_config_t s_cfg;
 static bool s_initialized = false;
 static char s_mac_str[18]; /* "XX:XX:XX:XX:XX:XX\0" */
 
-/* Single in-flight measurement publish slot — correlates QoS-1 ack to a measureID */
-static int64_t s_inflight_measure_id = -1;
-static int     s_inflight_msg_id     = -1;
+/* In-flight publish tracking. The sync runner claims a batch of measurement
+ * groups, the MQTT layer publishes them as one message, and the broker's
+ * PUBACK matches by msg_id back to the listed measure_ids. The mutex
+ * serialises read/mutate access across the Lua task, sync runner, and the
+ * MQTT event task that fires on_publish_ack. */
+static SemaphoreHandle_t s_inflight_mtx = NULL;
+static StaticSemaphore_t s_inflight_mtx_storage;
+static int64_t s_inflight_ids[MAX_BATCH_GROUPS];
+static size_t  s_inflight_n  = 0;
+static int     s_inflight_msg_id = -1;
 
 static cmd_result_t make_result(esp_err_t status, const char *fmt, ...)
 {
@@ -39,25 +58,29 @@ static cmd_result_t make_result(esp_err_t status, const char *fmt, ...)
 static void on_publish_ack(int msg_id, esp_err_t status, void *ctx)
 {
     (void)ctx;
-    if (s_inflight_msg_id < 0 || msg_id != s_inflight_msg_id) {
+    if (s_inflight_mtx == NULL) return;
+    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return;
+
+    if (s_inflight_msg_id < 0 || msg_id != s_inflight_msg_id || s_inflight_n == 0) {
+        xSemaphoreGive(s_inflight_mtx);
         return; /* Unknown ack — ignore (e.g. raw cmd_mqtt_publish) */
     }
-    if (s_inflight_measure_id < 0) {
-        return;
-    }
 
-    if (status == ESP_OK) {
-        if (s_cfg.mark_synced != NULL) {
-            s_cfg.mark_synced(s_inflight_measure_id);
-        }
-    } else {
-        if (s_cfg.mark_pending != NULL) {
-            s_cfg.mark_pending(s_inflight_measure_id);
-        }
-    }
+    /* Copy IDs out before clearing the slot so the DB updates run with the
+     * mutex released (SQLite has its own mutex; nesting risks priority
+     * inversion). */
+    int64_t ids[MAX_BATCH_GROUPS];
+    size_t  n = s_inflight_n;
+    memcpy(ids, s_inflight_ids, n * sizeof(ids[0]));
+    s_inflight_n     = 0;
+    s_inflight_msg_id = -1;
+    xSemaphoreGive(s_inflight_mtx);
 
-    s_inflight_measure_id = -1;
-    s_inflight_msg_id     = -1;
+    if (status == ESP_OK && s_cfg.mark_batch_synced != NULL) {
+        s_cfg.mark_batch_synced(ids, n);
+    } else if (s_cfg.mark_batch_pending != NULL) {
+        s_cfg.mark_batch_pending(ids, n);
+    }
 }
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg)
@@ -67,6 +90,10 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
     }
     s_cfg = *cfg;
     s_initialized = true;
+
+    if (s_inflight_mtx == NULL) {
+        s_inflight_mtx = xSemaphoreCreateMutexStatic(&s_inflight_mtx_storage);
+    }
 
     uint8_t mac[6];
     if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
@@ -168,24 +195,37 @@ cmd_result_t cmd_read_env(float *temp, float *hum, float *pres)
                        m.temperature_c, m.humidity_percent, m.pressure_pa);
 }
 
-/* Helper: populate a record with sensor_id=1, the shared timestamp, and PENDING
- * sync state. Caller fills in measure_id, measure_type, and value. */
+/* Return current UTC milliseconds since epoch, sourced from the IDF's internal
+ * clock (settimeofday'd from the RTC at boot — see components/pcf2131tfy_rtc).
+ * Cheap: one syscall, no I2C transactions. */
+static int64_t now_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
+}
+
+/* Helper: populate one onboard-BME280 row. measure_id, timestamps, and quantity
+ * are caller-supplied so all three rows of one record_env share them. */
 static void fill_env_record(measurement_record_t *r, int64_t measure_id,
-                            const char *measure_type, time_t timestamp,
+                            const char *quantity, int64_t start_ms, int64_t end_ms,
                             float value)
 {
     memset(r, 0, sizeof(*r));
-    r->sensor_id  = 1;
-    r->measure_id = measure_id;
-    strncpy(r->measure_type, measure_type, sizeof(r->measure_type) - 1);
-    r->timestamp  = timestamp;
-    strncpy(r->data_type, "float", sizeof(r->data_type) - 1);
-    r->value      = value;
-    r->sync_state = MEASUREMENT_SYNC_PENDING;
+    r->measure_id      = measure_id;
+    strncpy(r->quantity, quantity, sizeof(r->quantity) - 1);
+    r->start_ticks_ms  = start_ms;
+    r->end_ticks_ms    = end_ms;
+    r->device[0]       = '\0';                       /* onboard sensor */
+    strncpy(r->sensor, "BME280", sizeof(r->sensor) - 1);
+    r->sensor_id       = 0x76;                       /* BME280_I2C_ADDR_SECONDARY */
+    r->metadata[0]     = '\0';
+    r->value_is_string = false;
+    r->value_real      = value;
+    r->sync_state      = MEASUREMENT_SYNC_PENDING;
 }
 
-cmd_result_t cmd_record_env(int64_t *out_temp_id, int64_t *out_hum_id,
-                            int64_t *out_pres_id)
+cmd_result_t cmd_record_env(int64_t *out_measure_id)
 {
     if (!s_initialized || s_cfg.read_env == NULL ||
         s_cfg.store == NULL || s_cfg.next_id == NULL) {
@@ -193,44 +233,35 @@ cmd_result_t cmd_record_env(int64_t *out_temp_id, int64_t *out_hum_id,
                            "env/persistence not available");
     }
 
+    int64_t start_ms = now_ms();
     measurement_t m;
     esp_err_t err = s_cfg.read_env(&m);
+    int64_t end_ms = now_ms();
     if (err != ESP_OK) {
         return make_result(err, "env read failed: %s", esp_err_to_name(err));
     }
 
-    /* Best-effort timestamp; if RTC isn't ready we still record (ts=0). */
-    time_t ts = 0;
-    if (s_cfg.read_clock != NULL) {
-        (void)s_cfg.read_clock(&ts);
-    }
-
-    int64_t id_t = 0, id_h = 0, id_p = 0;
-    if ((err = s_cfg.next_id(&id_t)) != ESP_OK ||
-        (err = s_cfg.next_id(&id_h)) != ESP_OK ||
-        (err = s_cfg.next_id(&id_p)) != ESP_OK) {
+    int64_t mid = 0;
+    if ((err = s_cfg.next_id(&mid)) != ESP_OK) {
         return make_result(err, "next_id failed: %s", esp_err_to_name(err));
     }
 
+    /* T, H, P all share one measure_id and identical start/end ticks. */
     measurement_record_t records[3];
-    fill_env_record(&records[0], id_t, "temperature", ts, m.temperature_c);
-    fill_env_record(&records[1], id_h, "humidity",    ts, m.humidity_percent);
-    fill_env_record(&records[2], id_p, "pressure",    ts, m.pressure_pa);
+    fill_env_record(&records[0], mid, "temperature", start_ms, end_ms, m.temperature_c);
+    fill_env_record(&records[1], mid, "humidity",    start_ms, end_ms, m.humidity_percent);
+    fill_env_record(&records[2], mid, "pressure",    start_ms, end_ms, m.pressure_pa);
 
     err = s_cfg.store(records, 3);
     if (err != ESP_OK) {
         return make_result(err, "store failed: %s", esp_err_to_name(err));
     }
 
-    if (out_temp_id) *out_temp_id = id_t;
-    if (out_hum_id)  *out_hum_id  = id_h;
-    if (out_pres_id) *out_pres_id = id_p;
-
+    if (out_measure_id) *out_measure_id = mid;
     return make_result(ESP_OK,
-                       "recorded env: T=%.2fC(%lld) H=%.1f%%(%lld) P=%.0fPa(%lld)",
-                       m.temperature_c, (long long)id_t,
-                       m.humidity_percent, (long long)id_h,
-                       m.pressure_pa,    (long long)id_p);
+                       "recorded env id=%lld: T=%.2fC H=%.1f%% P=%.0fPa",
+                       (long long)mid, m.temperature_c,
+                       m.humidity_percent, m.pressure_pa);
 }
 
 cmd_result_t cmd_log(const char *msg)
@@ -263,25 +294,25 @@ cmd_result_t cmd_store_measurement(const measurement_record_t *records, size_t c
     return make_result(ESP_OK, "stored %u record(s)", (unsigned)count);
 }
 
-cmd_result_t cmd_query_measurements(const char *measure_type, time_t from, time_t to,
+cmd_result_t cmd_query_measurements(const char *quantity, int64_t from_ms, int64_t to_ms,
                                     measurement_record_t *out, size_t max, size_t *count)
 {
     if (!s_initialized || s_cfg.query == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
     }
-    esp_err_t err = s_cfg.query(measure_type, from, to, out, max, count);
+    esp_err_t err = s_cfg.query(quantity, from_ms, to_ms, out, max, count);
     if (err != ESP_OK) {
         return make_result(err, "query failed: %s", esp_err_to_name(err));
     }
     return make_result(ESP_OK, "query returned %u record(s)", (unsigned)*count);
 }
 
-cmd_result_t cmd_measurement_count(const char *measure_type, size_t *count)
+cmd_result_t cmd_measurement_count(const char *quantity, size_t *count)
 {
     if (!s_initialized || s_cfg.count == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
     }
-    esp_err_t err = s_cfg.count(measure_type, count);
+    esp_err_t err = s_cfg.count(quantity, count);
     if (err != ESP_OK) {
         return make_result(err, "count failed: %s", esp_err_to_name(err));
     }
@@ -300,13 +331,13 @@ cmd_result_t cmd_next_measure_id(int64_t *out_id)
     return make_result(ESP_OK, "next_id: %lld", (long long)*out_id);
 }
 
-cmd_result_t cmd_query_unsynced(const char *measure_type, measurement_record_t *out,
+cmd_result_t cmd_query_unsynced(const char *quantity, measurement_record_t *out,
                                 size_t max, size_t *count)
 {
     if (!s_initialized || s_cfg.query_unsynced == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
     }
-    esp_err_t err = s_cfg.query_unsynced(measure_type, out, max, count);
+    esp_err_t err = s_cfg.query_unsynced(quantity, out, max, count);
     if (err != ESP_OK) {
         return make_result(err, "query_unsynced failed: %s", esp_err_to_name(err));
     }
@@ -359,164 +390,200 @@ cmd_result_t cmd_mqtt_publish_raw(const char *payload)
     return make_result(ESP_OK, "published to %s (msg_id=%d)", topic, msg_id);
 }
 
-/* ── helpers shared by the two publish commands ──────────────────── */
+/* ── MQTT publish: batch a group of rows as `sample: [...]` ─────────── */
 
-#define MQTT_TOPIC_MAX   256
-#define MQTT_PAYLOAD_MAX 1024
-#define MQTT_RECORDS_MAX 8
-
-static cmd_result_t build_and_publish(int64_t measure_id)
+/* Add one measurement row as a JSON object to the `sample` array. */
+static void append_row_to_sample(cJSON *sample_arr, const measurement_record_t *r)
 {
-    measurement_record_t records[MQTT_RECORDS_MAX];
-    size_t count = 0;
-    esp_err_t err = s_cfg.query_by_id(measure_id, records, MQTT_RECORDS_MAX, &count);
-    if (err != ESP_OK || count == 0) {
-        s_cfg.mark_pending(measure_id);
-        return make_result(err != ESP_OK ? err : ESP_ERR_NOT_FOUND,
-                           "query_by_id failed for measure_id=%lld", (long long)measure_id);
+    cJSON *row = cJSON_CreateObject();
+    cJSON_AddNumberToObject(row, "measure_id", (double)r->measure_id);
+    cJSON_AddStringToObject(row, "quantity",   r->quantity);
+    cJSON_AddNumberToObject(row, "startTicks", (double)r->start_ticks_ms);
+    cJSON_AddNumberToObject(row, "endTicks",   (double)r->end_ticks_ms);
+    if (r->device[0] == '\0') {
+        cJSON_AddNullToObject(row, "device");
+    } else {
+        cJSON_AddStringToObject(row, "device", r->device);
+    }
+    cJSON_AddStringToObject(row, "sensor", r->sensor);
+    if (r->sensor_id == MEASUREMENT_SENSOR_ID_NONE) {
+        cJSON_AddNullToObject(row, "sensor_id");
+    } else {
+        cJSON_AddNumberToObject(row, "sensor_id", (double)r->sensor_id);
+    }
+    if (r->metadata[0] == '\0') {
+        cJSON_AddNullToObject(row, "metadata");
+    } else {
+        /* Try to parse metadata as JSON; if it parses, attach the value
+         * verbatim. Otherwise fall back to a string field. */
+        cJSON *meta = cJSON_Parse(r->metadata);
+        if (meta != NULL) {
+            cJSON_AddItemToObject(row, "metadata", meta);
+        } else {
+            cJSON_AddStringToObject(row, "metadata", r->metadata);
+        }
+    }
+    if (r->value_is_string) {
+        cJSON_AddStringToObject(row, "value", r->value_text);
+    } else {
+        cJSON_AddNumberToObject(row, "value", (double)r->value_real);
+    }
+    cJSON_AddItemToArray(sample_arr, row);
+}
+
+/* Collect distinct measure_ids from a row array, preserving order of first
+ * appearance. `out_ids` capacity must be at least MAX_BATCH_GROUPS. */
+static size_t distinct_measure_ids(const measurement_record_t *rows, size_t n,
+                                    int64_t *out_ids, size_t cap)
+{
+    size_t k = 0;
+    for (size_t i = 0; i < n && k < cap; i++) {
+        bool seen = false;
+        for (size_t j = 0; j < k; j++) {
+            if (out_ids[j] == rows[i].measure_id) { seen = true; break; }
+        }
+        if (!seen) out_ids[k++] = rows[i].measure_id;
+    }
+    return k;
+}
+
+cmd_result_t cmd_mqtt_publish_next_batch(void)
+{
+    if (!s_initialized || s_cfg.publish == NULL ||
+        s_cfg.claim_next_pending_batch == NULL || s_cfg.mark_batch_pending == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT or persistence not available");
+    }
+    if (s_inflight_mtx == NULL) {
+        return make_result(ESP_ERR_INVALID_STATE, "inflight mutex not initialised");
     }
 
-    /* Build topic: <root>/1234. The trailing segment is fixed so every publish
-     * lands on the same topic the server is configured to ingest. measure_id
-     * and measure_type are still carried by the payload (set[].key and the
-     * implicit sample structure) so the receiver can demultiplex there. */
+    /* Refuse a new batch if one is still waiting for PUBACK. */
+    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return make_result(ESP_ERR_TIMEOUT, "inflight mutex busy");
+    }
+    bool already_inflight = (s_inflight_n > 0);
+    xSemaphoreGive(s_inflight_mtx);
+    if (already_inflight) {
+        return make_result(ESP_ERR_INVALID_STATE,
+                           "previous batch (%u groups) still in flight",
+                           (unsigned)s_inflight_n);
+    }
+
+    /* Claim a batch atomically. Rows are heap-allocated since MAX_BATCH_ROWS
+     * worth of records (~370 B each) would blow a typical task stack. */
+    measurement_record_t *rows = calloc(MAX_BATCH_ROWS, sizeof(*rows));
+    if (rows == NULL) {
+        ESP_LOGE(TAG, "publish_next_batch: rows calloc(%u * %u = %u B) failed (free heap=%u)",
+                 (unsigned)MAX_BATCH_ROWS, (unsigned)sizeof(*rows),
+                 (unsigned)(MAX_BATCH_ROWS * sizeof(*rows)),
+                 (unsigned)esp_get_free_heap_size());
+        return make_result(ESP_ERR_NO_MEM, "rows alloc failed");
+    }
+    size_t row_count = 0;
+    esp_err_t err = s_cfg.claim_next_pending_batch(rows, MAX_BATCH_ROWS, &row_count);
+    if (err == ESP_ERR_NOT_FOUND || row_count == 0) {
+        free(rows);
+        return make_result(ESP_ERR_NOT_FOUND, "no pending measurements");
+    }
+    if (err != ESP_OK) {
+        free(rows);
+        return make_result(err, "claim_next_pending_batch failed: %s", esp_err_to_name(err));
+    }
+
+    int64_t ids[MAX_BATCH_GROUPS];
+    size_t  ids_n = distinct_measure_ids(rows, row_count, ids, MAX_BATCH_GROUPS);
+
+    /* ── Build JSON envelope ─────────────────────────────────────────── */
+    cJSON *root      = cJSON_CreateObject();
+    cJSON *sample    = cJSON_CreateArray();
+    if (root == NULL || sample == NULL) {
+        if (root)   cJSON_Delete(root);
+        if (sample) cJSON_Delete(sample);
+        s_cfg.mark_batch_pending(ids, ids_n);
+        free(rows);
+        return make_result(ESP_ERR_NO_MEM, "cJSON alloc failed");
+    }
+    cJSON_AddItemToObject(root, "sample", sample);
+    cJSON_AddStringToObject(root, "device_firmware",  s_cfg.device_firmware  ? s_cfg.device_firmware  : "");
+    cJSON_AddStringToObject(root, "device_id",        s_mac_str);
+    cJSON_AddStringToObject(root, "device_name",      s_cfg.device_name      ? s_cfg.device_name      : "");
+    cJSON_AddStringToObject(root, "device_version",   s_cfg.device_version   ? s_cfg.device_version   : "");
+    cJSON_AddStringToObject(root, "firmware_version", s_cfg.firmware_version ? s_cfg.firmware_version : "");
+
+    /* ISO 8601 publish-moment timestamp (UTC). */
+    char ts_str[32];
+    time_t ts = time(NULL);
+    struct tm tm_info;
+    gmtime_r(&ts, &tm_info);
+    strftime(ts_str, sizeof(ts_str), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
+    cJSON_AddStringToObject(root, "timestamp", ts_str);
+
+    for (size_t i = 0; i < row_count; i++) {
+        append_row_to_sample(sample, &rows[i]);
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        s_cfg.mark_batch_pending(ids, ids_n);
+        free(rows);
+        return make_result(ESP_ERR_NO_MEM, "cJSON print failed");
+    }
+
+    size_t payload_len = strlen(payload);
+    if (payload_len >= MQTT_PAYLOAD_MAX) {
+        ESP_LOGW(TAG, "payload %u bytes exceeds %u; truncated batch may be rejected",
+                 (unsigned)payload_len, (unsigned)MQTT_PAYLOAD_MAX);
+    }
+
     char topic[MQTT_TOPIC_MAX];
     snprintf(topic, sizeof(topic), "%s/1234",
              s_cfg.topic_root ? s_cfg.topic_root : "");
 
-    /* Build set[] array: [{"key":"<data_type>","value":<float>}, …] */
-    char set_buf[512];
-    int sp = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (i > 0 && sp < (int)sizeof(set_buf) - 3) {
-            set_buf[sp++] = ',';
-        }
-        int n = snprintf(set_buf + sp, sizeof(set_buf) - (size_t)sp,
-                         "{\"key\":\"%s\",\"value\":%.6g}",
-                         records[i].data_type, (double)records[i].value);
-        if (n > 0 && sp + n < (int)sizeof(set_buf)) {
-            sp += n;
-        } else {
-            break;
-        }
-    }
-    set_buf[sp] = '\0';
-
-    /* Build inner sample JSON (unescaped) */
-    char sample_inner[600];
-    int si = snprintf(sample_inner, sizeof(sample_inner),
-                      "{\"protocol_id\":\"%s\",\"set\":[%s]}",
-                      s_cfg.protocol_id ? s_cfg.protocol_id : "",
-                      set_buf);
-
-    /* JSON-encode sample_inner as a string value: escape " → \" */
-    char sample_esc[800];
-    int se = 0;
-    for (int j = 0; j < si && se < (int)sizeof(sample_esc) - 2; j++) {
-        if (sample_inner[j] == '"' && se < (int)sizeof(sample_esc) - 3) {
-            sample_esc[se++] = '\\';
-        }
-        sample_esc[se++] = sample_inner[j];
-    }
-    sample_esc[se] = '\0';
-
-    /* ISO 8601 timestamp */
-    char ts_str[32];
-    time_t ts = (time_t)records[0].timestamp;
-    struct tm tm_info;
-    gmtime_r(&ts, &tm_info);
-    strftime(ts_str, sizeof(ts_str), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
-
-    /* Build full payload — sample is a JSON-encoded string per server schema */
-    char payload[MQTT_PAYLOAD_MAX];
-    int pos = snprintf(payload, sizeof(payload),
-                       "{\"sample\":\"%s\","
-                       "\"device_firmware\":\"%s\","
-                       "\"device_id\":\"%s\","
-                       "\"device_name\":\"%s\","
-                       "\"device_version\":\"%s\","
-                       "\"firmware_version\":\"%s\","
-                       "\"timestamp\":\"%s\"}",
-                       sample_esc,
-                       s_cfg.device_firmware  ? s_cfg.device_firmware  : "",
-                       s_mac_str,
-                       s_cfg.device_name      ? s_cfg.device_name      : "",
-                       s_cfg.device_version   ? s_cfg.device_version   : "",
-                       s_cfg.firmware_version ? s_cfg.firmware_version : "",
-                       ts_str);
-
-    ESP_LOGI(TAG, "publish → topic: %s", topic);
-    ESP_LOGI(TAG, "publish → payload: %.120s%s", payload, pos > 120 ? "…" : "");
+    ESP_LOGI(TAG, "publish -> topic: %s (%u rows, %u groups, %u bytes)",
+             topic, (unsigned)row_count, (unsigned)ids_n, (unsigned)payload_len);
 
     int msg_id = 0;
-    err = s_cfg.publish(topic, payload, (size_t)pos, &msg_id);
+    err = s_cfg.publish(topic, payload, payload_len, &msg_id);
+    free(payload);
+    free(rows);
+
     if (err != ESP_OK) {
-        s_cfg.mark_pending(measure_id);
+        s_cfg.mark_batch_pending(ids, ids_n);
         return make_result(err, "publish failed: %s", esp_err_to_name(err));
     }
 
-    s_inflight_measure_id = measure_id;
-    s_inflight_msg_id     = msg_id;
-    return make_result(ESP_OK, "published measure_id=%lld msg_id=%d",
-                       (long long)measure_id, msg_id);
-}
-
-cmd_result_t cmd_mqtt_publish_measurement(int64_t measure_id)
-{
-    if (!s_initialized || s_cfg.publish == NULL ||
-        s_cfg.query_by_id == NULL || s_cfg.mark_inflight == NULL ||
-        s_cfg.mark_pending == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT or persistence not available");
-    }
-    if (s_inflight_measure_id >= 0) {
-        return make_result(ESP_ERR_INVALID_STATE,
-                           "measure_id %lld already in flight",
-                           (long long)s_inflight_measure_id);
+    /* Latch the inflight batch for the ack handler. */
+    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        memcpy(s_inflight_ids, ids, ids_n * sizeof(ids[0]));
+        s_inflight_n      = ids_n;
+        s_inflight_msg_id = msg_id;
+        xSemaphoreGive(s_inflight_mtx);
+    } else {
+        ESP_LOGW(TAG, "inflight latch failed; row(s) may be re-published on retry");
     }
 
-    esp_err_t err = s_cfg.mark_inflight(measure_id);
-    if (err != ESP_OK) {
-        return make_result(err, "mark_inflight failed: %s", esp_err_to_name(err));
-    }
-
-    return build_and_publish(measure_id);
-}
-
-cmd_result_t cmd_mqtt_publish_unsynced(const char *measure_type)
-{
-    if (!s_initialized || s_cfg.publish == NULL ||
-        s_cfg.claim_next_pending == NULL || s_cfg.query_by_id == NULL ||
-        s_cfg.mark_pending == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT or persistence not available");
-    }
-    if (s_inflight_measure_id >= 0) {
-        return make_result(ESP_ERR_INVALID_STATE,
-                           "measure_id %lld already in flight",
-                           (long long)s_inflight_measure_id);
-    }
-
-    /* Atomically claim the oldest PENDING group (marks it INFLIGHT in DB) */
-    int64_t claimed_id = -1;
-    esp_err_t err = s_cfg.claim_next_pending(measure_type, &claimed_id);
-    if (err == ESP_ERR_NOT_FOUND) {
-        return make_result(ESP_ERR_NOT_FOUND, "no pending measurements for '%s'",
-                           measure_type);
-    }
-    if (err != ESP_OK) {
-        return make_result(err, "claim_next_pending failed: %s", esp_err_to_name(err));
-    }
-
-    return build_and_publish(claimed_id);
+    return make_result(ESP_OK, "published %u groups (%u rows) msg_id=%d",
+                       (unsigned)ids_n, (unsigned)row_count, msg_id);
 }
 
 void device_commands_on_mqtt_disconnect(void)
 {
-    if (s_inflight_measure_id >= 0) {
-        if (s_cfg.mark_pending != NULL) {
-            s_cfg.mark_pending(s_inflight_measure_id);
-        }
-        s_inflight_measure_id = -1;
-        s_inflight_msg_id     = -1;
+    if (s_inflight_mtx == NULL) return;
+    if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) return;
+    if (s_inflight_n == 0) {
+        xSemaphoreGive(s_inflight_mtx);
+        return;
+    }
+    int64_t ids[MAX_BATCH_GROUPS];
+    size_t n = s_inflight_n;
+    memcpy(ids, s_inflight_ids, n * sizeof(ids[0]));
+    s_inflight_n      = 0;
+    s_inflight_msg_id = -1;
+    xSemaphoreGive(s_inflight_mtx);
+
+    if (s_cfg.mark_batch_pending != NULL) {
+        s_cfg.mark_batch_pending(ids, n);
     }
 }
 
@@ -981,13 +1048,8 @@ cmd_result_t cmd_dispatch_json(const char *json, size_t len)
             time_t ts = 0;
             res = cmd_device_status(&bme, &rtc, &ts);
 
-        } else if (strcmp(cmd, "publish_unsynced") == 0) {
-            cJSON *type_field = cJSON_GetObjectItemCaseSensitive(root, "type");
-            if (!cJSON_IsString(type_field) || type_field->valuestring == NULL) {
-                res = make_result(ESP_ERR_INVALID_ARG, "publish_unsynced requires 'type'");
-            } else {
-                res = cmd_mqtt_publish_unsynced(type_field->valuestring);
-            }
+        } else if (strcmp(cmd, "publish_next_batch") == 0) {
+            res = cmd_mqtt_publish_next_batch();
 
         } else if (strcmp(cmd, "mqtt_status") == 0) {
             res = cmd_mqtt_status();

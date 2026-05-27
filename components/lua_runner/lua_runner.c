@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include "esp_err.h"
@@ -104,22 +105,16 @@ static int l_device_read_env(lua_State *L)
     return 1;
 }
 
-/* device.record_env() — read BME280 + persist T/H/P as three PENDING records.
- * Returns { temperature_id, humidity_id, pressure_id } or nil,err. */
+/* device.record_env() — read BME280 + persist T/H/P as three rows sharing one
+ * measure_id. Returns that measure_id (int) or nil,err. */
 static int l_device_record_env(lua_State *L)
 {
-    int64_t id_t = 0, id_h = 0, id_p = 0;
-    cmd_result_t res = cmd_record_env(&id_t, &id_h, &id_p);
+    int64_t mid = 0;
+    cmd_result_t res = cmd_record_env(&mid);
     if (res.status != ESP_OK) {
         return lua_push_nil_reason(L, res.message);
     }
-    lua_newtable(L);
-    lua_pushinteger(L, (lua_Integer)id_t);
-    lua_setfield(L, -2, "temperature_id");
-    lua_pushinteger(L, (lua_Integer)id_h);
-    lua_setfield(L, -2, "humidity_id");
-    lua_pushinteger(L, (lua_Integer)id_p);
-    lua_setfield(L, -2, "pressure_id");
+    lua_pushinteger(L, (lua_Integer)mid);
     return 1;
 }
 
@@ -508,6 +503,100 @@ static int l_device_ambit_set_metadata(lua_State *L)
 
 /* ── db.* bindings ───────────────────────────────────────────────────── */
 
+/* Take an optional Lua field at index -1 (table on top of stack). Pops it.
+ * Writes a non-empty string to `out` (truncated to cap-1). */
+static void lua_get_optional_string(lua_State *L, const char *key,
+                                    char *out, size_t cap)
+{
+    lua_getfield(L, -1, key);
+    if (lua_isstring(L, -1)) {
+        const char *s = lua_tostring(L, -1);
+        strncpy(out, s, cap - 1);
+        out[cap - 1] = '\0';
+    }
+    lua_pop(L, 1);
+}
+
+/* Read a record from the table currently at the top of the stack. */
+static int read_lua_record(lua_State *L, measurement_record_t *r, int64_t now_ms_val)
+{
+    memset(r, 0, sizeof(*r));
+    r->sensor_id  = MEASUREMENT_SENSOR_ID_NONE;
+    r->sync_state = MEASUREMENT_SYNC_PENDING;
+
+    /* measure_id — optional; auto-allocate when missing */
+    lua_getfield(L, -1, "measure_id");
+    if (lua_isinteger(L, -1) || lua_isnumber(L, -1)) {
+        r->measure_id = (int64_t)lua_tointeger(L, -1);
+    } else {
+        lua_pop(L, 1);
+        cmd_result_t res = cmd_next_measure_id(&r->measure_id);
+        if (res.status != ESP_OK) return -1;
+        goto have_id; /* avoid double-pop */
+    }
+    lua_pop(L, 1);
+have_id:;
+
+    /* quantity — required */
+    lua_getfield(L, -1, "quantity");
+    if (!lua_isstring(L, -1)) {
+        lua_pop(L, 1);
+        return -2;
+    }
+    strncpy(r->quantity, lua_tostring(L, -1), sizeof(r->quantity) - 1);
+    lua_pop(L, 1);
+
+    /* sensor — required */
+    lua_getfield(L, -1, "sensor");
+    if (!lua_isstring(L, -1)) {
+        lua_pop(L, 1);
+        return -3;
+    }
+    strncpy(r->sensor, lua_tostring(L, -1), sizeof(r->sensor) - 1);
+    lua_pop(L, 1);
+
+    /* device — optional ("" or nil = onboard) */
+    lua_get_optional_string(L, "device", r->device, sizeof(r->device));
+
+    /* sensor_id — optional integer (-1 sentinel = NULL) */
+    lua_getfield(L, -1, "sensor_id");
+    if (lua_isinteger(L, -1) || lua_isnumber(L, -1)) {
+        r->sensor_id = (int64_t)lua_tointeger(L, -1);
+    }
+    lua_pop(L, 1);
+
+    /* metadata — optional: table → JSON via cJSON-equivalent (here we accept
+     * a pre-serialised string only; table form is a follow-up). */
+    lua_get_optional_string(L, "metadata", r->metadata, sizeof(r->metadata));
+
+    /* start_ticks / end_ticks — optional; default to caller's now_ms_val */
+    lua_getfield(L, -1, "start_ticks");
+    r->start_ticks_ms = (lua_isinteger(L, -1) || lua_isnumber(L, -1))
+                        ? (int64_t)lua_tointeger(L, -1) : now_ms_val;
+    lua_pop(L, 1);
+
+    lua_getfield(L, -1, "end_ticks");
+    r->end_ticks_ms = (lua_isinteger(L, -1) || lua_isnumber(L, -1))
+                      ? (int64_t)lua_tointeger(L, -1) : r->start_ticks_ms;
+    lua_pop(L, 1);
+
+    /* value — required; can be number (float) or string */
+    lua_getfield(L, -1, "value");
+    if (lua_isstring(L, -1) && !lua_isnumber(L, -1)) {
+        r->value_is_string = true;
+        strncpy(r->value_text, lua_tostring(L, -1), sizeof(r->value_text) - 1);
+    } else if (lua_isnumber(L, -1)) {
+        r->value_is_string = false;
+        r->value_real      = (float)lua_tonumber(L, -1);
+    } else {
+        lua_pop(L, 1);
+        return -4;
+    }
+    lua_pop(L, 1);
+
+    return 0;
+}
+
 static int l_db_store(lua_State *L)
 {
     luaL_checktype(L, 1, LUA_TTABLE);
@@ -521,43 +610,30 @@ static int l_db_store(lua_State *L)
         return lua_push_nil_reason(L, "out of memory");
     }
 
+    int64_t now_ms_val;
+    {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        now_ms_val = (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
+    }
+
     for (int i = 1; i <= n; i++) {
         lua_rawgeti(L, 1, i);
         if (!lua_istable(L, -1)) {
             free(records);
             return lua_push_nil_reason(L, "each record must be a table");
         }
-        measurement_record_t *r = &records[i - 1];
-        memset(r, 0, sizeof(*r));
-
-        lua_getfield(L, -1, "sensor_id");
-        r->sensor_id = (int64_t)luaL_checkinteger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, -1, "measure_id");
-        r->measure_id = (int64_t)luaL_checkinteger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, -1, "measure_type");
-        const char *mt = luaL_checkstring(L, -1);
-        strncpy(r->measure_type, mt, sizeof(r->measure_type) - 1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, -1, "timestamp");
-        r->timestamp = (time_t)luaL_checkinteger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, -1, "data_type");
-        const char *dt = luaL_checkstring(L, -1);
-        strncpy(r->data_type, dt, sizeof(r->data_type) - 1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, -1, "value");
-        r->value = (float)luaL_checknumber(L, -1);
-        lua_pop(L, 1);
-
-        r->sync_state = MEASUREMENT_SYNC_PENDING;
+        int err = read_lua_record(L, &records[i - 1], now_ms_val);
         lua_pop(L, 1); /* pop the record table */
+        if (err != 0) {
+            free(records);
+            const char *msg =
+                (err == -1) ? "next_id failed" :
+                (err == -2) ? "record missing required field 'quantity'" :
+                (err == -3) ? "record missing required field 'sensor'" :
+                              "record 'value' must be a number or string";
+            return lua_push_nil_reason(L, msg);
+        }
     }
 
     cmd_result_t res = cmd_store_measurement(records, (size_t)n);
@@ -573,17 +649,33 @@ static int l_db_store(lua_State *L)
 static void lua_push_record_table(lua_State *L, const measurement_record_t *r)
 {
     lua_newtable(L);
-    lua_pushinteger(L, (lua_Integer)r->sensor_id);
-    lua_setfield(L, -2, "sensor_id");
     lua_pushinteger(L, (lua_Integer)r->measure_id);
     lua_setfield(L, -2, "measure_id");
-    lua_pushstring(L, r->measure_type);
-    lua_setfield(L, -2, "measure_type");
-    lua_pushinteger(L, (lua_Integer)r->timestamp);
-    lua_setfield(L, -2, "timestamp");
-    lua_pushstring(L, r->data_type);
-    lua_setfield(L, -2, "data_type");
-    lua_pushnumber(L, (lua_Number)r->value);
+    lua_pushstring(L, r->quantity);
+    lua_setfield(L, -2, "quantity");
+    lua_pushinteger(L, (lua_Integer)r->start_ticks_ms);
+    lua_setfield(L, -2, "start_ticks");
+    lua_pushinteger(L, (lua_Integer)r->end_ticks_ms);
+    lua_setfield(L, -2, "end_ticks");
+    if (r->device[0] != '\0') {
+        lua_pushstring(L, r->device);
+        lua_setfield(L, -2, "device");
+    }
+    lua_pushstring(L, r->sensor);
+    lua_setfield(L, -2, "sensor");
+    if (r->sensor_id != MEASUREMENT_SENSOR_ID_NONE) {
+        lua_pushinteger(L, (lua_Integer)r->sensor_id);
+        lua_setfield(L, -2, "sensor_id");
+    }
+    if (r->metadata[0] != '\0') {
+        lua_pushstring(L, r->metadata);
+        lua_setfield(L, -2, "metadata");
+    }
+    if (r->value_is_string) {
+        lua_pushstring(L, r->value_text);
+    } else {
+        lua_pushnumber(L, (lua_Number)r->value_real);
+    }
     lua_setfield(L, -2, "value");
     lua_pushinteger(L, (lua_Integer)r->sync_state);
     lua_setfield(L, -2, "sync_state");
@@ -591,9 +683,9 @@ static void lua_push_record_table(lua_State *L, const measurement_record_t *r)
 
 static int l_db_query(lua_State *L)
 {
-    const char *type = luaL_checkstring(L, 1);
-    lua_Integer from = luaL_checkinteger(L, 2);
-    lua_Integer to = luaL_checkinteger(L, 3);
+    const char *quantity = luaL_checkstring(L, 1);
+    lua_Integer from_ms  = luaL_checkinteger(L, 2);
+    lua_Integer to_ms    = luaL_checkinteger(L, 3);
 
     measurement_record_t *out = malloc(LUA_QUERY_MAX_RECORDS * sizeof(measurement_record_t));
     if (out == NULL) {
@@ -601,7 +693,7 @@ static int l_db_query(lua_State *L)
     }
 
     size_t count = 0;
-    cmd_result_t res = cmd_query_measurements(type, (time_t)from, (time_t)to,
+    cmd_result_t res = cmd_query_measurements(quantity, (int64_t)from_ms, (int64_t)to_ms,
                                               out, LUA_QUERY_MAX_RECORDS, &count);
     if (res.status != ESP_OK) {
         free(out);
@@ -678,24 +770,15 @@ static int l_mqtt_status(lua_State *L)
     return 1;
 }
 
-static int l_mqtt_publish_measurement(lua_State *L)
+/* Force the background sync runner's next-batch publish path immediately.
+ * Returns true if a batch was sent, false (with reason) if nothing to send
+ * or another batch is still in flight, nil,err on failure. */
+static int l_mqtt_publish_next_batch(lua_State *L)
 {
-    lua_Integer id = luaL_checkinteger(L, 1);
-    cmd_result_t res = cmd_mqtt_publish_measurement((int64_t)id);
-    if (res.status != ESP_OK) {
-        return lua_push_nil_reason(L, res.message);
-    }
-    lua_pushboolean(L, 1);
-    return 1;
-}
-
-static int l_mqtt_publish_unsynced(lua_State *L)
-{
-    const char *type = luaL_checkstring(L, 1);
-    cmd_result_t res = cmd_mqtt_publish_unsynced(type);
-    if (res.status == ESP_ERR_NOT_FOUND) {
+    cmd_result_t res = cmd_mqtt_publish_next_batch();
+    if (res.status == ESP_ERR_NOT_FOUND || res.status == ESP_ERR_INVALID_STATE) {
         lua_pushboolean(L, 0);
-        lua_pushstring(L, "no pending");
+        lua_pushstring(L, res.message);
         return 2;
     }
     if (res.status != ESP_OK) {
@@ -761,8 +844,7 @@ static void lua_register_mqtt_module(lua_State *L)
 {
     static const luaL_Reg mqtt_api[] = {
         {"status",              l_mqtt_status},
-        {"publish_measurement", l_mqtt_publish_measurement},
-        {"publish_unsynced",    l_mqtt_publish_unsynced},
+        {"publish_next_batch",  l_mqtt_publish_next_batch},
         {NULL, NULL},
     };
 

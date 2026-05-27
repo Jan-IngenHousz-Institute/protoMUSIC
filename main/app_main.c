@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include "freertos/FreeRTOS.h"
@@ -87,7 +88,13 @@ static esp_err_t app_init_i2c_and_sensors(void)
     if (pcf2131tfy_rtc_is_ready()) {
         time_t rtc_now = 0;
         if (pcf2131tfy_rtc_get_time(&rtc_now) == ESP_OK) {
-            ESP_LOGI(APP_TAG, "RTC time: %lld", (long long)rtc_now);
+            /* Push the RTC value into the ESP-IDF system clock so subsequent
+             * gettimeofday / time(NULL) calls return real UTC instead of
+             * seconds-since-boot. Without this, every measurement timestamp
+             * and every MQTT publish "timestamp" field comes out as 1970+uptime. */
+            struct timeval tv = { .tv_sec = rtc_now, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            ESP_LOGI(APP_TAG, "RTC time: %lld (system clock synced)", (long long)rtc_now);
         } else {
             ESP_LOGW(APP_TAG, "RTC time read failed");
         }
@@ -389,16 +396,15 @@ void app_main(void)
         .read_env               = bme280_get_sensor_read_fn(),
         .read_clock             = pcf2131tfy_rtc_get_clock_read_fn(),
         .set_status             = ambyte_status_get_set_fn(),
-        .store                  = persistence_available ? sqlite_persistence_get_store_fn()              : NULL,
-        .query                  = persistence_available ? sqlite_persistence_get_query_fn()              : NULL,
-        .count                  = persistence_available ? sqlite_persistence_get_count_fn()              : NULL,
-        .next_id                = persistence_available ? sqlite_persistence_get_next_id_fn()            : NULL,
-        .query_unsynced         = persistence_available ? sqlite_persistence_get_query_unsynced_fn()     : NULL,
-        .mark_synced            = persistence_available ? sqlite_persistence_get_mark_synced_fn()        : NULL,
-        .mark_inflight          = persistence_available ? sqlite_persistence_get_mark_inflight_fn()      : NULL,
-        .mark_pending           = persistence_available ? sqlite_persistence_get_mark_pending_fn()       : NULL,
-        .query_by_id            = persistence_available ? sqlite_persistence_get_query_by_id_fn()        : NULL,
-        .claim_next_pending     = persistence_available ? sqlite_persistence_get_claim_next_pending_fn() : NULL,
+        .store                    = persistence_available ? sqlite_persistence_get_store_fn()                    : NULL,
+        .query                    = persistence_available ? sqlite_persistence_get_query_fn()                    : NULL,
+        .count                    = persistence_available ? sqlite_persistence_get_count_fn()                    : NULL,
+        .next_id                  = persistence_available ? sqlite_persistence_get_next_id_fn()                  : NULL,
+        .query_unsynced           = persistence_available ? sqlite_persistence_get_query_unsynced_fn()           : NULL,
+        .query_by_id              = persistence_available ? sqlite_persistence_get_query_by_id_fn()              : NULL,
+        .claim_next_pending_batch = persistence_available ? sqlite_persistence_get_claim_next_pending_batch_fn() : NULL,
+        .mark_batch_synced        = persistence_available ? sqlite_persistence_get_mark_batch_synced_fn()        : NULL,
+        .mark_batch_pending       = persistence_available ? sqlite_persistence_get_mark_batch_pending_fn()       : NULL,
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),

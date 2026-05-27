@@ -11,7 +11,11 @@
 extern "C" {
 #endif
 
-#define PENDING_ENTRY_MAGIC 0xABCD1234U
+/* Magic byte tagging each on-disk entry. Bump this whenever the on-disk
+ * layout of measurement_record_t changes — pending_store_init detects the
+ * mismatch, renames the legacy ring file to *.legacy_<unix_ts>, and starts
+ * fresh. Old entries are preserved on disk for forensic recovery. */
+#define PENDING_ENTRY_MAGIC 0xA5B72001U
 
 typedef struct {
     uint32_t magic;

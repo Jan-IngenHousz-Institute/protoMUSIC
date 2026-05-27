@@ -190,33 +190,36 @@ static int cli_cmd_test_t52(int argc, char **argv)
               cmd_mqtt_publish("test/topic", "test"));
     T52_CHECK("cmd_mqtt_publish_raw",
               cmd_mqtt_publish_raw("test"));
-    T52_CHECK("cmd_mqtt_publish_measurement(999999)",
-              cmd_mqtt_publish_measurement(999999LL));
-    T52_CHECK("cmd_mqtt_publish_unsynced(env)",
-              cmd_mqtt_publish_unsynced("env"));
+    T52_CHECK("cmd_mqtt_publish_next_batch",
+              cmd_mqtt_publish_next_batch());
     T52_CHECK("cmd_cert_status",
               cmd_cert_status());
 
     /* ── Persistence port guards ───────────────────────────────────── */
     measurement_record_t rec;
     memset(&rec, 0, sizeof(rec));
-    strncpy(rec.measure_type, "env",         sizeof(rec.measure_type) - 1);
-    strncpy(rec.data_type,    "temperature", sizeof(rec.data_type)    - 1);
-    rec.value      = 1.0f;
-    rec.timestamp  = 1;
-    rec.sensor_id  = 1;
-    rec.measure_id = 999999LL;
+    rec.measure_id      = 999999LL;
+    strncpy(rec.quantity, "temperature", sizeof(rec.quantity) - 1);
+    rec.start_ticks_ms  = 1;
+    rec.end_ticks_ms    = 1;
+    rec.device[0]       = '\0';
+    strncpy(rec.sensor, "test", sizeof(rec.sensor) - 1);
+    rec.sensor_id       = MEASUREMENT_SENSOR_ID_NONE;
+    rec.metadata[0]     = '\0';
+    rec.value_is_string = false;
+    rec.value_real      = 1.0f;
+    rec.sync_state      = MEASUREMENT_SYNC_PENDING;
 
     T52_CHECK("cmd_store_measurement",
               cmd_store_measurement(&rec, 1));
 
     size_t cnt = 0;
-    T52_CHECK("cmd_measurement_count(env)",
-              cmd_measurement_count("env", &cnt));
+    T52_CHECK("cmd_measurement_count(temperature)",
+              cmd_measurement_count("temperature", &cnt));
 
     measurement_record_t out[1];
-    T52_CHECK("cmd_query_unsynced(env)",
-              cmd_query_unsynced("env", out, 1, &cnt));
+    T52_CHECK("cmd_query_unsynced(temperature)",
+              cmd_query_unsynced("temperature", out, 1, &cnt));
 
     int64_t nid = 0;
     T52_CHECK("cmd_next_measure_id",

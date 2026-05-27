@@ -2,6 +2,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "esp_crc.h"
@@ -13,6 +15,7 @@
 #define PENDING_DATA_PATH  "/littlefs/pending.bin"
 #define PENDING_META_PATH  "/littlefs/pending_meta.bin"
 #define PENDING_CAPACITY_WARN_PCT 80
+#define PENDING_PARTITION_BYTES   (512U * 1024U)
 
 typedef struct {
     uint32_t head;
@@ -68,6 +71,64 @@ static esp_err_t meta_save(void)
     return (n == 1) ? ESP_OK : ESP_FAIL;
 }
 
+/* Inspect the first entry of an existing ring file. If its magic doesn't
+ * match the current build's expected value, rename the file out of the way
+ * (preserving bytes for manual recovery) and reset the metadata. Called once
+ * during init, before any reader/writer touches the data. */
+static void archive_legacy_if_magic_mismatch(void)
+{
+    if (s_meta.tail == s_meta.head) {
+        return; /* empty ring — nothing to inspect */
+    }
+
+    FILE *f = fopen(PENDING_DATA_PATH, "rb");
+    if (f == NULL) {
+        /* meta says there are entries but the file is gone — reset meta. */
+        ESP_LOGW(TAG, "Ring file missing but meta non-empty — resetting");
+        s_meta.head = 0;
+        s_meta.tail = 0;
+        meta_save();
+        return;
+    }
+
+    long offset = (long)(s_meta.head * sizeof(pending_entry_t));
+    if (fseek(f, offset, SEEK_SET) != 0) {
+        fclose(f);
+        /* Treat seek failure as layout mismatch — fall through to archive. */
+        goto archive;
+    }
+
+    pending_entry_t entry;
+    size_t read = fread(&entry, sizeof(entry), 1, f);
+    fclose(f);
+
+    if (read == 1 && entry.magic == PENDING_ENTRY_MAGIC) {
+        return; /* fresh layout, keep going */
+    }
+    /* Short read (file smaller than one current-layout entry) OR wrong magic
+     * — old firmware wrote entries with a different sizeof(record) or magic.
+     * Archive the file and reset meta. */
+
+archive:
+    /* Legacy entries — archive the file. */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    char archive_path[96];
+    snprintf(archive_path, sizeof(archive_path),
+             PENDING_DATA_PATH ".legacy_%lld", (long long)tv.tv_sec);
+
+    if (rename(PENDING_DATA_PATH, archive_path) == 0) {
+        ESP_LOGW(TAG, "Legacy ring entries archived to %s", archive_path);
+    } else {
+        ESP_LOGW(TAG, "Could not rename legacy ring file — removing");
+        remove(PENDING_DATA_PATH);
+    }
+
+    s_meta.head = 0;
+    s_meta.tail = 0;
+    meta_save();
+}
+
 esp_err_t pending_store_init(void)
 {
     if (s_initialized) {
@@ -80,6 +141,7 @@ esp_err_t pending_store_init(void)
     }
 
     meta_load();
+    archive_legacy_if_magic_mismatch();
     s_next_measure_id = s_meta.max_measure_id + 1;
     s_initialized = true;
 
@@ -130,7 +192,7 @@ esp_err_t pending_store_append(const measurement_record_t *records, size_t count
 
     size_t pending_count = s_meta.tail - s_meta.head;
     size_t entry_size = sizeof(pending_entry_t);
-    size_t max_entries = (512U * 1024U) / entry_size;
+    size_t max_entries = PENDING_PARTITION_BYTES / entry_size;
 
     if (pending_count + count > max_entries) {
         ESP_LOGE(TAG, "Pending store full (%u + %u > %u)",

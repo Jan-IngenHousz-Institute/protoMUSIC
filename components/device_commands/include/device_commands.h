@@ -30,16 +30,16 @@ typedef struct {
     clock_read_fn               read_clock;
 
     /* Persistence ports */
-    measurement_store_fn              store;
-    measurement_query_fn              query;
-    measurement_count_fn              count;
-    measurement_next_id_fn            next_id;
-    measurement_query_unsynced_fn     query_unsynced;
-    measurement_mark_synced_fn        mark_synced;
-    measurement_mark_inflight_fn      mark_inflight;
-    measurement_mark_pending_fn       mark_pending;
-    measurement_query_by_id_fn        query_by_id;
-    measurement_claim_next_pending_fn claim_next_pending;
+    measurement_store_fn                    store;
+    measurement_query_fn                    query;
+    measurement_count_fn                    count;
+    measurement_next_id_fn                  next_id;
+    measurement_query_unsynced_fn           query_unsynced;
+    measurement_query_by_id_fn              query_by_id;
+    /* Batch ops (used by sync_runner) */
+    measurement_claim_next_pending_batch_fn claim_next_pending_batch;
+    measurement_mark_batch_synced_fn        mark_batch_synced;
+    measurement_mark_batch_pending_fn       mark_batch_pending;
 
     /* Status port */
     status_set_fn               set_status;
@@ -79,27 +79,26 @@ cmd_result_t cmd_read_rtc(time_t *out_time);
 cmd_result_t cmd_device_status(bool *bme_ready, bool *rtc_ready, time_t *rtc_time);
 cmd_result_t cmd_read_env(float *temp, float *hum, float *pres);
 
-/* Read BME280 and persist temperature/humidity/pressure as three separate
- * measurement groups (one measure_id each, all sharing the same RTC timestamp).
- * Each group is left in PENDING state, ready for the background sync task to
- * publish. Out-params receive the allocated measure_ids; pass NULL to ignore. */
-cmd_result_t cmd_record_env(int64_t *out_temp_id, int64_t *out_hum_id,
-                            int64_t *out_pres_id);
+/* Read BME280 and persist temperature/humidity/pressure as three rows sharing
+ * one measure_id with identical start/end ticks. The background sync task
+ * (sync_runner) publishes them together as one batch entry. Pass NULL to
+ * ignore the allocated measure_id. */
+cmd_result_t cmd_record_env(int64_t *out_measure_id);
 cmd_result_t cmd_log(const char *msg);
 cmd_result_t cmd_sleep_ms(uint32_t ms);
 cmd_result_t cmd_store_measurement(const measurement_record_t *records, size_t count);
-cmd_result_t cmd_query_measurements(const char *measure_type, time_t from, time_t to,
+cmd_result_t cmd_query_measurements(const char *quantity, int64_t from_ms, int64_t to_ms,
                                     measurement_record_t *out, size_t max, size_t *count);
-cmd_result_t cmd_measurement_count(const char *measure_type, size_t *count);
+cmd_result_t cmd_measurement_count(const char *quantity, size_t *count);
 cmd_result_t cmd_next_measure_id(int64_t *out_id);
-cmd_result_t cmd_query_unsynced(const char *measure_type, measurement_record_t *out,
+cmd_result_t cmd_query_unsynced(const char *quantity, measurement_record_t *out,
                                 size_t max, size_t *count);
 
 /* MQTT commands (Phase 6A) */
 cmd_result_t cmd_mqtt_publish(const char *topic, const char *payload);
 cmd_result_t cmd_mqtt_publish_raw(const char *payload);
-cmd_result_t cmd_mqtt_publish_measurement(int64_t measure_id);
-cmd_result_t cmd_mqtt_publish_unsynced(const char *measure_type);
+/* Publish the next pending batch of measurements (used by the sync_runner). */
+cmd_result_t cmd_mqtt_publish_next_batch(void);
 cmd_result_t cmd_mqtt_status(void);
 
 /* Cert status (Phase 6C) */
