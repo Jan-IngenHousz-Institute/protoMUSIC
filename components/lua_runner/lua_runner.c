@@ -135,6 +135,32 @@ static int l_device_log(lua_State *L)
     return 0;
 }
 
+/* device.PWM(duty, freq, enable)
+ *   duty   0..100  float, default 0
+ *   freq   Hz,     default 10000
+ *   enable boolean default true; pass false to stop output (pin held low)
+ * Returns the status message string; raises on invalid args / HW error. */
+static int l_device_pwm(lua_State *L)
+{
+    lua_Number  duty   = luaL_optnumber(L, 1, 0.0);
+    lua_Integer freq   = luaL_optinteger(L, 2, 10000);
+    bool        enable = lua_isnoneornil(L, 3) ? true : (bool)lua_toboolean(L, 3);
+
+    if (duty < 0.0 || duty > 100.0) {
+        return luaL_error(L, "duty must be in [0, 100]");
+    }
+    if (enable && freq <= 0) {
+        return luaL_error(L, "freq must be > 0");
+    }
+
+    cmd_result_t res = cmd_pwm((float)duty, (uint32_t)freq, enable);
+    if (res.status != ESP_OK) {
+        return luaL_error(L, "%s", res.message);
+    }
+    lua_pushstring(L, res.message);
+    return 1;
+}
+
 /* ── device.uart_* bindings ──────────────────────────────────────────── */
 
 /* device.uart_ping(channel) → boolean */
@@ -856,6 +882,7 @@ static void lua_register_device_module(lua_State *L)
         {"record_env",             l_device_record_env},
         {"sleep_ms",               l_device_sleep_ms},
         {"log",                    l_device_log},
+        {"PWM",                    l_device_pwm},
         /* UART raw */
         {"uart_ping",              l_device_uart_ping},
         {"uart_query",             l_device_uart_query},
@@ -908,14 +935,135 @@ static void lua_register_mqtt_module(lua_State *L)
     lua_setglobal(L, "mqtt");
 }
 
+/* ambit.run(channel, segments, opts) — build and execute an array
+ * fluorescence run over the binary protocol (the firmware equivalent of the
+ * notebook's gen_cmd_arr_line + arrun1; type-2 / no-IR lines).
+ *
+ *   segments : array of { pulses=, freq=, actinic= }  (positional [1],[2],[3]
+ *              also accepted). Each line becomes 8 bytes:
+ *              [2, 0, pulses>>8, pulses&0xFF, freq>>8, freq&0xFF, actinic, 1]
+ *   opts     : { persist=false, allow_interrupt=false, timeout_ms=60000 }
+ *              persist=true keeps the actinic LED on after the run.
+ *
+ * Returns { array_count=N, arrays={ {index, name, data={...}, length}, ... } }
+ * with index->name 0=env 1=fluor 2=fluoRef 3=sun 4=leaf 5=ir730 6=ir730Ref.
+ * Returns the raw arrays; it does NOT persist them (the caller decides). */
+static int l_ambit_run(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    int nseg = (int)luaL_len(L, 2);
+    if (nseg <= 0 || nseg > 16) {
+        return luaL_error(L, "segments: 1-16 lines required (got %d)", nseg);
+    }
+
+    uint8_t  persist         = 0;
+    bool     allow_interrupt = false;
+    uint32_t timeout_ms      = 60000;
+    if (lua_istable(L, 3)) {
+        lua_getfield(L, 3, "persist");
+        persist = lua_toboolean(L, -1) ? 1 : 0;
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "allow_interrupt");
+        allow_interrupt = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "timeout_ms");
+        if (lua_isnumber(L, -1)) timeout_ms = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+    }
+
+    uint8_t *run_arr = malloc((size_t)nseg * 8);
+    if (!run_arr) return luaL_error(L, "out of memory");
+
+    for (int i = 1; i <= nseg; i++) {
+        lua_rawgeti(L, 2, i);
+        if (!lua_istable(L, -1)) {
+            free(run_arr);
+            return luaL_error(L, "segment %d must be a table", i);
+        }
+
+        lua_getfield(L, -1, "pulses");
+        if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_rawgeti(L, -1, 1); }
+        lua_Integer pulses = luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "freq");
+        if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_rawgeti(L, -1, 2); }
+        lua_Integer freq = luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "actinic");
+        if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_rawgeti(L, -1, 3); }
+        lua_Integer actinic = luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_pop(L, 1); /* segment table */
+
+        if (pulses < 1 || pulses > 65535) { free(run_arr); return luaL_error(L, "segment %d: pulses must be 1-65535", i); }
+        if (freq   < 1 || freq   > 65535) { free(run_arr); return luaL_error(L, "segment %d: freq must be 1-65535", i); }
+        if (actinic < 0 || actinic > 255) { free(run_arr); return luaL_error(L, "segment %d: actinic must be 0-255", i); }
+
+        uint8_t *line = run_arr + (i - 1) * 8;
+        line[0] = 2;                              /* type 2: no IR (notebook default) */
+        line[1] = 0;                              /* far-red off */
+        line[2] = (uint8_t)((pulses >> 8) & 0xFF);
+        line[3] = (uint8_t)(pulses & 0xFF);
+        line[4] = (uint8_t)((freq >> 8) & 0xFF);
+        line[5] = (uint8_t)(freq & 0xFF);
+        line[6] = (uint8_t)actinic;
+        line[7] = 1;                              /* subsampling: every point (returns sun+leaf) */
+    }
+
+    uart_sensor_response_t response;
+    cmd_result_t res = cmd_ambit_run(ch, run_arr, (uint8_t)nseg, persist,
+                                     allow_interrupt, &response, timeout_ms);
+    free(run_arr);
+    if (res.status != ESP_OK) {
+        uart_sensor_response_free(&response);
+        return lua_push_nil_reason(L, res.message);
+    }
+
+    static const char *const kArrName[] = {
+        "env", "fluor", "fluoRef", "sun", "leaf", "ir730", "ir730Ref"
+    };
+
+    lua_newtable(L);
+    lua_newtable(L); /* arrays */
+    for (uint8_t i = 0; i < response.array_count; i++) {
+        lua_newtable(L);
+        lua_pushinteger(L, response.arrays[i].index);
+        lua_setfield(L, -2, "index");
+        if (response.arrays[i].index < (sizeof(kArrName) / sizeof(kArrName[0]))) {
+            lua_pushstring(L, kArrName[response.arrays[i].index]);
+            lua_setfield(L, -2, "name");
+        }
+        lua_newtable(L);
+        for (uint16_t j = 0; j < response.arrays[i].length; j++) {
+            lua_pushinteger(L, (lua_Integer)response.arrays[i].data[j]);
+            lua_rawseti(L, -2, (int)(j + 1));
+        }
+        lua_setfield(L, -2, "data");
+        lua_pushinteger(L, response.arrays[i].length);
+        lua_setfield(L, -2, "length");
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "arrays");
+    lua_pushinteger(L, response.array_count);
+    lua_setfield(L, -2, "array_count");
+    uart_sensor_response_free(&response);
+    return 1;
+}
+
 /* ── ambit.* bindings ────────────────────────────────────────────────
- * For now this module exposes only the AMBIT binary uart_query (moved from
- * device.uart_query). The other ambit_* functions still live under device.
- * Consolidating them all here is a separate cleanup. */
+ * Exposes the AMBIT binary uart_query (moved from device.uart_query) and the
+ * high-level array run. The typed ambit_* helpers still live under device;
+ * consolidating them all here is a separate cleanup. */
 static void lua_register_ambit_module(lua_State *L)
 {
     static const luaL_Reg ambit_api[] = {
         {"uart_query", l_ambit_uart_query},
+        {"run",        l_ambit_run},
         {NULL, NULL},
     };
 

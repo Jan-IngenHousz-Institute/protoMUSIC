@@ -1,38 +1,47 @@
--- Records BME280 temperature to the local DB every 5 seconds.
+-- Reads the BME280 environment 10 times, stores every reading to the local
+-- DB, then switches on a 100% / 10 kHz PWM on GPIO4.
 --
--- The sync_runner background task (period 10 s) picks up PENDING rows from
--- the DB on its own cadence and publishes them via MQTT, so this script only
--- has to do the read + store half. Humidity and pressure are read at the
--- same time as a side-effect of the BME280 I2C transaction — they're just
--- discarded here because the requirement is "temperature only".
+-- Each reading stores temperature, humidity and pressure as three rows sharing
+-- one measure_id (so they publish together). One id is allocated per reading
+-- with db.next_id() and passed to all three rows — if measure_id is omitted,
+-- db.store allocates a *separate* id per row and the grouping is lost.
 --
--- Copy this file to the SD card root as `main.lua`. The firmware reads
--- /sdcard/main.lua at boot via luaL_loadfile (see components/lua_runner).
+-- The background sync_runner task (period 10 s) drains PENDING rows to MQTT on
+-- its own cadence, so this script only does the read + store half. When the
+-- loop finishes the script returns; the PWM output stays on.
+--
+-- Copy this file to the SD card root as `main.lua`. The firmware loads
+-- /sdcard/main.lua at boot (see components/lua_runner).
 
-device.log("env loop: temperature every 5s")
+local READS       = 10
+local INTERVAL_MS = 1000   -- delay between readings
 
-while true do
+device.log(string.format("env loop: %d readings, then PWM 100%% @ 10kHz", READS))
+
+for i = 1, READS do
     local env, err = device.read_env()
     if env then
-        local ts = device.read_rtc() or 0
         local id = db.next_id()
         local ok, store_err = db.store({
-            {
-                sensor_id    = 1,
-                measure_id   = id,
-                measure_type = "temperature",
-                timestamp    = ts,
-                data_type    = "float",
-                value        = env.temperature_c,
-            },
+            { measure_id = id, sensor = "BME280", quantity = "temperature", value = env.temperature_c },
+            { measure_id = id, sensor = "BME280", quantity = "humidity",    value = env.humidity_pct  },
+            { measure_id = id, sensor = "BME280", quantity = "pressure",    value = env.pressure_pa   },
         })
         if ok then
-            device.log(string.format("stored T=%.2fC id=%d", env.temperature_c, id))
+            device.log(string.format("[%d/%d] id=%d  T=%.2fC  H=%.2f%%  P=%.0fPa",
+                       i, READS, id, env.temperature_c, env.humidity_pct, env.pressure_pa))
         else
-            device.log("store failed: " .. (store_err or "unknown"))
+            device.log(string.format("[%d/%d] store failed: %s", i, READS, store_err or "unknown"))
         end
     else
-        device.log("read_env failed: " .. (err or "unknown"))
+        device.log(string.format("[%d/%d] read_env failed: %s", i, READS, err or "unknown"))
     end
-    device.sleep_ms(5000)
+
+    if i < READS then
+        device.sleep_ms(INTERVAL_MS)
+    end
 end
+
+-- Switch the PWM on: 100% duty, 10 kHz, GPIO4.
+local pwm_msg = device.PWM(100, 10000, true)
+device.log("PWM on -> " .. pwm_msg)

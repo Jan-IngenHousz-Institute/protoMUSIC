@@ -80,6 +80,12 @@ cmd_result_t cmd_read_rtc(time_t *out_time);
 cmd_result_t cmd_device_status(bool *bme_ready, bool *rtc_ready, time_t *rtc_time);
 cmd_result_t cmd_read_env(float *temp, float *hum, float *pres);
 
+/* Drive a PWM signal on GPIO4 via LEDC. duty_pct is 0..100 (float precision);
+ * freq_hz is the PWM frequency in Hz (e.g. 10000). When enable is false the
+ * output is stopped and the pin held low (duty/freq ignored). The duty
+ * resolution is chosen automatically from freq_hz (up to 14-bit). */
+cmd_result_t cmd_pwm(float duty_pct, uint32_t freq_hz, bool enable);
+
 /* Read BME280 and persist temperature/humidity/pressure as three rows sharing
  * one measure_id with identical start/end ticks. The background sync task
  * (sync_runner) publishes them together as one batch entry. Pass NULL to

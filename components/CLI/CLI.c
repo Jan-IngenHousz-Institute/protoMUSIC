@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -551,6 +552,39 @@ static int cli_cmd_wifi_reset(int argc, char **argv)
     return 0;
 }
 
+/* PWM <duty 0-100> [freq_hz=10000] [enable 0|1=1]
+ *   Drives a PWM on GPIO4 via LEDC. duty accepts floats (e.g. 37.5). freq
+ *   defaults to 10000 Hz. enable defaults to 1; pass 0 to stop output. */
+static int cli_cmd_pwm(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: PWM <duty 0-100> [freq_hz=10000] [enable 0|1=1]\r\n");
+        return 1;
+    }
+
+    float duty = strtof(argv[1], NULL);
+    if (duty < 0.0f || duty > 100.0f) {
+        printf("duty must be 0..100\r\n");
+        return 1;
+    }
+
+    uint32_t freq = 10000;
+    if (argc >= 3) {
+        long f = strtol(argv[2], NULL, 10);
+        if (f <= 0) {
+            printf("freq must be > 0\r\n");
+            return 1;
+        }
+        freq = (uint32_t)f;
+    }
+
+    bool enable = (argc >= 4) ? (atoi(argv[3]) != 0) : true;
+
+    cmd_result_t res = cmd_pwm(duty, freq, enable);
+    printf("%s\r\n", res.message);
+    return (res.status == ESP_OK) ? 0 : 1;
+}
+
 static esp_err_t cli_register_commands(void)
 {
     if (s_cli_commands_registered) {
@@ -637,6 +671,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "clear Wi-Fi credentials + provisioning flag and reboot",
         .func    = cli_cmd_wifi_reset,
     };
+    static const esp_console_cmd_t pwm_cmd = {
+        .command = "PWM",
+        .help    = "PWM <duty 0-100> [freq_hz=10000] [enable 0|1=1]  drive PWM on GPIO4",
+        .func    = cli_cmd_pwm,
+    };
 
     esp_err_t err = esp_console_cmd_register(&status_cmd);
     if (err != ESP_OK) {
@@ -714,6 +753,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&wifi_reset_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&pwm_cmd);
     if (err != ESP_OK) {
         return err;
     }

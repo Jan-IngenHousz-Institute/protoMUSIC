@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
@@ -15,6 +16,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -130,6 +132,96 @@ cmd_result_t cmd_set_rgb(uint8_t r, uint8_t g, uint8_t b)
         return make_result(err, "set_rgb failed: %s", esp_err_to_name(err));
     }
     return make_result(ESP_OK, "RGB set to (%u, %u, %u)", r, g, b);
+}
+
+/* ── PWM output (LEDC on GPIO4) ─────────────────────────────────────────
+ *
+ * A single LEDC timer/channel drives GPIO4. The duty resolution is chosen per
+ * call as the largest that supports the requested frequency on the 80 MHz APB
+ * clock (ESP32-S3 LEDC tops out at 14-bit). */
+#define PWM_GPIO          4
+#define PWM_TIMER         LEDC_TIMER_0
+#define PWM_CHANNEL       LEDC_CHANNEL_0
+#define PWM_SPEED_MODE    LEDC_LOW_SPEED_MODE   /* S3 has no high-speed mode */
+#define PWM_SRC_CLK_HZ    80000000u             /* APB clock */
+#define PWM_MAX_RES_BITS  14                    /* SOC_LEDC_TIMER_BIT_WIDTH (S3) */
+
+static bool s_pwm_configured = false;
+
+/* Largest duty resolution (bits) whose full-scale period fits freq_hz on the
+ * APB clock. Returns 0 if the frequency is too high to represent. */
+static int pwm_pick_resolution(uint32_t freq_hz)
+{
+    int bits = 0;
+    while (bits < PWM_MAX_RES_BITS &&
+           (1u << (bits + 1)) <= (PWM_SRC_CLK_HZ / freq_hz)) {
+        bits++;
+    }
+    return bits;
+}
+
+cmd_result_t cmd_pwm(float duty_pct, uint32_t freq_hz, bool enable)
+{
+    if (duty_pct < 0.0f || duty_pct > 100.0f) {
+        return make_result(ESP_ERR_INVALID_ARG,
+                           "duty must be 0..100 (got %.2f)", (double)duty_pct);
+    }
+
+    if (!enable) {
+        if (s_pwm_configured) {
+            ledc_stop(PWM_SPEED_MODE, PWM_CHANNEL, 0);  /* hold pin low */
+        }
+        return make_result(ESP_OK, "PWM disabled on GPIO%d", PWM_GPIO);
+    }
+
+    if (freq_hz == 0) {
+        return make_result(ESP_ERR_INVALID_ARG, "freq must be > 0");
+    }
+    int bits = pwm_pick_resolution(freq_hz);
+    if (bits == 0) {
+        return make_result(ESP_ERR_INVALID_ARG, "freq %u Hz too high (max %u Hz)",
+                           (unsigned)freq_hz, (unsigned)(PWM_SRC_CLK_HZ / 2));
+    }
+
+    ledc_timer_config_t tcfg = {
+        .speed_mode      = PWM_SPEED_MODE,
+        .timer_num       = PWM_TIMER,
+        .duty_resolution = (ledc_timer_bit_t)bits,
+        .freq_hz         = freq_hz,
+        .clk_cfg         = LEDC_USE_APB_CLK,
+    };
+    esp_err_t err = ledc_timer_config(&tcfg);
+    if (err != ESP_OK) {
+        return make_result(err, "ledc_timer_config(%u Hz, %d-bit) failed: %s",
+                           (unsigned)freq_hz, bits, esp_err_to_name(err));
+    }
+
+    uint32_t full = 1u << bits;
+    uint32_t raw  = (uint32_t)lroundf(duty_pct / 100.0f * (float)full);
+    if (raw > full) {
+        raw = full;
+    }
+
+    /* Re-running channel_config each enable is idempotent and re-asserts the
+     * output after a prior disable (ledc_stop). */
+    ledc_channel_config_t ccfg = {
+        .gpio_num   = PWM_GPIO,
+        .speed_mode = PWM_SPEED_MODE,
+        .channel    = PWM_CHANNEL,
+        .timer_sel  = PWM_TIMER,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .duty       = raw,
+        .hpoint     = 0,
+    };
+    err = ledc_channel_config(&ccfg);
+    if (err != ESP_OK) {
+        return make_result(err, "ledc_channel_config failed: %s",
+                           esp_err_to_name(err));
+    }
+    s_pwm_configured = true;
+
+    return make_result(ESP_OK, "PWM GPIO%d: %.2f%% @ %u Hz (%d-bit)",
+                       PWM_GPIO, (double)duty_pct, (unsigned)freq_hz, bits);
 }
 
 cmd_result_t cmd_read_rtc(time_t *out_time)
