@@ -23,6 +23,7 @@ struct ambit_calibration_info_t
     uint16_t act_250 = 1;
     float_t mlx_emissivity = 1.0;
     float_t sun_coef = 1.0;
+    float_t tick_factor = 0.854;  // PAM point-period scale (ms tick -> s); surfaced to the ambyte
 };
 
 extern struct ambit_calibration_info_t ambit_calibration_local, ambit_calibration_income;

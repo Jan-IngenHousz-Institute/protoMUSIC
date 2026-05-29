@@ -213,7 +213,7 @@ int run_arr_type1(uint8_t length, uint8_t* arr, bool led_persist, bool allow_int
 
   _tmparr = PAM_get_env(4, start_t0);
   d_env->put(_tmparr);
-  leaf_temp = ((int16_t) (_tmparr & 0xFFF)) / 20.0 - 20;
+  leaf_temp = (int16_t) (_tmparr & 0xFFFF) / 100.0;
 
 
   adpd.STOP();
@@ -258,7 +258,6 @@ int run_arr_type1(uint8_t length, uint8_t* arr, bool led_persist, bool allow_int
 
       counter = 0;
       for (uint8_t i = 0; i < 4; i++) buf_opt[i] = 0;
-      d_env->put(PAM_get_env(0, start_t0));
       adpd.RUN();
       delay(2);
       while (counter < num_ptx){
@@ -277,13 +276,13 @@ int run_arr_type1(uint8_t length, uint8_t* arr, bool led_persist, bool allow_int
           // save option data
           if (subsampling > 0){
             if (subsampling == 1){ // every point
-              d_sun->put(ret[0]);
-              d_leaf->put(ret[1]);
+              d_sun->put(ret[0] > 65000 ? ret[0] - 65000 : 0);
+              d_leaf->put(ret[1] > 65000 ? ret[1] - 65000 : 0);
               if (_type == 1){d_730->put(ret[6]);d_730Ref->put(ret[7]);} // ir enabled
 
             }else if (subsampling == 2){
-              buf_opt[0] += ret[0];
-              buf_opt[1] += ret[1];
+              buf_opt[0] += (ret[0] > 65000 ? ret[0] - 65000 : 0);
+              buf_opt[1] += (ret[1] > 65000 ? ret[1] - 65000 : 0);
               if (_type == 1){
                 buf_opt[2] += ret[6];
                 buf_opt[3] += ret[7];
@@ -322,7 +321,7 @@ int run_arr_type1(uint8_t length, uint8_t* arr, bool led_persist, bool allow_int
           if (measure_temperature && (millis() - env_timer1 > 2000)){
             _tmparr = PAM_get_env(4, start_t0);
             d_env->put(_tmparr);
-            leaf_temp = ((int16_t) (_tmparr & 0xFFF)) / 20.0 - 20;
+            leaf_temp = (int16_t) (_tmparr & 0xFFFF) / 100.0;
             env_timer1 = millis();
             esp_sleep_enable_timer_wakeup(1000);
           }
@@ -340,7 +339,6 @@ int run_arr_type1(uint8_t length, uint8_t* arr, bool led_persist, bool allow_int
       }
       
       adpd.STOP();
-      d_env->put(PAM_get_env(1, start_t0));      
       if (!led_persist) AS_LED_OFF();
       digitalWrite(1, LOW);
     }
@@ -462,7 +460,7 @@ int run_trigger_spacer(uint16_t length, uint8_t interval, bool change_act, uint8
 
   _tmparr = PAM_get_env(4, start_t0);
   d_env->put(_tmparr);
-  leaf_temp = ((int16_t) (_tmparr & 0xFFF)) / 20.0 - 20;
+  leaf_temp = (int16_t) (_tmparr & 0xFFFF) / 100.0;
   env_timer1 = millis();
 
 
@@ -503,8 +501,8 @@ int run_trigger_spacer(uint16_t length, uint8_t interval, bool change_act, uint8
 
     read_fluor = calc_signal(ret[2], ret[3], num_integration); d_fluor->put(read_fluor);
     read_fluoRef = calc_signal(ret[4], ret[5], num_integration); d_fluoRef->put(read_fluoRef);
-    read_sun = ret[0]; d_sun->put(read_sun);
-    read_leaf = ret[1]; d_leaf->put(read_leaf);
+    read_sun = ret[0]; d_sun->put(read_sun > 65000 ? read_sun - 65000 : 0);
+    read_leaf = ret[1]; d_leaf->put(read_leaf > 65000 ? read_leaf - 65000 : 0);
     read_7 = ret[6]; d_730->put(read_7);
     read_7Ref = ret[7]; d_730Ref->put(read_7Ref);
 
@@ -524,7 +522,7 @@ int run_trigger_spacer(uint16_t length, uint8_t interval, bool change_act, uint8
       if (millis() - env_timer1 > 2000){
         _tmparr = PAM_get_env(4, start_t0);
         d_env->put(_tmparr);
-        leaf_temp = ((int16_t) (_tmparr & 0xFFF)) / 20.0 - 20;
+        leaf_temp = (int16_t) (_tmparr & 0xFFFF) / 100.0;
         env_timer1 = millis();
       }      
     }    
@@ -1163,29 +1161,18 @@ int MPF(uint16_t mode, uint16_t current, uint16_t dc_current, uint8_t sign_gain,
 }
 
 
+/* Leaf temperature as centi-degC (signed int16 in the low 16 bits). The old
+ * time/type bit-packing is gone: env arrays sent to the ambyte are now a plain
+ * centi-degC series. Absolute time comes from the ambyte RTC; within-run point
+ * timing from the run freq. Only mode 4 (leaf temp) is emitted now; mode/t0 are
+ * kept so call sites are unchanged. */
 uint32_t PAM_get_env(uint8_t mode, unsigned int t0){
-  uint32_t ret = 0;
-  unsigned int time = millis() - t0;
-  uint16_t time_16 = 0;
-  time_16 = (uint16_t) (time >> 6);
-  uint8_t d_type = 0;
-  int16_t data = 0;
-
-  if (mode < 4){ // timestamp only 0 - 3
-    data = (time & 0x3F);
-    d_type = mode;
-    ret = time_16 << 16 | d_type << 12 | data;
-    return ret;
-
+  (void) t0;
+  if (mode == 4){
+    int16_t centi = (int16_t) (mlx_measure() * 100.0);
+    return (uint32_t) (uint16_t) centi;
   }
-
-  if (mode == 4){  // get leaf temp
-    data = (int16_t) ((mlx_measure() + 20) * 20);
-    d_type = mode;
-    ret = time_16 << 16 | d_type << 12 | data;
-    return ret;
-  }
-  return ret;
+  return 0;
 }
 
 uint32_t PAM_retrieve_env(uint32_t r, uint8_t* mode, float_t* data_f, int16_t* data_i){
