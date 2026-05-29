@@ -7,6 +7,7 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include "cJSON.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -599,208 +600,141 @@ static void lua_get_optional_string(lua_State *L, const char *key,
     lua_pop(L, 1);
 }
 
-/* Read a record from the table currently at the top of the stack. */
-static int read_lua_record(lua_State *L, measurement_record_t *r, int64_t now_ms_val)
+/* Recursively convert the Lua value at `idx` to a cJSON node. Tables with a
+ * non-zero sequence length become JSON arrays; all other tables become JSON
+ * objects (string keys only). Returns NULL on allocation failure. */
+static cJSON *lua_to_cjson(lua_State *L, int idx)
 {
-    memset(r, 0, sizeof(*r));
-    r->sensor_id  = MEASUREMENT_SENSOR_ID_NONE;
-    r->sync_state = MEASUREMENT_SYNC_PENDING;
-
-    /* measure_id — optional; auto-allocate when missing */
-    lua_getfield(L, -1, "measure_id");
-    if (lua_isinteger(L, -1) || lua_isnumber(L, -1)) {
-        r->measure_id = (int64_t)lua_tointeger(L, -1);
-    } else {
+    idx = lua_absindex(L, idx);
+    switch (lua_type(L, idx)) {
+    case LUA_TNIL:
+        return cJSON_CreateNull();
+    case LUA_TBOOLEAN:
+        return cJSON_CreateBool(lua_toboolean(L, idx));
+    case LUA_TNUMBER:
+        if (lua_isinteger(L, idx))
+            return cJSON_CreateNumber((double)lua_tointeger(L, idx));
+        return cJSON_CreateNumber(lua_tonumber(L, idx));
+    case LUA_TSTRING:
+        return cJSON_CreateString(lua_tostring(L, idx));
+    case LUA_TTABLE: {
+        lua_len(L, idx);
+        lua_Integer n = lua_tointeger(L, -1);
         lua_pop(L, 1);
-        cmd_result_t res = cmd_next_measure_id(&r->measure_id);
-        if (res.status != ESP_OK) return -1;
-        goto have_id; /* avoid double-pop */
+        if (n > 0) {
+            cJSON *arr = cJSON_CreateArray();
+            if (!arr) return NULL;
+            for (lua_Integer i = 1; i <= n; i++) {
+                lua_rawgeti(L, idx, i);
+                cJSON *child = lua_to_cjson(L, -1);
+                lua_pop(L, 1);
+                if (child) cJSON_AddItemToArray(arr, child);
+            }
+            return arr;
+        }
+        cJSON *obj = cJSON_CreateObject();
+        if (!obj) return NULL;
+        lua_pushnil(L);
+        while (lua_next(L, idx) != 0) {
+            /* key at -2, value at -1; only accept string keys */
+            if (lua_type(L, -2) == LUA_TSTRING) {
+                cJSON *child = lua_to_cjson(L, -1);
+                if (child) cJSON_AddItemToObject(obj, lua_tostring(L, -2), child);
+            }
+            lua_pop(L, 1); /* pop value, keep key for next() */
+        }
+        return obj;
     }
-    lua_pop(L, 1);
-have_id:;
-
-    /* quantity — required */
-    lua_getfield(L, -1, "quantity");
-    if (!lua_isstring(L, -1)) {
-        lua_pop(L, 1);
-        return -2;
+    default:
+        return cJSON_CreateNull();
     }
-    strncpy(r->quantity, lua_tostring(L, -1), sizeof(r->quantity) - 1);
-    lua_pop(L, 1);
-
-    /* sensor — required */
-    lua_getfield(L, -1, "sensor");
-    if (!lua_isstring(L, -1)) {
-        lua_pop(L, 1);
-        return -3;
-    }
-    strncpy(r->sensor, lua_tostring(L, -1), sizeof(r->sensor) - 1);
-    lua_pop(L, 1);
-
-    /* device — optional ("" or nil = onboard) */
-    lua_get_optional_string(L, "device", r->device, sizeof(r->device));
-
-    /* sensor_id — optional integer (-1 sentinel = NULL) */
-    lua_getfield(L, -1, "sensor_id");
-    if (lua_isinteger(L, -1) || lua_isnumber(L, -1)) {
-        r->sensor_id = (int64_t)lua_tointeger(L, -1);
-    }
-    lua_pop(L, 1);
-
-    /* metadata — optional: table → JSON via cJSON-equivalent (here we accept
-     * a pre-serialised string only; table form is a follow-up). */
-    lua_get_optional_string(L, "metadata", r->metadata, sizeof(r->metadata));
-
-    /* start_ticks / end_ticks — optional; default to caller's now_ms_val */
-    lua_getfield(L, -1, "start_ticks");
-    r->start_ticks_ms = (lua_isinteger(L, -1) || lua_isnumber(L, -1))
-                        ? (int64_t)lua_tointeger(L, -1) : now_ms_val;
-    lua_pop(L, 1);
-
-    lua_getfield(L, -1, "end_ticks");
-    r->end_ticks_ms = (lua_isinteger(L, -1) || lua_isnumber(L, -1))
-                      ? (int64_t)lua_tointeger(L, -1) : r->start_ticks_ms;
-    lua_pop(L, 1);
-
-    /* value — required; can be number (float) or string */
-    lua_getfield(L, -1, "value");
-    if (lua_isstring(L, -1) && !lua_isnumber(L, -1)) {
-        r->value_is_string = true;
-        strncpy(r->value_text, lua_tostring(L, -1), sizeof(r->value_text) - 1);
-    } else if (lua_isnumber(L, -1)) {
-        r->value_is_string = false;
-        r->value_real      = (float)lua_tonumber(L, -1);
-    } else {
-        lua_pop(L, 1);
-        return -4;
-    }
-    lua_pop(L, 1);
-
-    return 0;
 }
 
-static int l_db_store(lua_State *L)
+/* db.store_event{ sensor=, device=, data={...}, metadata=, measure_id=,
+ *                 start_ticks=, end_ticks= }
+ *
+ *   sensor       required string ("BME280", "AMBIT", …)
+ *   data         required table → JSON object of quantities (the payload)
+ *   device       optional string; "" / nil = onboard sensor
+ *   metadata     optional table → JSON object (or omit)
+ *   measure_id   optional int; auto-allocated when omitted
+ *   start_ticks  optional UTC-ms; defaults to now
+ *   end_ticks    optional UTC-ms; defaults to start_ticks
+ *
+ * Returns measure_id on success, or nil,reason. */
+static int l_db_store_event(lua_State *L)
 {
     luaL_checktype(L, 1, LUA_TTABLE);
-    int n = (int)luaL_len(L, 1);
-    if (n <= 0) {
-        return lua_push_nil_reason(L, "records array is empty");
+
+    /* sensor — required */
+    char sensor[24] = {0};
+    lua_get_optional_string(L, "sensor", sensor, sizeof(sensor));
+    if (sensor[0] == '\0') {
+        return lua_push_nil_reason(L, "store_event: 'sensor' (string) required");
     }
 
-    measurement_record_t *records = malloc((size_t)n * sizeof(measurement_record_t));
-    if (records == NULL) {
-        return lua_push_nil_reason(L, "out of memory");
+    /* device — optional ("" / nil = onboard) */
+    char device[24] = {0};
+    lua_get_optional_string(L, "device", device, sizeof(device));
+
+    /* measure_id — optional; auto-allocate when missing */
+    int64_t measure_id = 0;
+    lua_getfield(L, 1, "measure_id");
+    bool has_id = (lua_isinteger(L, -1) || lua_isnumber(L, -1));
+    if (has_id) measure_id = (int64_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    if (!has_id) {
+        cmd_result_t idr = cmd_next_measure_id(&measure_id);
+        if (idr.status != ESP_OK) return lua_push_nil_reason(L, idr.message);
     }
 
-    int64_t now_ms_val;
+    /* start_ticks / end_ticks — optional; default to now */
+    int64_t now_ms;
     {
         struct timeval tv;
         gettimeofday(&tv, NULL);
-        now_ms_val = (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
+        now_ms = (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
     }
+    lua_getfield(L, 1, "start_ticks");
+    int64_t start_ms = (lua_isinteger(L, -1) || lua_isnumber(L, -1))
+                       ? (int64_t)lua_tointeger(L, -1) : now_ms;
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "end_ticks");
+    int64_t end_ms = (lua_isinteger(L, -1) || lua_isnumber(L, -1))
+                     ? (int64_t)lua_tointeger(L, -1) : start_ms;
+    lua_pop(L, 1);
 
-    for (int i = 1; i <= n; i++) {
-        lua_rawgeti(L, 1, i);
-        if (!lua_istable(L, -1)) {
-            free(records);
-            return lua_push_nil_reason(L, "each record must be a table");
-        }
-        int err = read_lua_record(L, &records[i - 1], now_ms_val);
-        lua_pop(L, 1); /* pop the record table */
-        if (err != 0) {
-            free(records);
-            const char *msg =
-                (err == -1) ? "next_id failed" :
-                (err == -2) ? "record missing required field 'quantity'" :
-                (err == -3) ? "record missing required field 'sensor'" :
-                              "record 'value' must be a number or string";
-            return lua_push_nil_reason(L, msg);
-        }
+    /* data — required table → payload JSON object */
+    lua_getfield(L, 1, "data");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return lua_push_nil_reason(L, "store_event: 'data' (table) required");
     }
+    cJSON *data = lua_to_cjson(L, -1);
+    lua_pop(L, 1);
+    if (data == NULL) return lua_push_nil_reason(L, "store_event: out of memory (data)");
+    char *payload_json = cJSON_PrintUnformatted(data);
+    cJSON_Delete(data);
+    if (payload_json == NULL) return lua_push_nil_reason(L, "store_event: payload encode failed");
 
-    cmd_result_t res = cmd_store_measurement(records, (size_t)n);
-    free(records);
+    /* metadata — optional table → JSON object */
+    char *metadata_json = NULL;
+    lua_getfield(L, 1, "metadata");
+    if (lua_istable(L, -1)) {
+        cJSON *md = lua_to_cjson(L, -1);
+        if (md) { metadata_json = cJSON_PrintUnformatted(md); cJSON_Delete(md); }
+    }
+    lua_pop(L, 1);
+
+    cmd_result_t res = cmd_store_event(measure_id, device, sensor,
+                                       start_ms, end_ms, metadata_json, payload_json);
+    cJSON_free(payload_json);
+    if (metadata_json) cJSON_free(metadata_json);
 
     if (res.status != ESP_OK) {
         return lua_push_nil_reason(L, res.message);
     }
-    lua_pushboolean(L, 1);
-    return 1;
-}
-
-static void lua_push_record_table(lua_State *L, const measurement_record_t *r)
-{
-    lua_newtable(L);
-    lua_pushinteger(L, (lua_Integer)r->measure_id);
-    lua_setfield(L, -2, "measure_id");
-    lua_pushstring(L, r->quantity);
-    lua_setfield(L, -2, "quantity");
-    lua_pushinteger(L, (lua_Integer)r->start_ticks_ms);
-    lua_setfield(L, -2, "start_ticks");
-    lua_pushinteger(L, (lua_Integer)r->end_ticks_ms);
-    lua_setfield(L, -2, "end_ticks");
-    if (r->device[0] != '\0') {
-        lua_pushstring(L, r->device);
-        lua_setfield(L, -2, "device");
-    }
-    lua_pushstring(L, r->sensor);
-    lua_setfield(L, -2, "sensor");
-    if (r->sensor_id != MEASUREMENT_SENSOR_ID_NONE) {
-        lua_pushinteger(L, (lua_Integer)r->sensor_id);
-        lua_setfield(L, -2, "sensor_id");
-    }
-    if (r->metadata[0] != '\0') {
-        lua_pushstring(L, r->metadata);
-        lua_setfield(L, -2, "metadata");
-    }
-    if (r->value_is_string) {
-        lua_pushstring(L, r->value_text);
-    } else {
-        lua_pushnumber(L, (lua_Number)r->value_real);
-    }
-    lua_setfield(L, -2, "value");
-    lua_pushinteger(L, (lua_Integer)r->sync_state);
-    lua_setfield(L, -2, "sync_state");
-}
-
-static int l_db_query(lua_State *L)
-{
-    const char *quantity = luaL_checkstring(L, 1);
-    lua_Integer from_ms  = luaL_checkinteger(L, 2);
-    lua_Integer to_ms    = luaL_checkinteger(L, 3);
-
-    measurement_record_t *out = malloc(LUA_QUERY_MAX_RECORDS * sizeof(measurement_record_t));
-    if (out == NULL) {
-        return lua_push_nil_reason(L, "out of memory");
-    }
-
-    size_t count = 0;
-    cmd_result_t res = cmd_query_measurements(quantity, (int64_t)from_ms, (int64_t)to_ms,
-                                              out, LUA_QUERY_MAX_RECORDS, &count);
-    if (res.status != ESP_OK) {
-        free(out);
-        return lua_push_nil_reason(L, res.message);
-    }
-
-    lua_newtable(L);
-    for (size_t i = 0; i < count; i++) {
-        lua_push_record_table(L, &out[i]);
-        lua_rawseti(L, -2, (int)(i + 1));
-    }
-
-    free(out);
-    return 1;
-}
-
-static int l_db_count(lua_State *L)
-{
-    const char *type = luaL_checkstring(L, 1);
-    size_t count = 0;
-    cmd_result_t res = cmd_measurement_count(type, &count);
-    if (res.status != ESP_OK) {
-        return lua_push_nil_reason(L, res.message);
-    }
-    lua_pushinteger(L, (lua_Integer)count);
+    lua_pushinteger(L, (lua_Integer)measure_id);
     return 1;
 }
 
@@ -815,32 +749,6 @@ static int l_db_next_id(lua_State *L)
     return 1;
 }
 
-static int l_db_unsynced(lua_State *L)
-{
-    const char *type = luaL_checkstring(L, 1);
-
-    measurement_record_t *out = malloc(LUA_QUERY_MAX_RECORDS * sizeof(measurement_record_t));
-    if (out == NULL) {
-        return lua_push_nil_reason(L, "out of memory");
-    }
-
-    size_t count = 0;
-    cmd_result_t res = cmd_query_unsynced(type, out, LUA_QUERY_MAX_RECORDS, &count);
-    if (res.status != ESP_OK) {
-        free(out);
-        return lua_push_nil_reason(L, res.message);
-    }
-
-    lua_newtable(L);
-    for (size_t i = 0; i < count; i++) {
-        lua_push_record_table(L, &out[i]);
-        lua_rawseti(L, -2, (int)(i + 1));
-    }
-
-    free(out);
-    return 1;
-}
-
 /* ── mqtt.* bindings ─────────────────────────────────────────────────── */
 
 static int l_mqtt_status(lua_State *L)
@@ -852,12 +760,12 @@ static int l_mqtt_status(lua_State *L)
     return 1;
 }
 
-/* Force the background sync runner's next-batch publish path immediately.
- * Returns true if a batch was sent, false (with reason) if nothing to send
- * or another batch is still in flight, nil,err on failure. */
-static int l_mqtt_publish_next_batch(lua_State *L)
+/* Force the sync runner's next-event publish path immediately (one
+ * measure_id = one message). Returns true if an event was sent, false (with
+ * reason) if nothing to send or one is still in flight, nil,err on failure. */
+static int l_mqtt_publish_next_event(lua_State *L)
 {
-    cmd_result_t res = cmd_mqtt_publish_next_batch();
+    cmd_result_t res = cmd_mqtt_publish_next_event();
     if (res.status == ESP_ERR_NOT_FOUND || res.status == ESP_ERR_INVALID_STATE) {
         lua_pushboolean(L, 0);
         lua_pushstring(L, res.message);
@@ -911,11 +819,8 @@ static void lua_register_device_module(lua_State *L)
 static void lua_register_db_module(lua_State *L)
 {
     static const luaL_Reg db_api[] = {
-        {"store",    l_db_store},
-        {"query",    l_db_query},
-        {"count",    l_db_count},
-        {"next_id",  l_db_next_id},
-        {"unsynced", l_db_unsynced},
+        {"store_event", l_db_store_event},
+        {"next_id",     l_db_next_id},
         {NULL, NULL},
     };
 
@@ -927,7 +832,7 @@ static void lua_register_mqtt_module(lua_State *L)
 {
     static const luaL_Reg mqtt_api[] = {
         {"status",              l_mqtt_status},
-        {"publish_next_batch",  l_mqtt_publish_next_batch},
+        {"publish_next_event",  l_mqtt_publish_next_event},
         {NULL, NULL},
     };
 
@@ -935,19 +840,51 @@ static void lua_register_mqtt_module(lua_State *L)
     lua_setglobal(L, "mqtt");
 }
 
-/* ambit.run(channel, segments, opts) — build and execute an array
- * fluorescence run over the binary protocol (the firmware equivalent of the
- * notebook's gen_cmd_arr_line + arrun1; type-2 / no-IR lines).
+/* Parse "<key><number>" out of an ASCII line (e.g. key "T:" from
+ * "T:23.45,F:.."). Returns true and writes *out when found. */
+static bool ambit_parse_field(const char *line, const char *key, double *out)
+{
+    const char *p = strstr(line, key);
+    if (p == NULL) return false;
+    *out = strtod(p + strlen(key), NULL);
+    return true;
+}
+
+/* Parse the CSV that follows the TAB in a COMPUTER-mode block line
+ * ("Data:<tag>,Length:N\t v0,v1,...,"). Fills out[] up to cap, returns count. */
+static size_t parse_csv_after_tab(const char *line, double *out, size_t cap)
+{
+    const char *p = strchr(line, '\t');
+    if (p == NULL) return 0;
+    p++;
+    size_t n = 0;
+    while (*p != '\0' && n < cap) {
+        char *end = NULL;
+        double v = strtod(p, &end);
+        if (end == p) break;            /* no more numbers */
+        out[n++] = v;
+        p = end;
+        while (*p == ',' || *p == ' ') p++;
+    }
+    return n;
+}
+
+/* ambit.run(channel, segments, opts) — run an AMBIT fluorescence trace using
+ * the COMPUTER-mode `arrun2` command: the AMBIT runs the whole trace, then
+ * dumps each array as one ASCII block ("Data:<tag>,Length:N\t v,v,...,") ending
+ * with "Data sent". Unlike `arrun1` (PLOTTING) it does NOT stream per-point, so
+ * there are no inter-point UART idle gaps — which is what desynced the shared
+ * UART0 channels. We parse the Fluo / Fluoref / ENV blocks; other tags (SUN,
+ * leaf, 730…) and interleaved AMBIT log lines are ignored.
  *
- *   segments : array of { pulses=, freq=, actinic= }  (positional [1],[2],[3]
- *              also accepted). Each line becomes 8 bytes:
- *              [2, 0, pulses>>8, pulses&0xFF, freq>>8, freq&0xFF, actinic, 1]
- *   opts     : { persist=false, allow_interrupt=false, timeout_ms=60000 }
- *              persist=true keeps the actinic LED on after the run.
+ *   segments : array of { pulses=, freq=, actinic= }  (positional [1],[2],[3] ok)
+ *   opts     : { persist=false, store=true, timeout_ms=30000 }
  *
- * Returns { array_count=N, arrays={ {index, name, data={...}, length}, ... } }
- * with index->name 0=env 1=fluor 2=fluoRef 3=sun 4=leaf 5=ir730 6=ir730Ref.
- * Returns the raw arrays; it does NOT persist them (the caller decides). */
+ * Returns { points=N, stored=K, leaf_temp=degC, fluor={..}, fluoRef={..} }.
+ * leaf_temp is a single scalar (captured once); fluor/fluoRef are per-point
+ * arrays. store=true persists one event whose payload is
+ * {"leaf_temp":<degC>,"fluor":[…],"fluoRef":[…]} (stored=1 on success, else 0).
+ * Point count is capped (heap) — large runs truncate. */
 static int l_ambit_run(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
@@ -958,15 +895,16 @@ static int l_ambit_run(lua_State *L)
         return luaL_error(L, "segments: 1-16 lines required (got %d)", nseg);
     }
 
-    uint8_t  persist         = 0;
-    bool     allow_interrupt = false;
-    uint32_t timeout_ms      = 60000;
+    /* Defaults when opts is omitted (ambit.run(ch, trace)): store + 30 s. */
+    uint8_t  persist    = 0;
+    bool     store      = true;
+    uint32_t timeout_ms = 30000;
     if (lua_istable(L, 3)) {
         lua_getfield(L, 3, "persist");
-        persist = lua_toboolean(L, -1) ? 1 : 0;
+        if (!lua_isnil(L, -1)) persist = lua_toboolean(L, -1) ? 1 : 0;
         lua_pop(L, 1);
-        lua_getfield(L, 3, "allow_interrupt");
-        allow_interrupt = lua_toboolean(L, -1);
+        lua_getfield(L, 3, "store");
+        if (!lua_isnil(L, -1)) store = lua_toboolean(L, -1);
         lua_pop(L, 1);
         lua_getfield(L, 3, "timeout_ms");
         if (lua_isnumber(L, -1)) timeout_ms = (uint32_t)lua_tointeger(L, -1);
@@ -976,6 +914,7 @@ static int l_ambit_run(lua_State *L)
     uint8_t *run_arr = malloc((size_t)nseg * 8);
     if (!run_arr) return luaL_error(L, "out of memory");
 
+    uint32_t total_pts = 0;
     for (int i = 1; i <= nseg; i++) {
         lua_rawgeti(L, 2, i);
         if (!lua_istable(L, -1)) {
@@ -1012,46 +951,137 @@ static int l_ambit_run(lua_State *L)
         line[4] = (uint8_t)((freq >> 8) & 0xFF);
         line[5] = (uint8_t)(freq & 0xFF);
         line[6] = (uint8_t)actinic;
-        line[7] = 1;                              /* subsampling: every point (returns sun+leaf) */
+        line[7] = 1;                              /* subsampling: every point */
+        total_pts += (uint32_t)pulses;
     }
 
-    uart_sensor_response_t response;
-    cmd_result_t res = cmd_ambit_run(ch, run_arr, (uint8_t)nseg, persist,
-                                     allow_interrupt, &response, timeout_ms);
+    /* Build the ASCII arrun2 command "arrun2,<nseg>,<persist>,<bytes...>," and
+     * the run metadata, both from the packed array before it is freed. */
+    char cmd[700];
+    {
+        int off = snprintf(cmd, sizeof(cmd), "arrun2,%d,%u,", nseg, (unsigned)persist);
+        for (int i = 0; i < nseg * 8 && off > 0 && off < (int)sizeof(cmd); i++) {
+            off += snprintf(cmd + off, sizeof(cmd) - off, "%u,", (unsigned)run_arr[i]);
+        }
+    }
+    char metadata_json[768];
+    {
+        int off = snprintf(metadata_json, sizeof(metadata_json), "{\"segments\":[");
+        for (int i = 0; i < nseg && off > 0 && off < (int)sizeof(metadata_json); i++) {
+            const uint8_t *line = run_arr + i * 8;
+            off += snprintf(metadata_json + off, sizeof(metadata_json) - off,
+                            "%s{\"pulses\":%u,\"freq\":%u,\"actinic\":%u}", (i == 0) ? "" : ",",
+                            ((unsigned)line[2] << 8) | line[3],
+                            ((unsigned)line[4] << 8) | line[5], (unsigned)line[6]);
+        }
+        if (off < 0 || off > (int)sizeof(metadata_json) - 3) off = (int)sizeof(metadata_json) - 3;
+        snprintf(metadata_json + off, sizeof(metadata_json) - off, "]}");
+    }
     free(run_arr);
-    if (res.status != ESP_OK) {
-        uart_sensor_response_free(&response);
+
+    /* Cap point count for the line buffer + value arrays (limited heap).
+     * leaf_temp is a single scalar (it barely changes over a run); only the
+     * fluor (S) and fluoRef (R) signals are per-point arrays. */
+    size_t npts = total_pts < 1 ? 1 : (total_pts > 256 ? 256 : total_pts);
+    size_t text_cap = npts * 64 + 512;
+    char   *text = malloc(text_cap);
+    double *vf = malloc(npts * sizeof(double));   /* fluor signal (S) */
+    double *vr = malloc(npts * sizeof(double));   /* fluoRef (R) */
+    if (!text || !vf || !vr) {
+        free(text); free(vf); free(vr);
+        return luaL_error(L, "out of memory (npts=%u)", (unsigned)npts);
+    }
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t start_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    size_t text_len = 0;
+    cmd_result_t res = cmd_uart_stream_query(ch, cmd, "Data sent", timeout_ms,
+                                             text, text_cap, &text_len);
+
+    gettimeofday(&tv, NULL);
+    int64_t end_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    /* TEMP diagnostic: dump the raw stream so we can see whether all per-point
+     * lines arrive (and parse) or only one. Remove once point-capture is fixed. */
+    ESP_LOGI(LUA_RUNNER_TAG, "ambit.run raw stream (%u bytes):\n%s",
+             (unsigned)text_len, text);
+
+    if (res.status != ESP_OK && text_len == 0) {
+        free(text); free(vf); free(vr);
         return lua_push_nil_reason(L, res.message);
     }
 
-    static const char *const kArrName[] = {
-        "env", "fluor", "fluoRef", "sun", "leaf", "ir730", "ir730Ref"
-    };
+    /* Parse the COMPUTER-mode block dump. Each "Data:<tag>,Length:N\t<csv>"
+     * line carries one array; we want Fluo (fluor), Fluoref (fluoRef) and ENV
+     * (leaf temperature, packed as centi-°C in the low 16 bits). Other tags and
+     * AMBIT log lines are ignored. */
+    size_t count = 0;        /* fluor points */
+    size_t nref  = 0;        /* fluoRef points */
+    double leaf_temp_c = 0.0;
+    bool   have_temp   = false;
+    char *save = NULL;
+    for (char *ln = strtok_r(text, "\n", &save); ln != NULL;
+         ln = strtok_r(NULL, "\n", &save)) {
+        if (strncmp(ln, "Data:Fluoref,", 13) == 0) {
+            nref = parse_csv_after_tab(ln, vr, npts);
+        } else if (strncmp(ln, "Data:Fluo,", 10) == 0) {
+            count = parse_csv_after_tab(ln, vf, npts);
+        } else if (!have_temp && strncmp(ln, "Data:ENV,", 9) == 0) {
+            double env[8];
+            if (parse_csv_after_tab(ln, env, 8) > 0) {
+                int16_t centi = (int16_t)((uint32_t)(int64_t)env[0] & 0xFFFF);
+                leaf_temp_c = centi / 100.0;
+                have_temp   = true;
+            }
+        }
+    }
+    if (nref < count) count = nref;   /* keep fluor/fluoRef aligned */
+    ESP_LOGI(LUA_RUNNER_TAG,
+             "ambit.run ch%u: %u bytes, %u points parsed, leaf_temp=%.2f",
+             (unsigned)ch, (unsigned)text_len, (unsigned)count, leaf_temp_c);
+    free(text);
+
+    int stored = 0;
+    if (store && count > 0) {
+        /* One event: payload {"leaf_temp":<scalar>,"fluor":[…],"fluoRef":[…]} */
+        cJSON *payload = cJSON_CreateObject();
+        if (payload) {
+            cJSON_AddNumberToObject(payload, "leaf_temp", leaf_temp_c);
+            cJSON_AddItemToObject(payload, "fluor",   cJSON_CreateDoubleArray(vf, (int)count));
+            cJSON_AddItemToObject(payload, "fluoRef", cJSON_CreateDoubleArray(vr, (int)count));
+            char *payload_json = cJSON_PrintUnformatted(payload);
+            cJSON_Delete(payload);
+            if (payload_json) {
+                int64_t mid = 0;
+                if (cmd_next_measure_id(&mid).status == ESP_OK &&
+                    cmd_store_event(mid, "ambit", "AMBIT", start_ms, end_ms,
+                                    metadata_json, payload_json).status == ESP_OK) {
+                    stored = 1;
+                }
+                cJSON_free(payload_json);
+            }
+        }
+    }
 
     lua_newtable(L);
-    lua_newtable(L); /* arrays */
-    for (uint8_t i = 0; i < response.array_count; i++) {
-        lua_newtable(L);
-        lua_pushinteger(L, response.arrays[i].index);
-        lua_setfield(L, -2, "index");
-        if (response.arrays[i].index < (sizeof(kArrName) / sizeof(kArrName[0]))) {
-            lua_pushstring(L, kArrName[response.arrays[i].index]);
-            lua_setfield(L, -2, "name");
-        }
-        lua_newtable(L);
-        for (uint16_t j = 0; j < response.arrays[i].length; j++) {
-            lua_pushinteger(L, (lua_Integer)response.arrays[i].data[j]);
-            lua_rawseti(L, -2, (int)(j + 1));
-        }
-        lua_setfield(L, -2, "data");
-        lua_pushinteger(L, response.arrays[i].length);
-        lua_setfield(L, -2, "length");
-        lua_rawseti(L, -2, (int)(i + 1));
+    lua_pushinteger(L, (lua_Integer)count);
+    lua_setfield(L, -2, "points");
+    if (store) {
+        lua_pushinteger(L, stored);
+        lua_setfield(L, -2, "stored");
     }
-    lua_setfield(L, -2, "arrays");
-    lua_pushinteger(L, response.array_count);
-    lua_setfield(L, -2, "array_count");
-    uart_sensor_response_free(&response);
+    lua_pushnumber(L, leaf_temp_c);
+    lua_setfield(L, -2, "leaf_temp");
+    lua_newtable(L);
+    for (size_t i = 0; i < count; i++) { lua_pushnumber(L, vf[i]); lua_rawseti(L, -2, (int)(i + 1)); }
+    lua_setfield(L, -2, "fluor");
+    lua_newtable(L);
+    for (size_t i = 0; i < count; i++) { lua_pushnumber(L, vr[i]); lua_rawseti(L, -2, (int)(i + 1)); }
+    lua_setfield(L, -2, "fluoRef");
+
+    free(vf); free(vr);
     return 1;
 }
 

@@ -25,11 +25,6 @@
 
 #define MQTT_TOPIC_MAX        256
 #define MQTT_PAYLOAD_MAX     (128U * 1024U)   /* AWS IoT max payload */
-#define MAX_BATCH_GROUPS      16              /* must match sqlite_persistence */
-/* 32 rows = up to ~10 BME280 groups (T/H/P each) per publish. Bigger numbers
- * blow the heap budget once Lua/MQTT/SQLite have run for a bit (free heap is
- * ~60 KiB steady-state on this build; the per-row record is ~380 B). */
-#define MAX_BATCH_ROWS        32
 
 static device_commands_config_t s_cfg;
 static bool s_initialized = false;
@@ -42,9 +37,16 @@ static char s_mac_str[18]; /* "XX:XX:XX:XX:XX:XX\0" */
  * MQTT event task that fires on_publish_ack. */
 static SemaphoreHandle_t s_inflight_mtx = NULL;
 static StaticSemaphore_t s_inflight_mtx_storage;
-static int64_t s_inflight_ids[MAX_BATCH_GROUPS];
-static size_t  s_inflight_n  = 0;
-static int     s_inflight_msg_id = -1;
+/* One event in flight at a time (one measure_id = one MQTT message). */
+static int64_t s_inflight_measure_id = -1;
+static int     s_inflight_msg_id     = -1;
+
+/* Measurement-activity gate. Incremented around every UART sensor transaction
+ * so the background sync runner can pause publishing while a measurement is in
+ * progress (it drains during idle/sleep instead). A counter (not a bool) so
+ * overlapping reads don't clear it early. Single 32-bit access is atomic on
+ * the ESP32; the sync runner only reads it. */
+static volatile int s_measurement_active = 0;
 
 static cmd_result_t make_result(esp_err_t status, const char *fmt, ...)
 {
@@ -64,25 +66,19 @@ static void on_publish_ack(int msg_id, esp_err_t status, void *ctx)
     if (s_inflight_mtx == NULL) return;
     if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return;
 
-    if (s_inflight_msg_id < 0 || msg_id != s_inflight_msg_id || s_inflight_n == 0) {
+    if (s_inflight_msg_id < 0 || msg_id != s_inflight_msg_id) {
         xSemaphoreGive(s_inflight_mtx);
         return; /* Unknown ack — ignore (e.g. raw cmd_mqtt_publish) */
     }
-
-    /* Copy IDs out before clearing the slot so the DB updates run with the
-     * mutex released (SQLite has its own mutex; nesting risks priority
-     * inversion). */
-    int64_t ids[MAX_BATCH_GROUPS];
-    size_t  n = s_inflight_n;
-    memcpy(ids, s_inflight_ids, n * sizeof(ids[0]));
-    s_inflight_n     = 0;
-    s_inflight_msg_id = -1;
+    int64_t mid = s_inflight_measure_id;
+    s_inflight_measure_id = -1;
+    s_inflight_msg_id     = -1;
     xSemaphoreGive(s_inflight_mtx);
 
-    if (status == ESP_OK && s_cfg.mark_batch_synced != NULL) {
-        s_cfg.mark_batch_synced(ids, n);
-    } else if (s_cfg.mark_batch_pending != NULL) {
-        s_cfg.mark_batch_pending(ids, n);
+    if (status == ESP_OK && s_cfg.mark_event_synced != NULL) {
+        s_cfg.mark_event_synced(mid);
+    } else if (s_cfg.mark_event_pending != NULL) {
+        s_cfg.mark_event_pending(mid);
     }
 }
 
@@ -298,32 +294,11 @@ static int64_t now_ms(void)
     return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
 }
 
-/* Helper: populate one onboard-BME280 row. measure_id, timestamps, and quantity
- * are caller-supplied so all three rows of one record_env share them. */
-static void fill_env_record(measurement_record_t *r, int64_t measure_id,
-                            const char *quantity, int64_t start_ms, int64_t end_ms,
-                            float value)
-{
-    memset(r, 0, sizeof(*r));
-    r->measure_id      = measure_id;
-    strncpy(r->quantity, quantity, sizeof(r->quantity) - 1);
-    r->start_ticks_ms  = start_ms;
-    r->end_ticks_ms    = end_ms;
-    r->device[0]       = '\0';                       /* onboard sensor */
-    strncpy(r->sensor, "BME280", sizeof(r->sensor) - 1);
-    r->sensor_id       = 0x76;                       /* BME280_I2C_ADDR_SECONDARY */
-    r->metadata[0]     = '\0';
-    r->value_is_string = false;
-    r->value_real      = value;
-    r->sync_state      = MEASUREMENT_SYNC_PENDING;
-}
-
 cmd_result_t cmd_record_env(int64_t *out_measure_id)
 {
     if (!s_initialized || s_cfg.read_env == NULL ||
-        s_cfg.store == NULL || s_cfg.next_id == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED,
-                           "env/persistence not available");
+        s_cfg.store_event == NULL || s_cfg.next_id == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "env/persistence not available");
     }
 
     int64_t start_ms = now_ms();
@@ -339,13 +314,13 @@ cmd_result_t cmd_record_env(int64_t *out_measure_id)
         return make_result(err, "next_id failed: %s", esp_err_to_name(err));
     }
 
-    /* T, H, P all share one measure_id and identical start/end ticks. */
-    measurement_record_t records[3];
-    fill_env_record(&records[0], mid, "temperature", start_ms, end_ms, m.temperature_c);
-    fill_env_record(&records[1], mid, "humidity",    start_ms, end_ms, m.humidity_percent);
-    fill_env_record(&records[2], mid, "pressure",    start_ms, end_ms, m.pressure_pa);
+    /* One event: T/H/P together in the payload. device "" = onboard sensor. */
+    char payload[160];
+    snprintf(payload, sizeof(payload),
+             "{\"temperature\":%.2f,\"humidity\":%.2f,\"pressure\":%.1f}",
+             m.temperature_c, m.humidity_percent, m.pressure_pa);
 
-    err = s_cfg.store(records, 3);
+    err = s_cfg.store_event(mid, "", "BME280", start_ms, end_ms, NULL, payload);
     if (err != ESP_OK) {
         return make_result(err, "store failed: %s", esp_err_to_name(err));
     }
@@ -372,46 +347,6 @@ cmd_result_t cmd_sleep_ms(uint32_t ms)
     return make_result(ESP_OK, "slept %lu ms", (unsigned long)ms);
 }
 
-cmd_result_t cmd_store_measurement(const measurement_record_t *records, size_t count)
-{
-    if (!s_initialized || s_cfg.store == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
-    }
-    if (records == NULL || count == 0) {
-        return make_result(ESP_ERR_INVALID_ARG, "no records to store");
-    }
-    esp_err_t err = s_cfg.store(records, count);
-    if (err != ESP_OK) {
-        return make_result(err, "store failed: %s", esp_err_to_name(err));
-    }
-    return make_result(ESP_OK, "stored %u record(s)", (unsigned)count);
-}
-
-cmd_result_t cmd_query_measurements(const char *quantity, int64_t from_ms, int64_t to_ms,
-                                    measurement_record_t *out, size_t max, size_t *count)
-{
-    if (!s_initialized || s_cfg.query == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
-    }
-    esp_err_t err = s_cfg.query(quantity, from_ms, to_ms, out, max, count);
-    if (err != ESP_OK) {
-        return make_result(err, "query failed: %s", esp_err_to_name(err));
-    }
-    return make_result(ESP_OK, "query returned %u record(s)", (unsigned)*count);
-}
-
-cmd_result_t cmd_measurement_count(const char *quantity, size_t *count)
-{
-    if (!s_initialized || s_cfg.count == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
-    }
-    esp_err_t err = s_cfg.count(quantity, count);
-    if (err != ESP_OK) {
-        return make_result(err, "count failed: %s", esp_err_to_name(err));
-    }
-    return make_result(ESP_OK, "count: %u", (unsigned)*count);
-}
-
 cmd_result_t cmd_next_measure_id(int64_t *out_id)
 {
     if (!s_initialized || s_cfg.next_id == NULL) {
@@ -422,19 +357,6 @@ cmd_result_t cmd_next_measure_id(int64_t *out_id)
         return make_result(err, "next_id failed: %s", esp_err_to_name(err));
     }
     return make_result(ESP_OK, "next_id: %lld", (long long)*out_id);
-}
-
-cmd_result_t cmd_query_unsynced(const char *quantity, measurement_record_t *out,
-                                size_t max, size_t *count)
-{
-    if (!s_initialized || s_cfg.query_unsynced == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
-    }
-    esp_err_t err = s_cfg.query_unsynced(quantity, out, max, count);
-    if (err != ESP_OK) {
-        return make_result(err, "query_unsynced failed: %s", esp_err_to_name(err));
-    }
-    return make_result(ESP_OK, "unsynced: %u record(s)", (unsigned)*count);
 }
 
 cmd_result_t cmd_mqtt_status(void)
@@ -483,118 +405,68 @@ cmd_result_t cmd_mqtt_publish_raw(const char *payload)
     return make_result(ESP_OK, "published to %s (msg_id=%d)", topic, msg_id);
 }
 
-/* ── MQTT publish: batch a group of rows as `sample: [...]` ─────────── */
+/* ── Event store + publish (one row/event; one message per measure_id) ── */
 
-/* Add one measurement row as a JSON object to the `sample` array. */
-static void append_row_to_sample(cJSON *sample_arr, const measurement_record_t *r)
+cmd_result_t cmd_store_event(int64_t measure_id, const char *device, const char *sensor,
+                             int64_t start_ms, int64_t end_ms,
+                             const char *metadata_json, const char *payload_json)
 {
-    cJSON *row = cJSON_CreateObject();
-    cJSON_AddNumberToObject(row, "measure_id", (double)r->measure_id);
-    cJSON_AddStringToObject(row, "quantity",   r->quantity);
-    cJSON_AddNumberToObject(row, "startTicks", (double)r->start_ticks_ms);
-    cJSON_AddNumberToObject(row, "endTicks",   (double)r->end_ticks_ms);
-    if (r->device[0] == '\0') {
-        cJSON_AddNullToObject(row, "device");
-    } else {
-        cJSON_AddStringToObject(row, "device", r->device);
+    if (!s_initialized || s_cfg.store_event == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "event storage not available (no SD?)");
     }
-    cJSON_AddStringToObject(row, "sensor", r->sensor);
-    if (r->sensor_id == MEASUREMENT_SENSOR_ID_NONE) {
-        cJSON_AddNullToObject(row, "sensor_id");
-    } else {
-        cJSON_AddNumberToObject(row, "sensor_id", (double)r->sensor_id);
+    if (sensor == NULL || payload_json == NULL) {
+        return make_result(ESP_ERR_INVALID_ARG, "store_event: null arg");
     }
-    if (r->metadata[0] == '\0') {
-        cJSON_AddNullToObject(row, "metadata");
-    } else {
-        /* Try to parse metadata as JSON; if it parses, attach the value
-         * verbatim. Otherwise fall back to a string field. */
-        cJSON *meta = cJSON_Parse(r->metadata);
-        if (meta != NULL) {
-            cJSON_AddItemToObject(row, "metadata", meta);
-        } else {
-            cJSON_AddStringToObject(row, "metadata", r->metadata);
-        }
+    esp_err_t err = s_cfg.store_event(measure_id, device, sensor, start_ms, end_ms,
+                                      metadata_json, payload_json);
+    if (err != ESP_OK) {
+        return make_result(err, "store_event(%s) failed: %s", sensor, esp_err_to_name(err));
     }
-    if (r->value_is_string) {
-        cJSON_AddStringToObject(row, "value", r->value_text);
-    } else {
-        cJSON_AddNumberToObject(row, "value", (double)r->value_real);
-    }
-    cJSON_AddItemToArray(sample_arr, row);
+    return make_result(ESP_OK, "stored event id=%lld (%s)", (long long)measure_id, sensor);
 }
 
-/* Collect distinct measure_ids from a row array, preserving order of first
- * appearance. `out_ids` capacity must be at least MAX_BATCH_GROUPS. */
-static size_t distinct_measure_ids(const measurement_record_t *rows, size_t n,
-                                    int64_t *out_ids, size_t cap)
-{
-    size_t k = 0;
-    for (size_t i = 0; i < n && k < cap; i++) {
-        bool seen = false;
-        for (size_t j = 0; j < k; j++) {
-            if (out_ids[j] == rows[i].measure_id) { seen = true; break; }
-        }
-        if (!seen) out_ids[k++] = rows[i].measure_id;
-    }
-    return k;
-}
-
-cmd_result_t cmd_mqtt_publish_next_batch(void)
+/* Publish the next pending event as one MQTT message (one measure_id = one
+ * message). Keeps the cloud's `sample:[…]` wrapper; the event's quantities are
+ * nested under `data`. */
+cmd_result_t cmd_mqtt_publish_next_event(void)
 {
     if (!s_initialized || s_cfg.publish == NULL ||
-        s_cfg.claim_next_pending_batch == NULL || s_cfg.mark_batch_pending == NULL) {
+        s_cfg.claim_next_event == NULL || s_cfg.mark_event_pending == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT or persistence not available");
     }
     if (s_inflight_mtx == NULL) {
         return make_result(ESP_ERR_INVALID_STATE, "inflight mutex not initialised");
     }
 
-    /* Refuse a new batch if one is still waiting for PUBACK. */
+    /* One event in flight at a time. */
     if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) {
         return make_result(ESP_ERR_TIMEOUT, "inflight mutex busy");
     }
-    bool already_inflight = (s_inflight_n > 0);
+    bool busy = (s_inflight_msg_id >= 0);
     xSemaphoreGive(s_inflight_mtx);
-    if (already_inflight) {
-        return make_result(ESP_ERR_INVALID_STATE,
-                           "previous batch (%u groups) still in flight",
-                           (unsigned)s_inflight_n);
+    if (busy) {
+        return make_result(ESP_ERR_INVALID_STATE, "previous event still in flight");
     }
 
-    /* Claim a batch atomically. Rows are heap-allocated since MAX_BATCH_ROWS
-     * worth of records (~370 B each) would blow a typical task stack. */
-    measurement_record_t *rows = calloc(MAX_BATCH_ROWS, sizeof(*rows));
-    if (rows == NULL) {
-        ESP_LOGE(TAG, "publish_next_batch: rows calloc(%u * %u = %u B) failed (free heap=%u)",
-                 (unsigned)MAX_BATCH_ROWS, (unsigned)sizeof(*rows),
-                 (unsigned)(MAX_BATCH_ROWS * sizeof(*rows)),
-                 (unsigned)esp_get_free_heap_size());
-        return make_result(ESP_ERR_NO_MEM, "rows alloc failed");
-    }
-    size_t row_count = 0;
-    esp_err_t err = s_cfg.claim_next_pending_batch(rows, MAX_BATCH_ROWS, &row_count);
-    if (err == ESP_ERR_NOT_FOUND || row_count == 0) {
-        free(rows);
+    measurement_event_t e;
+    esp_err_t err = s_cfg.claim_next_event(&e);
+    if (err == ESP_ERR_NOT_FOUND) {
         return make_result(ESP_ERR_NOT_FOUND, "no pending measurements");
     }
     if (err != ESP_OK) {
-        free(rows);
-        return make_result(err, "claim_next_pending_batch failed: %s", esp_err_to_name(err));
+        return make_result(err, "claim_next_event failed: %s", esp_err_to_name(err));
     }
 
-    int64_t ids[MAX_BATCH_GROUPS];
-    size_t  ids_n = distinct_measure_ids(rows, row_count, ids, MAX_BATCH_GROUPS);
-
-    /* ── Build JSON envelope ─────────────────────────────────────────── */
-    cJSON *root      = cJSON_CreateObject();
-    cJSON *sample    = cJSON_CreateArray();
-    if (root == NULL || sample == NULL) {
+    cJSON *root   = cJSON_CreateObject();
+    cJSON *sample = cJSON_CreateArray();
+    cJSON *data   = cJSON_Parse(e.payload_json); /* payload is a JSON object */
+    if (root == NULL || sample == NULL || data == NULL) {
         if (root)   cJSON_Delete(root);
         if (sample) cJSON_Delete(sample);
-        s_cfg.mark_batch_pending(ids, ids_n);
-        free(rows);
-        return make_result(ESP_ERR_NO_MEM, "cJSON alloc failed");
+        if (data)   cJSON_Delete(data);
+        s_cfg.mark_event_pending(e.measure_id);
+        measurement_event_free(&e);
+        return make_result(ESP_ERR_NO_MEM, "cJSON build failed");
     }
     cJSON_AddItemToObject(root, "sample", sample);
     cJSON_AddStringToObject(root, "device_firmware",  s_cfg.device_firmware  ? s_cfg.device_firmware  : "");
@@ -603,7 +475,6 @@ cmd_result_t cmd_mqtt_publish_next_batch(void)
     cJSON_AddStringToObject(root, "device_version",   s_cfg.device_version   ? s_cfg.device_version   : "");
     cJSON_AddStringToObject(root, "firmware_version", s_cfg.firmware_version ? s_cfg.firmware_version : "");
 
-    /* ISO 8601 publish-moment timestamp (UTC). */
     char ts_str[32];
     time_t ts = time(NULL);
     struct tm tm_info;
@@ -611,74 +482,111 @@ cmd_result_t cmd_mqtt_publish_next_batch(void)
     strftime(ts_str, sizeof(ts_str), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
     cJSON_AddStringToObject(root, "timestamp", ts_str);
 
-    for (size_t i = 0; i < row_count; i++) {
-        append_row_to_sample(sample, &rows[i]);
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddNumberToObject(obj, "measure_id", (double)e.measure_id);
+    cJSON_AddNumberToObject(obj, "startTicks", (double)e.start_ticks_ms);
+    cJSON_AddNumberToObject(obj, "endTicks",   (double)e.end_ticks_ms);
+    if (e.device[0] == '\0') cJSON_AddNullToObject(obj, "device");
+    else                     cJSON_AddStringToObject(obj, "device", e.device);
+    cJSON_AddStringToObject(obj, "sensor", e.sensor);
+    if (e.metadata_json == NULL) {
+        cJSON_AddNullToObject(obj, "metadata");
+    } else {
+        cJSON *meta = cJSON_Parse(e.metadata_json);
+        if (meta) cJSON_AddItemToObject(obj, "metadata", meta);
+        else      cJSON_AddStringToObject(obj, "metadata", e.metadata_json);
     }
+    cJSON_AddItemToObject(obj, "data", data); /* root owns data */
+    cJSON_AddItemToArray(sample, obj);
 
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (payload == NULL) {
-        s_cfg.mark_batch_pending(ids, ids_n);
-        free(rows);
+        s_cfg.mark_event_pending(e.measure_id);
+        measurement_event_free(&e);
         return make_result(ESP_ERR_NO_MEM, "cJSON print failed");
     }
 
     size_t payload_len = strlen(payload);
     if (payload_len >= MQTT_PAYLOAD_MAX) {
-        ESP_LOGW(TAG, "payload %u bytes exceeds %u; truncated batch may be rejected",
+        ESP_LOGW(TAG, "event payload %u bytes exceeds %u; may be rejected",
                  (unsigned)payload_len, (unsigned)MQTT_PAYLOAD_MAX);
     }
-
     char topic[MQTT_TOPIC_MAX];
-    snprintf(topic, sizeof(topic), "%s/1234",
-             s_cfg.topic_root ? s_cfg.topic_root : "");
+    snprintf(topic, sizeof(topic), "%s/1234", s_cfg.topic_root ? s_cfg.topic_root : "");
 
-    ESP_LOGI(TAG, "publish -> topic: %s (%u rows, %u groups, %u bytes)",
-             topic, (unsigned)row_count, (unsigned)ids_n, (unsigned)payload_len);
+    ESP_LOGI(TAG, "publish event -> %s (id=%lld, sensor=%s, %u bytes)",
+             topic, (long long)e.measure_id, e.sensor, (unsigned)payload_len);
 
     int msg_id = 0;
     err = s_cfg.publish(topic, payload, payload_len, &msg_id);
     free(payload);
-    free(rows);
-
     if (err != ESP_OK) {
-        s_cfg.mark_batch_pending(ids, ids_n);
-        return make_result(err, "publish failed: %s", esp_err_to_name(err));
+        s_cfg.mark_event_pending(e.measure_id);
+        measurement_event_free(&e);
+        return make_result(err, "event publish failed: %s", esp_err_to_name(err));
     }
 
-    /* Latch the inflight batch for the ack handler. */
     if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        memcpy(s_inflight_ids, ids, ids_n * sizeof(ids[0]));
-        s_inflight_n      = ids_n;
-        s_inflight_msg_id = msg_id;
+        s_inflight_measure_id = e.measure_id;
+        s_inflight_msg_id     = msg_id;
         xSemaphoreGive(s_inflight_mtx);
     } else {
-        ESP_LOGW(TAG, "inflight latch failed; row(s) may be re-published on retry");
+        ESP_LOGW(TAG, "inflight latch failed; event may be re-published on retry");
     }
 
-    return make_result(ESP_OK, "published %u groups (%u rows) msg_id=%d",
-                       (unsigned)ids_n, (unsigned)row_count, msg_id);
+    int64_t mid = e.measure_id;
+    measurement_event_free(&e);
+    return make_result(ESP_OK, "published event id=%lld msg_id=%d", (long long)mid, msg_id);
+}
+
+cmd_result_t cmd_uart_stream_query(uint8_t channel, const char *cmd,
+                                   const char *sentinel, uint32_t timeout_ms,
+                                   char *out, size_t out_cap, size_t *out_len)
+{
+    if (!s_initialized || s_cfg.uart_stream_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART stream query not available");
+    }
+    if (cmd == NULL || out == NULL || out_len == NULL || out_cap < 2) {
+        return make_result(ESP_ERR_INVALID_ARG, "stream_query: bad args");
+    }
+    device_commands_measurement_begin();
+    esp_err_t err = s_cfg.uart_stream_query(channel, cmd, "\n", sentinel,
+                                            out, out_cap, out_len, timeout_ms);
+    device_commands_measurement_end();
+    if (err == ESP_ERR_TIMEOUT) {
+        return make_result(ESP_ERR_TIMEOUT, "stream timeout (no '%s')", sentinel ? sentinel : "");
+    }
+    if (err != ESP_OK) {
+        return make_result(err, "stream_query ch%u failed: %s", channel, esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "stream ch%u: %u bytes", channel, (unsigned)*out_len);
 }
 
 void device_commands_on_mqtt_disconnect(void)
 {
     if (s_inflight_mtx == NULL) return;
     if (xSemaphoreTake(s_inflight_mtx, pdMS_TO_TICKS(1000)) != pdTRUE) return;
-    if (s_inflight_n == 0) {
-        xSemaphoreGive(s_inflight_mtx);
-        return;
-    }
-    int64_t ids[MAX_BATCH_GROUPS];
-    size_t n = s_inflight_n;
-    memcpy(ids, s_inflight_ids, n * sizeof(ids[0]));
-    s_inflight_n      = 0;
-    s_inflight_msg_id = -1;
+    int64_t mid = s_inflight_measure_id;
+    bool had = (mid >= 0 && s_inflight_msg_id >= 0);
+    s_inflight_measure_id = -1;
+    s_inflight_msg_id     = -1;
     xSemaphoreGive(s_inflight_mtx);
 
-    if (s_cfg.mark_batch_pending != NULL) {
-        s_cfg.mark_batch_pending(ids, n);
+    if (had && s_cfg.mark_event_pending != NULL) {
+        s_cfg.mark_event_pending(mid);
     }
 }
+
+/* ── Measurement-activity gate ──────────────────────────────────────────
+ * The sync runner consults device_commands_measurement_active() and pauses
+ * publishing while a UART measurement is in progress, draining during idle. */
+void device_commands_measurement_begin(void) { s_measurement_active++; }
+void device_commands_measurement_end(void)
+{
+    if (s_measurement_active > 0) s_measurement_active--;
+}
+bool device_commands_measurement_active(void) { return s_measurement_active > 0; }
 
 cmd_result_t cmd_cert_status(void)
 {
@@ -716,8 +624,10 @@ cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
     if (channel >= UART_SENSOR_NUM_CHANNELS) {
         return make_result(ESP_ERR_INVALID_ARG, "invalid channel %u", channel);
     }
+    device_commands_measurement_begin();
     esp_err_t err = s_cfg.uart_query(channel, cmd, extra, extra_len,
                                      expect_raw, response, timeout_ms);
+    device_commands_measurement_end();
     if (err != ESP_OK) {
         return make_result(err, "UART ch%u query failed: %s",
                            channel, esp_err_to_name(err));
@@ -742,7 +652,9 @@ cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected)
     if (channel >= UART_SENSOR_NUM_CHANNELS) {
         return make_result(ESP_ERR_INVALID_ARG, "invalid channel %u", channel);
     }
+    device_commands_measurement_begin();
     esp_err_t err = s_cfg.uart_ping(channel, connected);
+    device_commands_measurement_end();
     if (err != ESP_OK) {
         return make_result(err, "UART ch%u ping failed: %s",
                            channel, esp_err_to_name(err));
@@ -804,6 +716,7 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
     out_resp[0] = '\0';
 
     /* First attempt — full timeout budget. */
+    device_commands_measurement_begin();
     esp_err_t err = s_cfg.uart_text_query(channel, cmd, terminator,
                                           out_resp, resp_cap, resp_len, timeout_ms);
 
@@ -829,6 +742,7 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
             }
         }
     }
+    device_commands_measurement_end();
 
     /* On hard error (other than timeout) propagate without saving. */
     if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
@@ -839,31 +753,28 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
     /* save=true: write one row tagged sensor=uart_chN, quantity=response.
      * On timeout the row carries value_text="" (empty string) to indicate
      * "queried but nothing came back". */
-    if (save && s_cfg.store != NULL && s_cfg.next_id != NULL) {
+    if (save && s_cfg.store_event != NULL && s_cfg.next_id != NULL) {
         int64_t mid = 0;
         if (s_cfg.next_id(&mid) == ESP_OK) {
             gettimeofday(&tv, NULL);
             int64_t end_ms_val = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-
-            measurement_record_t r;
-            memset(&r, 0, sizeof(r));
-            r.measure_id      = mid;
-            snprintf(r.quantity, sizeof(r.quantity), "response");
-            r.start_ticks_ms  = start_ms_val;
-            r.end_ticks_ms    = end_ms_val;
-            r.device[0]       = '\0';                       /* onboard */
-            snprintf(r.sensor, sizeof(r.sensor), "uart_ch%u", channel);
-            r.sensor_id       = MEASUREMENT_SENSOR_ID_NONE;
-            r.metadata[0]     = '\0';
-            r.value_is_string = true;
-            /* On timeout, value_text stays "" — copy whatever we have (could
-             * still be empty if no data came in). Truncate to fit. */
-            strncpy(r.value_text, out_resp, sizeof(r.value_text) - 1);
-            r.sync_state      = MEASUREMENT_SYNC_PENDING;
-
-            esp_err_t store_err = s_cfg.store(&r, 1);
-            if (store_err != ESP_OK) {
-                ESP_LOGW(TAG, "uart_text_query: save failed: %s", esp_err_to_name(store_err));
+            char sensor[16];
+            snprintf(sensor, sizeof(sensor), "uart_ch%u", channel);
+            /* One event, payload {"response":"..."}; cJSON escapes the string.
+             * On timeout out_resp is "" (queried but nothing came back). */
+            cJSON *p = cJSON_CreateObject();
+            if (p != NULL) {
+                cJSON_AddStringToObject(p, "response", out_resp);
+                char *pj = cJSON_PrintUnformatted(p);
+                cJSON_Delete(p);
+                if (pj != NULL) {
+                    esp_err_t store_err = s_cfg.store_event(mid, "", sensor,
+                                                            start_ms_val, end_ms_val, NULL, pj);
+                    free(pj);
+                    if (store_err != ESP_OK) {
+                        ESP_LOGW(TAG, "uart_text_query: save failed: %s", esp_err_to_name(store_err));
+                    }
+                }
             }
         }
     }
@@ -1241,8 +1152,9 @@ cmd_result_t cmd_dispatch_json(const char *json, size_t len)
             time_t ts = 0;
             res = cmd_device_status(&bme, &rtc, &ts);
 
-        } else if (strcmp(cmd, "publish_next_batch") == 0) {
-            res = cmd_mqtt_publish_next_batch();
+        } else if (strcmp(cmd, "publish_next_batch") == 0 ||
+                   strcmp(cmd, "publish_next_event") == 0) {
+            res = cmd_mqtt_publish_next_event();
 
         } else if (strcmp(cmd, "mqtt_status") == 0) {
             res = cmd_mqtt_status();

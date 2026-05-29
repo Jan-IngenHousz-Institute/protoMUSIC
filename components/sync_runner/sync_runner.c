@@ -10,18 +10,56 @@
 
 #define SYNC_RUNNER_PERIOD_MS    10000U
 #define SYNC_RUNNER_TASK_NAME    "sync_runner"
-/* 8 KiB matches lua_runner. cmd_mqtt_publish_next_batch heap-allocates the
- * batch buffer and cJSON tree itself, so the task stack stays light. */
+/* 8 KiB matches lua_runner. cmd_mqtt_publish_next_event heap-allocates the
+ * payload buffer and cJSON tree itself, so the task stack stays light. */
 #define SYNC_RUNNER_TASK_STACK   8192
 #define SYNC_RUNNER_TASK_PRIO    3   /* below lua_runner (5), above idle */
 
+/* Time to wait between publish attempts while draining, to let the broker's
+ * PUBACK free the single in-flight slot before the next publish. */
+#define SYNC_RUNNER_ACK_POLL_MS  100U
+/* Cap on consecutive "still in flight" polls before abandoning the drain this
+ * cycle (~5 s) — guards against a lost PUBACK wedging the loop. */
+#define SYNC_RUNNER_MAX_ACK_POLLS 50
+
 static TaskHandle_t s_task_handle = NULL;
 
-/* Default gate — always permits sync. Replaced by a power_monitor lookup once
- * the solar/charge sensor is wired (separate plan). */
+/* Sync gate: pause publishing while a measurement is in progress so MQTT does
+ * not compete with latency-sensitive sensor reads; drain during idle/sleep.
+ * Weak so a future power_monitor can add a solar/charge condition on top. */
 __attribute__((weak)) bool sync_runner_is_allowed(void)
 {
-    return true;
+    return !device_commands_measurement_active();
+}
+
+/* Publish pending events back-to-back until the queue drains, the gate closes,
+ * or a PUBACK stalls. One measure_id = one message, one in flight at a time. */
+static void sync_runner_drain(void)
+{
+    int ack_polls = 0;
+    while (sync_runner_is_allowed()) {
+        cmd_result_t res = cmd_mqtt_publish_next_event();
+        if (res.status == ESP_OK) {
+            ESP_LOGI(TAG, "%s", res.message);
+            ack_polls = 0;
+            vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_ACK_POLL_MS));
+        } else if (res.status == ESP_ERR_INVALID_STATE) {
+            /* Previous event still in flight — wait for its PUBACK. */
+            if (++ack_polls > SYNC_RUNNER_MAX_ACK_POLLS) {
+                ESP_LOGW(TAG, "drain stalled waiting for PUBACK");
+                return;
+            }
+            vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_ACK_POLL_MS));
+        } else if (res.status == ESP_ERR_NOT_FOUND) {
+            return; /* nothing left to publish */
+        } else {
+            /* NOT_SUPPORTED (no MQTT/persistence) or a publish error. */
+            if (res.status != ESP_ERR_NOT_SUPPORTED) {
+                ESP_LOGW(TAG, "publish skipped: %s", res.message);
+            }
+            return;
+        }
+    }
 }
 
 static void sync_runner_task(void *arg)
@@ -34,20 +72,10 @@ static void sync_runner_task(void *arg)
 
     while (1) {
         if (sync_runner_is_allowed()) {
-            cmd_result_t res = cmd_mqtt_publish_next_batch();
-            if (res.status == ESP_OK) {
-                ESP_LOGI(TAG, "%s", res.message);
-            } else if (res.status == ESP_ERR_NOT_FOUND) {
-                /* INFO once per cycle so the log shows the task is alive even
-                 * when nothing is queued. Dial back to DEBUG once steady. */
-                ESP_LOGI(TAG, "no pending measurements");
-            } else if (res.status == ESP_ERR_INVALID_STATE) {
-                ESP_LOGW(TAG, "previous batch still in flight (slot stuck?)");
-            } else {
-                ESP_LOGW(TAG, "publish skipped: %s", res.message);
-            }
+            /* Burst-drain all pending events while idle (one msg per id). */
+            sync_runner_drain();
         } else {
-            ESP_LOGD(TAG, "sync gate closed — skipping cycle");
+            ESP_LOGD(TAG, "measurement in progress — deferring sync");
         }
 
         vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_PERIOD_MS));

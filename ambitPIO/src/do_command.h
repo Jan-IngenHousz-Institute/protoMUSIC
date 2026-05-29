@@ -233,7 +233,32 @@ void do_command(char *choose){
       run_arr_type1(16, arr, persist);
     }
       Serial.println("Done");
-      break;  
+      break;
+
+    // arrun2 — like arrun1 but COMPUTER mode. Runs the whole trace, then dumps
+    // each data array as one ASCII block ("Data:<tag>,Length:N\t v,v,...,")
+    // ending with "Data sent". No per-point streaming → no inter-point UART
+    // gaps, so it stays in sync on the ambyte (device-to-device) link.
+    case hash("arrun2"):
+     {
+      uint8_t len = (uint8_t) Serial_Input_Long(",", 10);
+      uint8_t persist = (uint8_t) Serial_Input_Long(",", 10);
+      uint8_t arr[128] = {0};
+      CONNECTION_TYPE = CONNECTION_TYPES::COMPUTER;
+
+      for (uint8_t i = 0; i < len; i++){
+        for (uint8_t j = 0; j < 8; j++){
+          arr[i * 8 + j] = (uint8_t) Serial_Input_Long(",", 10);
+        }
+      }
+
+      if (adpd_mode != ADPD_CONFIG_MODE::ARRAY_MODE1){
+        conf_slow_FR_1();
+        adpd_mode = ADPD_CONFIG_MODE::ARRAY_MODE1;
+      }
+      run_arr_type1(16, arr, persist);
+    }
+      break;
 
 
       case hash("q"):

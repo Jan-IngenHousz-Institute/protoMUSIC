@@ -12,6 +12,7 @@ if (HAVE_LOCAL_LUA)
             "include"
         REQUIRES
             device_commands
+            json
             lua
     )
 else()
@@ -35,6 +36,7 @@ else()
             "include"
         REQUIRES
             device_commands
+            json
     )
 
     target_include_directories(${COMPONENT_LIB} PRIVATE ${LUA_INCLUDE_DIRS})

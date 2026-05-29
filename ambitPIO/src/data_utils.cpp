@@ -185,6 +185,15 @@ uint16_t dataclass::get_length(void){
 
 
 
+/* Sum of the 4 little-endian bytes of v. The data checksum is a byte-sum of
+ * the payload (matching the bytes send_binary_array transmits and the ambyte's
+ * verification) — summing the uint32 value into a uint8 would only cover the
+ * low byte. */
+static inline uint8_t u32_byte_sum(uint32_t v)
+{
+    return (uint8_t)v + (uint8_t)(v >> 8) + (uint8_t)(v >> 16) + (uint8_t)(v >> 24);
+}
+
 uint32_t dataclass::send(void (*func) (uint32_t*, uint16_t), uint8_t* c){
     uint8_t checksum = 0;
     if (dataclass::get_length() == 0){
@@ -197,8 +206,8 @@ uint32_t dataclass::send(void (*func) (uint32_t*, uint16_t), uint8_t* c){
         if (dataclass::write_ptr <= dataclass::read_ptr){
             func(this->arr + this->read_ptr, this->_length - this->read_ptr);
             func(this->arr, this->read_ptr);
-            for (uint16_t i = 0; i < this->_length - this->read_ptr; i++) checksum += this->arr[this->read_ptr + i];
-            for (uint16_t i = 0; i < this->read_ptr; i++) checksum += this->arr[i];
+            for (uint16_t i = 0; i < this->_length - this->read_ptr; i++) checksum += u32_byte_sum(this->arr[this->read_ptr + i]);
+            for (uint16_t i = 0; i < this->read_ptr; i++) checksum += u32_byte_sum(this->arr[i]);
             *c = checksum;
             return 1;
         }
@@ -207,7 +216,7 @@ uint32_t dataclass::send(void (*func) (uint32_t*, uint16_t), uint8_t* c){
     }else{
         if (dataclass::write_ptr > dataclass::read_ptr){
             func(this->arr + this->read_ptr, this->write_ptr - this->read_ptr);
-            for (uint16_t i = 0; i < this->write_ptr - this->read_ptr; i++) checksum += this->arr[this->read_ptr + i];
+            for (uint16_t i = 0; i < this->write_ptr - this->read_ptr; i++) checksum += u32_byte_sum(this->arr[this->read_ptr + i]);
             *c = checksum;
             return 1;}
 
@@ -352,7 +361,6 @@ int dataclass::fsm_wake_up_calls(void){
     this->_num_wake_up_calls += 1;
     this->num_retry += 1;
 
-    Serial.println("W:");
     flush_serial(10); // remove serial buffer
 
     // potential status
@@ -383,8 +391,7 @@ int dataclass::fsm_wake_up_calls(void){
 int dataclass::fsm_send_length_info(uint8_t arr_idx){
     if (this->data_fsm_state != DATA_STATUS::LENGTHARRAY) return -1;
     unsigned int timer1 = millis();
-    Serial.println("L:");
-    
+
     int ret = serial_read_until(AMBYTE_AWAKE, 0, 0, 100, true);
     if (ret != 1){
         ESP_LOGE(TAG, "Status not match: length got %d", ret);

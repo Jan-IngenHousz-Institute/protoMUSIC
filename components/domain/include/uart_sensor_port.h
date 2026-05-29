@@ -115,6 +115,20 @@ typedef esp_err_t (*uart_sensor_text_query_fn)(uint8_t channel,
                                                size_t     *resp_len,
                                                uint32_t    timeout_ms);
 
+/* uart_sensor_stream_query_fn — send an ASCII command and accumulate MANY
+ * response lines until a line containing `sentinel` (e.g. "Done") arrives or
+ * `timeout_ms` elapses. Pre-wakes the port. The whole multi-line response is
+ * written to `out` (NUL-terminated, truncated at out_cap-1). Used for the
+ * AMBIT PLOTTING run (streamed "T:..,F:.." lines + "Done"). */
+typedef esp_err_t (*uart_sensor_stream_query_fn)(uint8_t channel,
+                                                 const char *cmd,
+                                                 const char *terminator,
+                                                 const char *sentinel,
+                                                 char       *out,
+                                                 size_t      out_cap,
+                                                 size_t     *out_len,
+                                                 uint32_t    timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

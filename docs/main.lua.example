@@ -1,47 +1,48 @@
--- Reads the BME280 environment 10 times, stores every reading to the local
--- DB, then switches on a 100% / 10 kHz PWM on GPIO4.
+-- Runs a fluorescence trace on every connected AMBIT every 30 seconds and
+-- stores the returned arrays (leaf_temp, fluor, fluoRef) to the local DB. The
+-- background sync_runner (period 10 s) publishes the stored arrays over MQTT on
+-- its own cadence — this script only does run + store.
 --
--- Each reading stores temperature, humidity and pressure as three rows sharing
--- one measure_id (so they publish together). One id is allocated per reading
--- with db.next_id() and passed to all three rows — if measure_id is omitted,
--- db.store allocates a *separate* id per row and the grouping is lost.
+-- Trace (3 segments, type-2 / no-IR, like the notebook's gen_cmd_arr_line):
+--   10 points @ 10 Hz, actinic 0    (dark baseline)
+--   10 points @ 10 Hz, actinic 255  (full actinic)
+--   10 points @ 10 Hz, actinic 0    (relaxation)
 --
--- The background sync_runner task (period 10 s) drains PENDING rows to MQTT on
--- its own cadence, so this script only does the read + store half. When the
--- loop finishes the script returns; the PWM output stays on.
+-- "Every AMBIT": each round pings UART channels 0..3 and runs only on the ones
+-- that answer (device.uart_ping wakes the AMBIT; ~2 s timeout on an empty
+-- channel). Pinging first matters — running blind on an empty channel would
+-- block for the whole run timeout.
 --
--- Copy this file to the SD card root as `main.lua`. The firmware loads
--- /sdcard/main.lua at boot (see components/lua_runner).
+-- Copy this file to the SD card root as `main.lua` (firmware loads
+-- /sdcard/main.lua at boot — see components/lua_runner).
 
-local READS       = 10
-local INTERVAL_MS = 1000   -- delay between readings
+local PERIOD_MS    = 30000   -- delay between rounds
+local NUM_CHANNELS = 4       -- AMBIT UART channels 0..3
 
-device.log(string.format("env loop: %d readings, then PWM 100%% @ 10kHz", READS))
+local trace = {
+    { pulses = 10, freq = 10, actinic = 0   },
+    { pulses = 10, freq = 10, actinic = 255 },
+    { pulses = 10, freq = 10, actinic = 0   },
+}
 
-for i = 1, READS do
-    local env, err = device.read_env()
-    if env then
-        local id = db.next_id()
-        local ok, store_err = db.store({
-            { measure_id = id, sensor = "BME280", quantity = "temperature", value = env.temperature_c },
-            { measure_id = id, sensor = "BME280", quantity = "humidity",    value = env.humidity_pct  },
-            { measure_id = id, sensor = "BME280", quantity = "pressure",    value = env.pressure_pa   },
-        })
-        if ok then
-            device.log(string.format("[%d/%d] id=%d  T=%.2fC  H=%.2f%%  P=%.0fPa",
-                       i, READS, id, env.temperature_c, env.humidity_pct, env.pressure_pa))
-        else
-            device.log(string.format("[%d/%d] store failed: %s", i, READS, store_err or "unknown"))
+device.log("ambit loop: 3-segment trace on every AMBIT every 30s")
+
+while true do
+    local ran = 0
+    for ch = 0, NUM_CHANNELS - 1 do
+        if device.uart_ping(ch) then
+            local r, err = ambit.run(ch, trace, { store = true, timeout_ms = 30000 })
+            if r then
+                ran = ran + 1
+                device.log(string.format("ch%d: %d points, stored %d arrays",
+                           ch, r.points, r.stored or 0))
+            else
+                device.log(string.format("ch%d: run failed: %s", ch, err or "unknown"))
+            end
         end
-    else
-        device.log(string.format("[%d/%d] read_env failed: %s", i, READS, err or "unknown"))
     end
-
-    if i < READS then
-        device.sleep_ms(INTERVAL_MS)
+    if ran == 0 then
+        device.log("no AMBIT responded on any channel")
     end
+    device.sleep_ms(PERIOD_MS)
 end
-
--- Switch the PWM on: 100% duty, 10 kHz, GPIO4.
-local pwm_msg = device.PWM(100, 10000, true)
-device.log("PWM on -> " .. pwm_msg)

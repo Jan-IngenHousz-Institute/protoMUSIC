@@ -396,15 +396,11 @@ void app_main(void)
         .read_env               = bme280_get_sensor_read_fn(),
         .read_clock             = pcf2131tfy_rtc_get_clock_read_fn(),
         .set_status             = ambyte_status_get_set_fn(),
-        .store                    = persistence_available ? sqlite_persistence_get_store_fn()                    : NULL,
-        .query                    = persistence_available ? sqlite_persistence_get_query_fn()                    : NULL,
-        .count                    = persistence_available ? sqlite_persistence_get_count_fn()                    : NULL,
-        .next_id                  = persistence_available ? sqlite_persistence_get_next_id_fn()                  : NULL,
-        .query_unsynced           = persistence_available ? sqlite_persistence_get_query_unsynced_fn()           : NULL,
-        .query_by_id              = persistence_available ? sqlite_persistence_get_query_by_id_fn()              : NULL,
-        .claim_next_pending_batch = persistence_available ? sqlite_persistence_get_claim_next_pending_batch_fn() : NULL,
-        .mark_batch_synced        = persistence_available ? sqlite_persistence_get_mark_batch_synced_fn()        : NULL,
-        .mark_batch_pending       = persistence_available ? sqlite_persistence_get_mark_batch_pending_fn()       : NULL,
+        .next_id            = persistence_available ? sqlite_persistence_get_next_id_fn()            : NULL,
+        .store_event        = persistence_available ? sqlite_persistence_get_store_event_fn()        : NULL,
+        .claim_next_event   = persistence_available ? sqlite_persistence_get_claim_next_event_fn()   : NULL,
+        .mark_event_synced  = persistence_available ? sqlite_persistence_get_mark_event_synced_fn()  : NULL,
+        .mark_event_pending = persistence_available ? sqlite_persistence_get_mark_event_pending_fn() : NULL,
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),
@@ -421,6 +417,7 @@ void app_main(void)
         .uart_ping              = uart_available ? uart_sensors_get_ping_fn()        : NULL,
         .uart_status            = uart_available ? uart_sensors_get_status_fn()      : NULL,
         .uart_text_query        = uart_available ? uart_sensors_get_text_query_fn()  : NULL,
+        .uart_stream_query      = uart_available ? uart_sensors_get_stream_query_fn(): NULL,
     };
     device_commands_init(&cmd_cfg);
     // device_commands_subscribe_inbound();

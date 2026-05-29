@@ -9,52 +9,37 @@ extern "C" {
 #endif
 
 /*
- * Initialize the persistence layer:
- *   1. Init pending store (LittleFS)
- *   2. Open SQLite DB on SD card (if available)
- *   3. Run schema migration (legacy `measurements` → archive + fresh measurements_v2)
- *   4. Reset stale INFLIGHT rows to PENDING (crash-recovery)
- *   5. Seed measure_id counter from MAX(measure_id)
- *   6. Start background flush task
+ * Initialise the persistence layer:
+ *   1. Open SQLite on the SD card (if mounted)
+ *   2. Migrate to the `events` schema (archive any pre-v3 DB, clean slate)
+ *   3. Reset stale INFLIGHT rows to PENDING (crash recovery)
+ *   4. Seed the measure_id counter from MAX(measure_id)
  *
- * SD card and LittleFS must be mounted before calling this.
+ * One row per measurement event; all quantities are a JSON object in `payload`.
  */
 esp_err_t sqlite_persistence_init(void);
 
-/* Port implementations — pass these function pointers to device_commands */
-esp_err_t sqlite_persistence_store(const measurement_record_t *records, size_t count);
-esp_err_t sqlite_persistence_query(const char *quantity, int64_t from_ms, int64_t to_ms,
-                                    measurement_record_t *out, size_t max, size_t *count);
-esp_err_t sqlite_persistence_count(const char *quantity, size_t *count);
-esp_err_t sqlite_persistence_next_id(int64_t *out_id);
-esp_err_t sqlite_persistence_query_unsynced(const char *quantity,
-                                             measurement_record_t *out, size_t max,
-                                             size_t *count);
-esp_err_t sqlite_persistence_query_by_id(int64_t measure_id,
-                                          measurement_record_t *out, size_t max,
-                                          size_t *count);
+/* Called by the SD hot-plug monitor (Phase 2) when the card is pulled/inserted. */
+esp_err_t sqlite_persistence_on_sd_lost(void);
+esp_err_t sqlite_persistence_on_sd_restored(void);
 
-/* Batch claim / mark used by the sync runner.
- * claim_next_pending_batch returns up to `max_rows` rows (whole groups only)
- * and atomically marks them INFLIGHT. mark_batch_synced / mark_batch_pending
- * are the per-publish post-PUBACK handlers.
- */
-esp_err_t sqlite_persistence_claim_next_pending_batch(measurement_record_t *out,
-                                                       size_t max_rows,
-                                                       size_t *out_count);
-esp_err_t sqlite_persistence_mark_batch_synced(const int64_t *measure_ids, size_t count);
-esp_err_t sqlite_persistence_mark_batch_pending(const int64_t *measure_ids, size_t count);
+/* Event store / claim / mark. */
+esp_err_t sqlite_persistence_next_id(int64_t *out_id);
+esp_err_t sqlite_persistence_store_event(int64_t measure_id,
+                                         const char *device, const char *sensor,
+                                         int64_t start_ms, int64_t end_ms,
+                                         const char *metadata_json,
+                                         const char *payload_json);
+esp_err_t sqlite_persistence_claim_next_event(measurement_event_t *out);
+esp_err_t sqlite_persistence_mark_event_synced(int64_t measure_id);
+esp_err_t sqlite_persistence_mark_event_pending(int64_t measure_id);
 
 /* Getters for function pointers */
-measurement_store_fn                    sqlite_persistence_get_store_fn(void);
-measurement_query_fn                    sqlite_persistence_get_query_fn(void);
-measurement_count_fn                    sqlite_persistence_get_count_fn(void);
-measurement_next_id_fn                  sqlite_persistence_get_next_id_fn(void);
-measurement_query_unsynced_fn           sqlite_persistence_get_query_unsynced_fn(void);
-measurement_query_by_id_fn              sqlite_persistence_get_query_by_id_fn(void);
-measurement_claim_next_pending_batch_fn sqlite_persistence_get_claim_next_pending_batch_fn(void);
-measurement_mark_batch_synced_fn        sqlite_persistence_get_mark_batch_synced_fn(void);
-measurement_mark_batch_pending_fn       sqlite_persistence_get_mark_batch_pending_fn(void);
+measurement_next_id_fn            sqlite_persistence_get_next_id_fn(void);
+measurement_store_event_fn        sqlite_persistence_get_store_event_fn(void);
+measurement_claim_next_event_fn   sqlite_persistence_get_claim_next_event_fn(void);
+measurement_mark_event_synced_fn  sqlite_persistence_get_mark_event_synced_fn(void);
+measurement_mark_event_pending_fn sqlite_persistence_get_mark_event_pending_fn(void);
 
 #ifdef __cplusplus
 }

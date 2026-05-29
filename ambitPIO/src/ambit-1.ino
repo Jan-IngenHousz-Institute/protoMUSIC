@@ -75,6 +75,11 @@ void setup(){
     Serial.println(esp_timer_get_time());
     Serial.setTimeout(50);
 
+    /* The binary FSM protocol shares UART0 with the ESP-IDF log console
+     * (Serial -> UART0). Silence all logging so it can't interleave ASCII into
+     * the binary stream sent to the ambyte over the FFC. */
+    esp_log_level_set("*", ESP_LOG_NONE);
+
 
     digitalWrite(STF_FLASH_PIN, HIGH);
     delayMicroseconds(1);

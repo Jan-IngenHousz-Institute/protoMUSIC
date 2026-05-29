@@ -320,7 +320,8 @@ static esp_err_t fsm_receive_one_array(uart_port_t port,
             return err;
         }
 
-        /* Verify data checksum */
+        /* Verify data checksum: sum of every data byte mod 256. The ambit's
+         * dataclass::send byte-sums to match (u32_byte_sum over each element). */
         uint8_t data_cs = 0;
         const uint8_t *raw_bytes = (const uint8_t *)data;
         for (size_t i = 0; i < (size_t)arr_len * 4; i++) {
@@ -683,9 +684,94 @@ static esp_err_t do_text_query(uint8_t channel,
     return ESP_ERR_TIMEOUT;
 }
 
+/* ── Streaming ASCII query (multi-line until a sentinel) ──────────────── *
+ *
+ * For sensors that answer a command with many lines and a final sentinel line
+ * (e.g. the AMBIT PLOTTING run: many "T:..,F:.." lines then a "Done" line).
+ * Pre-wakes the port (the AMBIT light-sleeps and drops the first bytes on UART
+ * wake; a lone newline is parsed as an empty command and wakes it), sends
+ * cmd+terminator, then accumulates everything into `out` until a line
+ * containing `sentinel` arrives or `timeout_ms` elapses. */
+static esp_err_t do_stream_query(uint8_t channel,
+                                 const char *cmd, const char *terminator,
+                                 const char *sentinel,
+                                 char *out, size_t cap, size_t *out_len,
+                                 uint32_t timeout_ms)
+{
+    if (channel >= UART_SENSOR_NUM_CHANNELS || cmd == NULL ||
+            out == NULL || cap < 2 || out_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *out_len = 0;
+    out[0] = '\0';
+    int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
+
+    esp_err_t err = channel_acquire(channel, pdMS_TO_TICKS(timeout_ms));
+    if (err != ESP_OK) {
+        return err;
+    }
+    uart_port_t port = s_ch[channel].uart_num;
+
+    /* Wake with the proper 3-byte handshake and WAIT for the AMBIT's ACK before
+     * sending the command. The AMBIT selects ASCII vs binary command mode from
+     * the first received byte (>127 => binary); if the command's first byte is
+     * the one mangled by the UART wake transient and lands >127, the AMBIT
+     * misroutes to binary mode and rejects the whole command ("Unknown cmd N").
+     * Confirming the ack first guarantees the AMBIT is awake and the command's
+     * first byte arrives clean. */
+    esp_err_t wake_err = ambit_wake(port, deadline);
+    if (wake_err != ESP_OK) {
+        s_ch[channel].state = UART_SENSOR_DISCONNECTED;
+        channel_release(channel);
+        return wake_err;   /* AMBIT never acked — treat as disconnected */
+    }
+    uart_flush_input(port);   /* drop the ACK / boot-idle bytes */
+
+    size_t cmd_len = strlen(cmd);
+    if (cmd_len > 0) {
+        uart_write_bytes(port, cmd, cmd_len);
+    }
+    if (terminator != NULL && terminator[0] != '\0') {
+        uart_write_bytes(port, terminator, strlen(terminator));
+    }
+
+    size_t line_start = 0;
+    size_t sent_len   = (sentinel != NULL) ? strlen(sentinel) : 0;
+    while (*out_len + 1 < cap) {
+        int64_t remain_us = deadline - now_us();
+        if (remain_us <= 0) break;
+        TickType_t ticks = pdMS_TO_TICKS((uint32_t)(remain_us / 1000));
+        if (ticks == 0) ticks = 1;
+
+        uint8_t b;
+        int n = uart_read_bytes(port, &b, 1, ticks);
+        if (n <= 0) {
+            continue;
+        }
+        out[(*out_len)++] = (char)b;
+        if (b == '\n') {
+            out[*out_len] = '\0';
+            if (sent_len > 0 && strstr(out + line_start, sentinel) != NULL) {
+                break; /* sentinel line received — done */
+            }
+            line_start = *out_len;
+        }
+    }
+
+    out[*out_len] = '\0';
+    s_ch[channel].state = (*out_len > 0) ? UART_SENSOR_CONNECTED : UART_SENSOR_DISCONNECTED;
+    channel_release(channel);
+    return (*out_len > 0) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
 /* ── Port-adapter getters ──────────────────────────────────────────── */
 
 uart_sensor_query_fn       uart_sensors_get_query_fn(void)       { return do_query;      }
 uart_sensor_ping_fn        uart_sensors_get_ping_fn(void)        { return do_ping;       }
 uart_sensor_status_fn      uart_sensors_get_status_fn(void)      { return do_status;     }
 uart_sensor_text_query_fn  uart_sensors_get_text_query_fn(void)  { return do_text_query; }
+uart_sensor_stream_query_fn uart_sensors_get_stream_query_fn(void) { return do_stream_query; }

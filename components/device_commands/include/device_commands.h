@@ -29,17 +29,12 @@ typedef struct {
     sensor_read_fn              read_env;
     clock_read_fn               read_clock;
 
-    /* Persistence ports */
-    measurement_store_fn                    store;
-    measurement_query_fn                    query;
-    measurement_count_fn                    count;
-    measurement_next_id_fn                  next_id;
-    measurement_query_unsynced_fn           query_unsynced;
-    measurement_query_by_id_fn              query_by_id;
-    /* Batch ops (used by sync_runner) */
-    measurement_claim_next_pending_batch_fn claim_next_pending_batch;
-    measurement_mark_batch_synced_fn        mark_batch_synced;
-    measurement_mark_batch_pending_fn       mark_batch_pending;
+    /* Persistence ports — one row per measurement event (event-document model) */
+    measurement_next_id_fn            next_id;
+    measurement_store_event_fn        store_event;
+    measurement_claim_next_event_fn   claim_next_event;   /* used by sync_runner */
+    measurement_mark_event_synced_fn  mark_event_synced;
+    measurement_mark_event_pending_fn mark_event_pending;
 
     /* Status port */
     status_set_fn               set_status;
@@ -71,9 +66,17 @@ typedef struct {
     uart_sensor_ping_fn                 uart_ping;
     uart_sensor_status_fn               uart_status;
     uart_sensor_text_query_fn           uart_text_query;   /* generic ASCII line */
+    uart_sensor_stream_query_fn         uart_stream_query; /* multi-line until sentinel */
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);
+
+/* Measurement-activity gate. Bracket any latency-sensitive sensor transaction
+ * with begin()/end(); the background sync runner pauses publishing while the
+ * count is non-zero and drains once it returns to idle. Safe to nest. */
+void device_commands_measurement_begin(void);
+void device_commands_measurement_end(void);
+bool device_commands_measurement_active(void);
 
 cmd_result_t cmd_set_rgb(uint8_t r, uint8_t g, uint8_t b);
 cmd_result_t cmd_read_rtc(time_t *out_time);
@@ -86,26 +89,35 @@ cmd_result_t cmd_read_env(float *temp, float *hum, float *pres);
  * resolution is chosen automatically from freq_hz (up to 14-bit). */
 cmd_result_t cmd_pwm(float duty_pct, uint32_t freq_hz, bool enable);
 
-/* Read BME280 and persist temperature/humidity/pressure as three rows sharing
- * one measure_id with identical start/end ticks. The background sync task
- * (sync_runner) publishes them together as one batch entry. Pass NULL to
- * ignore the allocated measure_id. */
+/* Read BME280 and persist temperature/humidity/pressure as one event row
+ * (payload {"temperature":..,"humidity":..,"pressure":..}). The background sync
+ * task (sync_runner) publishes it as one MQTT message. Pass NULL to ignore the
+ * allocated measure_id. */
 cmd_result_t cmd_record_env(int64_t *out_measure_id);
 cmd_result_t cmd_log(const char *msg);
 cmd_result_t cmd_sleep_ms(uint32_t ms);
-cmd_result_t cmd_store_measurement(const measurement_record_t *records, size_t count);
-cmd_result_t cmd_query_measurements(const char *quantity, int64_t from_ms, int64_t to_ms,
-                                    measurement_record_t *out, size_t max, size_t *count);
-cmd_result_t cmd_measurement_count(const char *quantity, size_t *count);
+
+/* Store one measurement event. payload_json is a JSON object of quantities
+ * (required); metadata_json may be NULL; device "" / NULL = onboard. Writes
+ * straight to SQLite — requires the SD-backed DB. */
+cmd_result_t cmd_store_event(int64_t measure_id, const char *device, const char *sensor,
+                             int64_t start_ms, int64_t end_ms,
+                             const char *metadata_json, const char *payload_json);
+
+/* Send an ASCII command and read multiple response lines until one contains
+ * `sentinel` (or timeout). Pre-wakes the port. Used for the AMBIT PLOTTING run.
+ * `out` is NUL-terminated; *out_len excludes the NUL. */
+cmd_result_t cmd_uart_stream_query(uint8_t channel, const char *cmd,
+                                   const char *sentinel, uint32_t timeout_ms,
+                                   char *out, size_t out_cap, size_t *out_len);
 cmd_result_t cmd_next_measure_id(int64_t *out_id);
-cmd_result_t cmd_query_unsynced(const char *quantity, measurement_record_t *out,
-                                size_t max, size_t *count);
 
 /* MQTT commands (Phase 6A) */
 cmd_result_t cmd_mqtt_publish(const char *topic, const char *payload);
 cmd_result_t cmd_mqtt_publish_raw(const char *payload);
-/* Publish the next pending batch of measurements (used by the sync_runner). */
-cmd_result_t cmd_mqtt_publish_next_batch(void);
+/* Publish the next pending event as one MQTT message (one measure_id = one
+ * message; used by the sync_runner). */
+cmd_result_t cmd_mqtt_publish_next_event(void);
 cmd_result_t cmd_mqtt_status(void);
 
 /* Cert status (Phase 6C) */
@@ -128,12 +140,12 @@ cmd_result_t cmd_uart_status(void);
  * discarded and the next line is returned.
  *
  * When `save` is true, the response (or an empty string on timeout) is
- * stored as a single measurement row tagged
- *   sensor   = "uart_ch<N>"
- *   quantity = "response"
- *   device   = NULL (onboard)
- * via the existing cmd_store_measurement path. `out_resp` is always set
- * (NUL-terminated, possibly empty) on return.
+ * stored as a single measurement event tagged
+ *   sensor  = "uart_ch<N>"
+ *   device  = NULL (onboard)
+ *   payload = {"response":"<text>"}
+ * via cmd_store_event. `out_resp` is always set (NUL-terminated, possibly
+ * empty) on return.
  */
 cmd_result_t cmd_uart_text_query(uint8_t channel,
                                  const char *cmd, const char *terminator,

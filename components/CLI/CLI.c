@@ -8,7 +8,9 @@
 #include "driver/i2c.h"
 #include "esp_console.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "ambit_protocol.h"
 #include "device_commands.h"
@@ -191,36 +193,15 @@ static int cli_cmd_test_t52(int argc, char **argv)
               cmd_mqtt_publish("test/topic", "test"));
     T52_CHECK("cmd_mqtt_publish_raw",
               cmd_mqtt_publish_raw("test"));
-    T52_CHECK("cmd_mqtt_publish_next_batch",
-              cmd_mqtt_publish_next_batch());
+    T52_CHECK("cmd_mqtt_publish_next_event",
+              cmd_mqtt_publish_next_event());
     T52_CHECK("cmd_cert_status",
               cmd_cert_status());
 
-    /* ── Persistence port guards ───────────────────────────────────── */
-    measurement_record_t rec;
-    memset(&rec, 0, sizeof(rec));
-    rec.measure_id      = 999999LL;
-    strncpy(rec.quantity, "temperature", sizeof(rec.quantity) - 1);
-    rec.start_ticks_ms  = 1;
-    rec.end_ticks_ms    = 1;
-    rec.device[0]       = '\0';
-    strncpy(rec.sensor, "test", sizeof(rec.sensor) - 1);
-    rec.sensor_id       = MEASUREMENT_SENSOR_ID_NONE;
-    rec.metadata[0]     = '\0';
-    rec.value_is_string = false;
-    rec.value_real      = 1.0f;
-    rec.sync_state      = MEASUREMENT_SYNC_PENDING;
-
-    T52_CHECK("cmd_store_measurement",
-              cmd_store_measurement(&rec, 1));
-
-    size_t cnt = 0;
-    T52_CHECK("cmd_measurement_count(temperature)",
-              cmd_measurement_count("temperature", &cnt));
-
-    measurement_record_t out[1];
-    T52_CHECK("cmd_query_unsynced(temperature)",
-              cmd_query_unsynced("temperature", out, 1, &cnt));
+    /* ── Persistence port guards (event-document model) ────────────── */
+    T52_CHECK("cmd_store_event",
+              cmd_store_event(999999LL, "", "test", 1, 1, NULL,
+                              "{\"temperature\":1.0}"));
 
     int64_t nid = 0;
     T52_CHECK("cmd_next_measure_id",
@@ -585,6 +566,16 @@ static int cli_cmd_pwm(int argc, char **argv)
     return (res.status == ESP_OK) ? 0 : 1;
 }
 
+static int cli_cmd_reboot(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    printf("Rebooting...\r\n");
+    fflush(stdout);
+    vTaskDelay(pdMS_TO_TICKS(100)); /* let the message flush before reset */
+    esp_restart();
+    return 0; /* not reached */
+}
+
 static esp_err_t cli_register_commands(void)
 {
     if (s_cli_commands_registered) {
@@ -676,6 +667,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "PWM <duty 0-100> [freq_hz=10000] [enable 0|1=1]  drive PWM on GPIO4",
         .func    = cli_cmd_pwm,
     };
+    static const esp_console_cmd_t reboot_cmd = {
+        .command = "reboot",
+        .help    = "restart the device",
+        .func    = cli_cmd_reboot,
+    };
 
     esp_err_t err = esp_console_cmd_register(&status_cmd);
     if (err != ESP_OK) {
@@ -758,6 +754,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&pwm_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&reboot_cmd);
     if (err != ESP_OK) {
         return err;
     }
