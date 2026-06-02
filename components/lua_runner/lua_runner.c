@@ -11,6 +11,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "device_commands.h"
@@ -27,6 +28,16 @@
 #define LUA_SCRIPT_PATH "/sdcard/main.lua"
 
 static TaskHandle_t s_lua_task_handle = NULL;
+
+/* Stop-flag inspected by the Lua debug hook + the interruptible sleep. Set by
+ * lua_runner_stop(); the script unwinds via luaL_error and the task exits. */
+static volatile bool s_should_stop = false;
+
+/* Signaled by the task when it has finished cleaning up (lua_close done). Lets
+ * lua_runner_stop() wait for a clean exit before lua_runner_start() spawns a
+ * new task — avoids two Lua states alive at once. Created lazily. */
+static SemaphoreHandle_t s_done_sem = NULL;
+static StaticSemaphore_t s_done_sem_storage;
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
@@ -119,13 +130,35 @@ static int l_device_record_env(lua_State *L)
     return 1;
 }
 
+/* device.sd_ready() -> true|false. Gate measurement rounds with this so the
+ * loop pauses while the SD card is out (DB closed) and resumes on reinsert. */
+static int l_device_sd_ready(lua_State *L)
+{
+    bool ready = false;
+    cmd_result_t res = cmd_sd_ready(&ready);
+    (void)res;     /* not_supported / errors → ready stays false, push as-is */
+    lua_pushboolean(L, ready ? 1 : 0);
+    return 1;
+}
+
 static int l_device_sleep_ms(lua_State *L)
 {
     lua_Integer ms = luaL_checkinteger(L, 1);
     if (ms < 0 || ms > INT_MAX) {
         return luaL_error(L, "ms must be in [0, INT_MAX]");
     }
-    cmd_sleep_ms((uint32_t)ms);
+    /* Interruptible sleep: chop into 100 ms chunks so a stop signal wakes the
+     * task quickly instead of waiting for a full 30 s sleep to elapse. */
+    const uint32_t CHUNK_MS = 100;
+    uint32_t remaining = (uint32_t)ms;
+    while (remaining > 0) {
+        if (s_should_stop) {
+            return luaL_error(L, "lua_runner: stop signaled during sleep");
+        }
+        uint32_t step = remaining > CHUNK_MS ? CHUNK_MS : remaining;
+        cmd_sleep_ms(step);
+        remaining -= step;
+    }
     return 0;
 }
 
@@ -788,6 +821,7 @@ static void lua_register_device_module(lua_State *L)
         {"status",                 l_device_status},
         {"read_env",               l_device_read_env},
         {"record_env",             l_device_record_env},
+        {"sd_ready",               l_device_sd_ready},
         {"sleep_ms",               l_device_sleep_ms},
         {"log",                    l_device_log},
         {"PWM",                    l_device_pwm},
@@ -1110,6 +1144,16 @@ static void log_lua_error(lua_State *L, const char *phase)
     lua_pop(L, 1);
 }
 
+/* Debug hook fired every N Lua bytecode instructions. Raises a Lua error if
+ * lua_runner_stop() has been signaled — unwinds the running script cleanly. */
+static void lua_stop_hook(lua_State *L, lua_Debug *ar)
+{
+    (void)ar;
+    if (s_should_stop) {
+        luaL_error(L, "lua_runner: stop signaled");
+    }
+}
+
 static void lua_runner_task(void *arg)
 {
     (void)arg;
@@ -1117,9 +1161,7 @@ static void lua_runner_task(void *arg)
     lua_State *L = luaL_newstate();
     if (L == NULL) {
         ESP_LOGE(LUA_RUNNER_TAG, "Failed to create Lua state");
-        s_lua_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
+        goto done;
     }
 
     luaL_openlibs(L);
@@ -1128,12 +1170,14 @@ static void lua_runner_task(void *arg)
     lua_register_mqtt_module(L);
     lua_register_ambit_module(L);
 
+    /* Fire the stop-check every 1000 Lua bytecode instructions — cheap and
+     * gives prompt unwinding without measurable interpreter slowdown. */
+    lua_sethook(L, lua_stop_hook, LUA_MASKCOUNT, 1000);
+
     if (luaL_loadfile(L, LUA_SCRIPT_PATH) != LUA_OK) {
         log_lua_error(L, "failed to load " LUA_SCRIPT_PATH);
         lua_close(L);
-        s_lua_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
+        goto done;
     }
 
     if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
@@ -1144,7 +1188,12 @@ static void lua_runner_task(void *arg)
              (unsigned long)uxTaskGetStackHighWaterMark(NULL));
 
     lua_close(L);
+
+done:
     s_lua_task_handle = NULL;
+    if (s_done_sem != NULL) {
+        xSemaphoreGive(s_done_sem);
+    }
     vTaskDelete(NULL);
 }
 
@@ -1153,6 +1202,16 @@ esp_err_t lua_runner_start(void)
     if (s_lua_task_handle != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+
+    if (s_done_sem == NULL) {
+        s_done_sem = xSemaphoreCreateBinaryStatic(&s_done_sem_storage);
+        if (s_done_sem == NULL) return ESP_ERR_NO_MEM;
+    } else {
+        /* Drain any leftover give from a previous run so stop() waits on the
+         * NEW task's exit, not a stale signal. */
+        (void)xSemaphoreTake(s_done_sem, 0);
+    }
+    s_should_stop = false;
 
     BaseType_t created = xTaskCreate(
         lua_runner_task,
@@ -1165,6 +1224,26 @@ esp_err_t lua_runner_start(void)
     if (created != pdPASS) {
         s_lua_task_handle = NULL;
         return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+esp_err_t lua_runner_stop(uint32_t wait_ms)
+{
+    if (s_lua_task_handle == NULL) {
+        return ESP_OK;     /* nothing running */
+    }
+    s_should_stop = true;
+    if (s_done_sem == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* The Lua VM unwinds at the next bytecode (or sleep chunk). If the task is
+     * stuck in a long C-blocking call (e.g. a 30 s UART read), we time out;
+     * it'll still exit on its own once that call returns. */
+    if (xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+        ESP_LOGW(LUA_RUNNER_TAG, "stop: task still busy after %u ms — will exit later",
+                 (unsigned)wait_ms);
+        return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
 }

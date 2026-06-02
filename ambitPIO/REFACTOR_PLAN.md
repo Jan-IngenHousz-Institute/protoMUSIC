@@ -124,6 +124,21 @@ capacity + count.
 do_command.h:22-25 — no uniqueness check; two commands can collide to one `case`
 with no compiler warning. Prefer `strcmp` table / `string_view` switch.
 
+### 20. Protocol mode-switch is glitch-sensitive (`c > 127` heuristic)
+ambit-1.ino:159-181 — the main loop decides "computer text" vs "ambyte binary"
+purely on whether the first peeked byte is `> 127`. A single stray high byte (line
+noise, or a UART framing glitch from the DTR/RTS reset when a host opens the port)
+forces a 50 ms binary-header hunt (`serial_read_until(170,160,222,…)`) and emits
+`[E] Unknown cmd <n>` (e.g. the observed `Unknown cmd 251` / 0xFB). It self-recovers
+(drops the byte, replies 128), so it's benign as a one-off but noisy and fragile.
+Also `serial_read_until`/`flush_serial` echo every received byte back (decimal for
+>127, raw otherwise; data_utils.cpp:28-33), which pollutes the link.
+**Fix direction:** a properly framed protocol with a sync preamble + length +
+checksum that rejects junk bytes cleanly, instead of mode-switching on a single
+byte's MSB. Drop the echo-on-parse behavior. Until then, host side should
+`setDTR(False)/setRTS(False)` and `reset_input_buffer()` on open (see the demo
+notebook fix) so the open glitch never reaches the parser.
+
 ---
 
 ## Suggested order of attack
@@ -131,7 +146,8 @@ with no compiler warning. Prefer `strcmp` table / `string_view` switch.
 1. **Delete dead code** (#3) — zero risk, unblocks readability.
 2. **Fix concrete bugs** (#5, #6, #7, #8, #9, #12) — small, isolated.
 3. **Centralize protocol constants + pins** (#13, #14) + single `serial_read_until`
-   prototype (#15).
+   prototype (#15). Address the glitch-sensitive mode-switch + parser echo (#20)
+   here too — they share the protocol-framing rework.
 4. **Unify config structs** (#2); make `dataclass` stack/RAII (#11).
 5. **Extract shared PAM measurement scaffolding** (#4).
 6. **Decide on Wrench** (#1) — the big strategic call.

@@ -19,6 +19,7 @@ typedef struct {
 
 static esp_mqtt_client_handle_t s_client    = NULL;
 static volatile bool            s_connected = false;
+static bool                     s_started   = false;
 
 /* Outbound ack callback */
 static message_publish_ack_fn s_ack_handler = NULL;
@@ -257,17 +258,27 @@ esp_err_t mqtt_client_init(const mqtt_client_config_t *cfg)
 
 void mqtt_client_start(void)
 {
-    if (s_client != NULL) {
+    if (s_client != NULL && !s_started) {
         esp_mqtt_client_start(s_client);
+        s_started = true;
     }
 }
 
 void mqtt_client_stop(void)
 {
-    if (s_client != NULL) {
+    /* Idempotent: silently skip if we never started. Prevents the esp-mqtt
+     * "Client asked to stop, but was not started" warning on every Wi-Fi
+     * disconnect attempt when the broker never came up. */
+    if (s_client != NULL && s_started) {
         s_connected = false;
+        s_started   = false;
         esp_mqtt_client_stop(s_client);
     }
+}
+
+bool mqtt_client_is_running(void)
+{
+    return s_started;
 }
 
 message_publish_fn mqtt_client_get_publish_fn(void)

@@ -6,6 +6,7 @@
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "sdmmc_cmd.h"
 
 #define TAG "sd_card"
@@ -124,7 +125,7 @@ static esp_err_t sdcard_init_locked(void)
     return ESP_OK;
 }
 
-static esp_err_t sdcard_mount_locked(void)
+static esp_err_t sdcard_mount_locked(bool quiet)
 {
     if (s_sdcard.mounted) {
         return ESP_OK;
@@ -142,7 +143,9 @@ static esp_err_t sdcard_mount_locked(void)
         &s_mount_config,
         &s_sdcard.card);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SD mount failed: %s", esp_err_to_name(err));
+        if (!quiet) {
+            ESP_LOGE(TAG, "SD mount failed: %s", esp_err_to_name(err));
+        }
         s_sdcard.card = NULL;
         return err;
     }
@@ -170,7 +173,7 @@ esp_err_t sdcard_mount(void)
         return err;
     }
 
-    err = sdcard_mount_locked();
+    err = sdcard_mount_locked(false);
     sdcard_unlock();
     return err;
 }
@@ -209,4 +212,98 @@ bool sdcard_is_mounted(void)
     mounted = s_sdcard.mounted;
     sdcard_unlock();
     return mounted;
+}
+
+/* ── Hot-plug monitor ─────────────────────────────────────────────────── */
+
+static TaskHandle_t      s_monitor_task = NULL;
+static sdcard_state_cb_t s_state_cb     = NULL;
+static uint32_t          s_monitor_period_ms = 2000;
+
+/* One probe step: try to detect a state transition. Returns the new mounted
+ * state (or current state if no change). Takes the lock briefly. */
+static bool sdcard_probe_step(void)
+{
+    if (sdcard_lock() != ESP_OK) {
+        return s_sdcard.mounted;     /* lock busy — report last known */
+    }
+
+    bool was_mounted = s_sdcard.mounted;
+
+    if (was_mounted && s_sdcard.card != NULL) {
+        /* CMD13 — fast card-status query. Fails if the card is gone. */
+        esp_err_t err = sdmmc_get_status(s_sdcard.card);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "card lost (sdmmc_get_status: %s) — unmounting",
+                     esp_err_to_name(err));
+            esp_err_t u = esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_sdcard.card);
+            if (u != ESP_OK) {
+                ESP_LOGW(TAG, "unmount after card-loss: %s", esp_err_to_name(u));
+            }
+            s_sdcard.card    = NULL;
+            s_sdcard.mounted = false;
+        }
+    } else if (!was_mounted) {
+        /* Card was out — try to remount. Quiet on failure (likely no card). */
+        esp_err_t err = sdcard_mount_locked(true);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "card detected — remounted");
+        }
+    }
+
+    bool now_mounted = s_sdcard.mounted;
+    sdcard_unlock();
+    return (now_mounted != was_mounted) ? now_mounted : was_mounted;
+    /* Caller compares against its own previous state to fire transitions. */
+}
+
+static void sdcard_monitor_task(void *arg)
+{
+    (void)arg;
+    bool last = sdcard_is_mounted();
+
+    /* Stagger the first probe so we don't fight boot-time SD activity. */
+    vTaskDelay(pdMS_TO_TICKS(s_monitor_period_ms));
+
+    while (1) {
+        bool now = sdcard_probe_step();
+        if (now != last) {
+            ESP_LOGI(TAG, "state transition: %s -> %s",
+                     last ? "mounted" : "out",
+                     now  ? "mounted" : "out");
+            if (s_state_cb != NULL) {
+                s_state_cb(now);
+            }
+            last = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(s_monitor_period_ms));
+    }
+}
+
+esp_err_t sdcard_start_monitor(uint32_t period_ms, sdcard_state_cb_t cb)
+{
+    if (s_monitor_task != NULL) {
+        return ESP_OK;     /* already running */
+    }
+    if (period_ms < 200) period_ms = 200;
+    s_monitor_period_ms = period_ms;
+    s_state_cb          = cb;
+
+    /* Silence the ESP-IDF SDMMC layers' ERROR-level "no card" spam — those
+     * fire every poll while the card is out. Boot-time errors already logged
+     * before we get here. WARN/INFO from these tags is still visible. */
+    esp_log_level_set("sdmmc_common",   ESP_LOG_WARN);
+    esp_log_level_set("vfs_fat_sdmmc",  ESP_LOG_WARN);
+
+    /* 12 KB stack: the remount path goes through esp_vfs_fat_sdmmc_mount +
+     * FATFS, and the cb fans out to sqlite_persistence_on_sd_restored() which
+     * reopens SQLite (heavy stack user). 4 KB overflowed; 8 KB was marginal. */
+    BaseType_t ok = xTaskCreate(sdcard_monitor_task, "sd_monitor",
+                                12288, NULL, 2, &s_monitor_task);
+    if (ok != pdPASS) {
+        s_monitor_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "hot-plug monitor started (period=%u ms)", (unsigned)period_ms);
+    return ESP_OK;
 }

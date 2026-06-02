@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 #include "messaging_port.h"
 
@@ -20,6 +22,7 @@ typedef struct {
 esp_err_t mqtt_client_init(const mqtt_client_config_t *cfg);
 void      mqtt_client_start(void);
 void      mqtt_client_stop(void);
+bool      mqtt_client_is_running(void);   /* true once start() has been called and stop() hasn't been */
 
 message_publish_fn                  mqtt_client_get_publish_fn(void);
 message_is_connected_fn             mqtt_client_get_is_connected_fn(void);

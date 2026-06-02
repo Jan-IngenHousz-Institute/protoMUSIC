@@ -58,29 +58,6 @@ static int integrity_cb(void *arg, int ncols, char **values, char **names)
     return 0;
 }
 
-static int read_user_version(sqlite3 *db)
-{
-    sqlite3_stmt *st = NULL;
-    int v = 0;
-    if (sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &st, NULL) != SQLITE_OK) return 0;
-    if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int(st, 0);
-    sqlite3_finalize(st);
-    return v;
-}
-
-static bool table_exists(sqlite3 *db, const char *name)
-{
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db,
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", -1, &st, NULL) != SQLITE_OK) {
-        return false;
-    }
-    sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
-    bool found = (sqlite3_step(st) == SQLITE_ROW);
-    sqlite3_finalize(st);
-    return found;
-}
-
 static char *dup_text_col(sqlite3_stmt *st, int col)
 {
     if (sqlite3_column_type(st, col) == SQLITE_NULL) return NULL;
@@ -103,39 +80,6 @@ static int64_t db_get_max_measure_id(void)
     if (sqlite3_step(st) == SQLITE_ROW) m = sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
     return m;
-}
-
-/* Archive any pre-v3 DB (old measurements / measurements_v2 / measurement_arrays).
- * Clean-slate migration: bytes preserved on the SD under a timestamped name. */
-static void maybe_archive_legacy_db(void)
-{
-    sqlite3 *probe = NULL;
-    if (sqlite3_open(DB_PATH, &probe) != SQLITE_OK) {
-        if (probe) sqlite3_close(probe);
-        return;
-    }
-    int  version    = read_user_version(probe);
-    bool has_events = table_exists(probe, "events");
-    bool has_old    = table_exists(probe, "measurements") ||
-                      table_exists(probe, "measurements_v2") ||
-                      table_exists(probe, "measurement_arrays");
-    sqlite3_close(probe);
-
-    if (version >= SCHEMA_VERSION && has_events) return; /* current schema */
-    if (!has_old && !has_events) return;                 /* fresh file — CREATE handles it */
-
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    char archive[96];
-    snprintf(archive, sizeof(archive), DB_PATH ".legacy_%lld", (long long)tv.tv_sec);
-    if (rename(DB_PATH, archive) != 0) {
-        ESP_LOGW(TAG, "Failed to archive legacy DB; removing");
-        remove(DB_PATH);
-    } else {
-        ESP_LOGW(TAG, "Legacy DB archived to %s", archive);
-    }
-    rename(DB_PATH "-wal",     DB_PATH "-wal.legacy");
-    rename(DB_PATH "-journal", DB_PATH "-journal.legacy");
 }
 
 static esp_err_t db_open_and_configure(void)
@@ -226,7 +170,6 @@ esp_err_t sqlite_persistence_init(void)
 
     if (sdcard_is_mounted()) {
         sqlite3_initialize();
-        maybe_archive_legacy_db();
         if (db_open_and_configure() == ESP_OK) {
             s_db_available = true;
             ESP_LOGI(TAG, "events DB ready (schema v%d), next measure_id = %lld",
@@ -258,7 +201,6 @@ esp_err_t sqlite_persistence_on_sd_restored(void)
     esp_err_t err = ESP_OK;
     if (!s_db_available) {
         sqlite3_initialize();
-        maybe_archive_legacy_db();
         err = db_open_and_configure();
         s_db_available = (err == ESP_OK);
     }

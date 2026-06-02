@@ -27,6 +27,9 @@ local trace = {
 
 device.log("ambit loop: 3-segment trace on every AMBIT every 30s")
 
+-- No SD-state check needed in the script: the firmware stops this task on
+-- card removal and restarts it on reinsertion. (device.sd_ready() is still
+-- available if you want to gate something on it from Lua.)
 while true do
     local ran = 0
     for ch = 0, NUM_CHANNELS - 1 do
@@ -46,3 +49,6 @@ while true do
     end
     device.sleep_ms(PERIOD_MS)
 end
+
+
+

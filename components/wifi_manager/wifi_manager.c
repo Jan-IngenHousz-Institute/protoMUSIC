@@ -34,10 +34,12 @@
 #define WIFI_MANAGER_CREDS_NVS_KEY_PASS  "pass"
 
 /* Reconnect backoff: attempt 1 is immediate, then BASE, 2*BASE, 4*BASE ...
- * doubling until capped at MAX. Retries continue indefinitely at MAX so the
- * device self-heals when the AP comes back — the rate is bounded, not the count. */
+ * doubling until capped at MAX. After MAX_ATTEMPTS the manager gives up and
+ * reports FAILED — at that point the AP has been gone long enough that we
+ * stop spamming the log; user code can re-arm via wifi_manager_connect(). */
 #define WIFI_MANAGER_RECONNECT_BACKOFF_BASE_MS 500
 #define WIFI_MANAGER_RECONNECT_BACKOFF_MAX_MS  10000
+#define WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS    100
 
 typedef struct {
     EventGroupHandle_t event_group;
@@ -291,6 +293,15 @@ static void wifi_event_handler(
         }
 
         ++s_wifi.reconnect_count;
+        if (s_wifi.reconnect_count > WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS) {
+            s_wifi.connect_requested = false;
+            wifi_manager_cancel_reconnect();
+            xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
+            ESP_LOGE(TAG,
+                     "Wi-Fi reconnect gave up after %d attempts (reason=%d) — \"%s\" unreachable",
+                     WIFI_MANAGER_RECONNECT_MAX_ATTEMPTS, reason, s_wifi.current_ssid);
+            return;
+        }
         const uint32_t delay_ms = wifi_manager_reconnect_delay_ms(s_wifi.reconnect_count);
         ESP_LOGW(
             TAG,

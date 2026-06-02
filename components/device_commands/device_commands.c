@@ -347,6 +347,19 @@ cmd_result_t cmd_sleep_ms(uint32_t ms)
     return make_result(ESP_OK, "slept %lu ms", (unsigned long)ms);
 }
 
+cmd_result_t cmd_sd_ready(bool *out_ready)
+{
+    if (out_ready == NULL) {
+        return make_result(ESP_ERR_INVALID_ARG, "out_ready is NULL");
+    }
+    if (!s_initialized || s_cfg.sd_ready == NULL) {
+        *out_ready = false;
+        return make_result(ESP_ERR_NOT_SUPPORTED, "SD port not wired");
+    }
+    *out_ready = s_cfg.sd_ready();
+    return make_result(ESP_OK, "SD: %s", *out_ready ? "ready" : "out");
+}
+
 cmd_result_t cmd_next_measure_id(int64_t *out_id)
 {
     if (!s_initialized || s_cfg.next_id == NULL) {
@@ -433,6 +446,13 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     if (!s_initialized || s_cfg.publish == NULL ||
         s_cfg.claim_next_event == NULL || s_cfg.mark_event_pending == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT or persistence not available");
+    }
+    /* Don't even claim an event if the broker isn't connected — Wi-Fi/MQTT
+     * may be down and we'd just shove bytes at a dead pipe (the esp-mqtt
+     * client silently enqueues / drops them). Keeps events PENDING for the
+     * next cycle and lets sync_runner_drain exit silently. */
+    if (s_cfg.message_is_connected != NULL && !s_cfg.message_is_connected()) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not connected");
     }
     if (s_inflight_mtx == NULL) {
         return make_result(ESP_ERR_INVALID_STATE, "inflight mutex not initialised");

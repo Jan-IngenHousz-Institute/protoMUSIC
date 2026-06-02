@@ -39,6 +39,10 @@ typedef struct {
     /* Status port */
     status_set_fn               set_status;
 
+    /* SD-card readiness probe (used by Lua main.lua to gate measurement
+     * rounds when the card is out). NULL = SD layer absent. */
+    bool                       (*sd_ready)(void);
+
     /* Messaging ports (Phase 6A) */
     message_publish_fn                  publish;
     message_is_connected_fn             message_is_connected;
@@ -94,6 +98,11 @@ cmd_result_t cmd_pwm(float duty_pct, uint32_t freq_hz, bool enable);
  * task (sync_runner) publishes it as one MQTT message. Pass NULL to ignore the
  * allocated measure_id. */
 cmd_result_t cmd_record_env(int64_t *out_measure_id);
+
+/* Returns true when the SD card is mounted (and therefore the SQLite event DB
+ * is writable). main.lua should consult this before starting a measurement
+ * round so it doesn't measure into a closed DB. */
+cmd_result_t cmd_sd_ready(bool *out_ready);
 cmd_result_t cmd_log(const char *msg);
 cmd_result_t cmd_sleep_ms(uint32_t ms);
 

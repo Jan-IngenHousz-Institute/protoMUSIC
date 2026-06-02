@@ -132,6 +132,32 @@ static esp_err_t app_init_sdcard(void)
     return ESP_OK;
 }
 
+/* Hot-plug callback: fired by the sd_monitor task on every mount-state
+ * transition. Drives the persistence layer AND the Lua runner so the script
+ * is paused while the card is out and re-launched fresh when it returns —
+ * which is the cleanest way to avoid running measurements against a closed
+ * DB and to pick up any edits to /sdcard/main.lua on reinsert. */
+static void app_on_sd_state_change(bool mounted)
+{
+    if (mounted) {
+        /* DB first (the script will hit cmd_store_event almost immediately). */
+        sqlite_persistence_on_sd_restored();
+        esp_err_t err = lua_runner_start();
+        if (err == ESP_OK) {
+            ESP_LOGI(APP_TAG, "Lua runner restarted (SD inserted)");
+        } else if (err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(APP_TAG, "Lua runner restart failed: %s", esp_err_to_name(err));
+        }
+    } else {
+        /* Stop the script first so no in-flight ambit.run tries to write into
+         * the DB while we're closing it. 5 s is enough for the script to
+         * unwind from a sleep / short read; longer UART reads will finish in
+         * the background and the task will exit on its own. */
+        lua_runner_stop(5000);
+        sqlite_persistence_on_sd_lost();
+    }
+}
+
 static esp_err_t app_init_littlefs(void)
 {
     esp_vfs_littlefs_conf_t lfs_conf = {
@@ -192,9 +218,14 @@ static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)id; (void)data;
-    ESP_LOGW(APP_TAG, "Wi-Fi disconnected — stopping MQTT");
-    mqtt_client_stop();
-    device_commands_on_mqtt_disconnect();
+    /* Only log + tear down if MQTT was actually running. Wi-Fi reconnect
+     * attempts before we ever got an IP also fire this event, and there's
+     * nothing to "stop" then — wifi_manager already logs the disconnect. */
+    if (mqtt_client_is_running()) {
+        ESP_LOGW(APP_TAG, "Wi-Fi disconnected — stopping MQTT");
+        mqtt_client_stop();
+        device_commands_on_mqtt_disconnect();
+    }
 }
 
 void app_main(void)
@@ -382,6 +413,14 @@ void app_main(void)
     }
     ESP_LOGI(APP_TAG, "Free heap after persistence: %lu", (unsigned long)esp_get_free_heap_size());
 
+    /* ── SD hot-plug monitor ──────────────────────────────────────── */
+    if (sd_available) {
+        esp_err_t mon_err = sdcard_start_monitor(2000, app_on_sd_state_change);
+        if (mon_err != ESP_OK) {
+            ESP_LOGW(APP_TAG, "SD monitor failed to start: %s", esp_err_to_name(mon_err));
+        }
+    }
+
     /* ── Hardware inventory ───────────────────────────────────────── */
     ESP_LOGI(APP_TAG, "BOOT: BME280=%s RTC=%s SD=%s LFS=%s DB=%s UART=%s",
              bme280_is_ready() ? "OK" : "ABSENT",
@@ -396,6 +435,7 @@ void app_main(void)
         .read_env               = bme280_get_sensor_read_fn(),
         .read_clock             = pcf2131tfy_rtc_get_clock_read_fn(),
         .set_status             = ambyte_status_get_set_fn(),
+        .sd_ready               = sd_available ? sdcard_is_mounted : NULL,
         .next_id            = persistence_available ? sqlite_persistence_get_next_id_fn()            : NULL,
         .store_event        = persistence_available ? sqlite_persistence_get_store_event_fn()        : NULL,
         .claim_next_event   = persistence_available ? sqlite_persistence_get_claim_next_event_fn()   : NULL,
