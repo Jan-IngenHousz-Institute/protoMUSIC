@@ -551,6 +551,33 @@ cmd_result_t cmd_uart_status(void)
     return make_result(ESP_OK, "%s", buf);
 }
 
+cmd_result_t cmd_uart_text_query(uint8_t channel, const char *cmd,
+                                 const char *terminator, uint32_t timeout_ms,
+                                 char *out_resp, size_t resp_cap, size_t *resp_len)
+{
+    if (!s_initialized || s_cfg.uart_text_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    if (channel >= UART_SENSOR_NUM_CHANNELS) {
+        return make_result(ESP_ERR_INVALID_ARG, "invalid channel %u", channel);
+    }
+    if (cmd == NULL || out_resp == NULL || resp_len == NULL || resp_cap < 2) {
+        return make_result(ESP_ERR_INVALID_ARG, "bad args");
+    }
+
+    esp_err_t err = s_cfg.uart_text_query(channel, cmd, terminator,
+                                          out_resp, resp_cap, resp_len, timeout_ms);
+    if (err == ESP_ERR_TIMEOUT) {
+        return make_result(ESP_ERR_TIMEOUT, "ch%u: no response within %ums",
+                           channel, (unsigned)timeout_ms);
+    }
+    if (err != ESP_OK) {
+        return make_result(err, "uart_text_query ch%u failed: %s",
+                           channel, esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "ch%u: %u bytes", channel, (unsigned)*resp_len);
+}
+
 /* ── Typed Ambit commands ────────────────────────────────────────── *
  *
  * Each function wraps one ambit-1 ESP binary command (see ambit_protocol.h

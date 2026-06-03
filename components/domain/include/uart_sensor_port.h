@@ -91,6 +91,21 @@ typedef esp_err_t (*uart_sensor_ping_fn)(uint8_t channel, bool *connected);
 typedef esp_err_t (*uart_sensor_status_fn)(uint8_t channel,
                                            uart_sensor_state_t *out);
 
+/* uart_sensor_text_query_fn — send an ASCII command line and read one reply line.
+ *
+ * Writes `cmd` followed by `terminator`, then accumulates incoming bytes until
+ * `terminator` is seen or `timeout_ms` elapses. The terminator is stripped from
+ * `out_resp` (NUL-terminated on return). On timeout *resp_len is 0 and the
+ * function returns ESP_ERR_TIMEOUT. No AMBIT wake handshake — this is for plain
+ * ASCII line devices, not the binary AMBIT protocol. */
+typedef esp_err_t (*uart_sensor_text_query_fn)(uint8_t channel,
+                                               const char *cmd,
+                                               const char *terminator,
+                                               char       *out_resp,
+                                               size_t      resp_cap,
+                                               size_t     *resp_len,
+                                               uint32_t    timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

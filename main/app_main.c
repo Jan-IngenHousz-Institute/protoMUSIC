@@ -620,6 +620,7 @@ void app_main(void)
         .uart_query             = uart_available ? uart_sensors_get_query_fn()  : NULL,
         .uart_ping              = uart_available ? uart_sensors_get_ping_fn()   : NULL,
         .uart_status            = uart_available ? uart_sensors_get_status_fn() : NULL,
+        .uart_text_query        = uart_available ? uart_sensors_get_text_query_fn() : NULL,
     };
     device_commands_init(&cmd_cfg);
     // device_commands_subscribe_inbound();

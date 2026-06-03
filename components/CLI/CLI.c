@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -369,6 +370,51 @@ static int cli_cmd_uart_status(int argc, char **argv)
     return (res.status == ESP_OK) ? 0 : 1;
 }
 
+/* uart_query <ch> <text> [timeout_ms]
+ *   Sends the ASCII line <text> (LF-terminated, single token) on channel <ch>,
+ *   then prints the reply line. timeout_ms is optional and defaults to 1000.
+ *   Only yields a reply from a device that speaks ASCII lines (not an AMBIT,
+ *   which uses the binary protocol). e.g.  uart_query 0 hello   /   uart_query 0 hello 3000 */
+static int cli_cmd_uart_query(int argc, char **argv)
+{
+    if (argc < 3 || argc > 4) {
+        printf("Usage: uart_query <ch> <text> [timeout_ms=1000]\r\n");
+        return 1;
+    }
+
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel must be 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+
+    const char *cmd = argv[2];
+
+    /* Optional trailing timeout; default 1 s. */
+    int timeout_ms = (argc == 4) ? atoi(argv[3]) : 1000;
+    if (timeout_ms <= 0) {
+        timeout_ms = 1000;
+    }
+
+    char   resp[256];
+    size_t resp_len = 0;
+    cmd_result_t res = cmd_uart_text_query((uint8_t)ch, cmd, "\n",
+                                           (uint32_t)timeout_ms,
+                                           resp, sizeof(resp), &resp_len);
+
+    if (res.status == ESP_ERR_TIMEOUT) {
+        printf("ch%d: timeout after %dms (no response)\r\n", ch, timeout_ms);
+        return 1;
+    }
+    if (res.status != ESP_OK) {
+        printf("ch%d: %s\r\n", ch, res.message);
+        return 1;
+    }
+    /* Just print the reply back. */
+    printf("%s\r\n", resp);
+    return 0;
+}
+
 static int cli_cmd_ambit_temp(int argc, char **argv)
 {
     if (argc != 2) {
@@ -550,6 +596,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "show connection state of all 4 UART sensor channels",
         .func    = cli_cmd_uart_status,
     };
+    static const esp_console_cmd_t uart_query_cmd = {
+        .command = "uart_query",
+        .help    = "uart_query <ch> <text> [timeout_ms=1000]  send ASCII line, print reply",
+        .func    = cli_cmd_uart_query,
+    };
     static const esp_console_cmd_t ambit_temp_cmd = {
         .command = "ambit_temp",
         .help    = "ambit_temp <0-3>  read leaf+chip temperature from AMBIT sensor",
@@ -622,6 +673,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&uart_status_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&uart_query_cmd);
     if (err != ESP_OK) {
         return err;
     }

@@ -70,6 +70,7 @@ typedef struct {
     uart_sensor_query_fn                uart_query;
     uart_sensor_ping_fn                 uart_ping;
     uart_sensor_status_fn               uart_status;
+    uart_sensor_text_query_fn           uart_text_query;   /* ASCII line query */
 } device_commands_config_t;
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);
@@ -106,6 +107,13 @@ cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
                             uint32_t timeout_ms);
 cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected);
 cmd_result_t cmd_uart_status(void);
+
+/* ASCII line query: send `cmd` + `terminator` on `channel`, read one reply
+ * line into `out_resp` (terminator stripped, NUL-terminated). Returns
+ * ESP_ERR_TIMEOUT if no line arrives within timeout_ms. */
+cmd_result_t cmd_uart_text_query(uint8_t channel, const char *cmd,
+                                 const char *terminator, uint32_t timeout_ms,
+                                 char *out_resp, size_t resp_cap, size_t *resp_len);
 
 /* Ambit sensor commands — typed wrappers (Phase 7) */
 

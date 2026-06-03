@@ -539,6 +539,72 @@ static esp_err_t do_status(uint8_t channel, uart_sensor_state_t *out)
     return ESP_OK;
 }
 
+/* ── ASCII line query (plain text, no AMBIT handshake) ─────────────── */
+
+static esp_err_t do_text_query(uint8_t channel, const char *cmd, const char *terminator,
+                               char *out, size_t out_cap, size_t *out_len,
+                               uint32_t timeout_ms)
+{
+    if (!s_inited || channel >= UART_SENSOR_NUM_CHANNELS) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (cmd == NULL || out == NULL || out_cap < 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (terminator == NULL || terminator[0] == '\0') {
+        terminator = "\n";
+    }
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+    out[0] = '\0';
+
+    esp_err_t err = channel_acquire(channel, pdMS_TO_TICKS(timeout_ms));
+    if (err != ESP_OK) {
+        return err;
+    }
+    uart_port_t port = s_ch[channel].uart_num;
+
+    /* Send the command line. */
+    uart_flush_input(port);
+    size_t cmd_len = strlen(cmd);
+    if (cmd_len > 0) {
+        uart_write_bytes(port, cmd, cmd_len);
+    }
+    uart_write_bytes(port, terminator, strlen(terminator));
+
+    /* Read until the terminator appears or the deadline passes. */
+    const size_t term_len = strlen(terminator);
+    const int64_t deadline = now_us() + (int64_t)timeout_ms * 1000;
+    size_t n = 0;
+    err = ESP_ERR_TIMEOUT;
+    while (!deadline_reached(deadline) && n < out_cap - 1) {
+        uint8_t b;
+        int64_t remain = deadline - now_us();
+        TickType_t ticks = pdMS_TO_TICKS(remain > 0 ? (uint32_t)(remain / 1000) : 1);
+        if (ticks == 0) {
+            ticks = 1;
+        }
+        int r = uart_read_bytes(port, &b, 1, ticks);
+        if (r == 1) {
+            out[n++] = (char)b;
+            if (n >= term_len && memcmp(out + n - term_len, terminator, term_len) == 0) {
+                n -= term_len;          /* strip the terminator */
+                err = ESP_OK;
+                break;
+            }
+        }
+    }
+    out[n] = '\0';
+    if (out_len != NULL) {
+        *out_len = n;
+    }
+
+    s_ch[channel].state = (err == ESP_OK) ? UART_SENSOR_CONNECTED : UART_SENSOR_DISCONNECTED;
+    channel_release(channel);
+    return err;
+}
+
 /* ── Init ──────────────────────────────────────────────────────────── */
 
 esp_err_t uart_sensors_init(void)
@@ -609,3 +675,4 @@ esp_err_t uart_sensors_init(void)
 uart_sensor_query_fn  uart_sensors_get_query_fn(void)  { return do_query;  }
 uart_sensor_ping_fn   uart_sensors_get_ping_fn(void)   { return do_ping;   }
 uart_sensor_status_fn uart_sensors_get_status_fn(void)  { return do_status; }
+uart_sensor_text_query_fn uart_sensors_get_text_query_fn(void) { return do_text_query; }
