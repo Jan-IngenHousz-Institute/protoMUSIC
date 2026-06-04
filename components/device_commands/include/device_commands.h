@@ -22,8 +22,6 @@ typedef struct {
     char message[256];
 } cmd_result_t;
 
-typedef bool (*certs_status_fn)(void);
-
 typedef struct {
     /* Sensing ports */
     sensor_read_fn              read_env;
@@ -48,15 +46,9 @@ typedef struct {
     message_is_connected_fn             message_is_connected;
     message_set_publish_ack_handler_fn  set_publish_ack_handler;
 
-    /* Inbound subscribe port (Phase 6B) */
-    message_subscribe_fn                subscribe;
-
     /* Topic config (Phase 6A) */
     const char                         *topic_root;
     const char                         *device_id;
-
-    /* Cert status (Phase 6C) */
-    certs_status_fn                     certs_status;
 
     /* Payload metadata (provisioned via BLE) */
     const char                         *protocol_id;
@@ -122,15 +114,10 @@ cmd_result_t cmd_uart_stream_query(uint8_t channel, const char *cmd,
 cmd_result_t cmd_next_measure_id(int64_t *out_id);
 
 /* MQTT commands (Phase 6A) */
-cmd_result_t cmd_mqtt_publish(const char *topic, const char *payload);
-cmd_result_t cmd_mqtt_publish_raw(const char *payload);
 /* Publish the next pending event as one MQTT message (one measure_id = one
  * message; used by the sync_runner). */
 cmd_result_t cmd_mqtt_publish_next_event(void);
 cmd_result_t cmd_mqtt_status(void);
-
-/* Cert status (Phase 6C) */
-cmd_result_t cmd_cert_status(void);
 
 /* UART sensor commands — raw (Phase 7) */
 cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
@@ -198,16 +185,6 @@ cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t 
 
 /* Call from the Wi-Fi disconnect event handler to clear any in-flight publish slot */
 void device_commands_on_mqtt_disconnect(void);
-
-/* Parse a JSON command object and dispatch to the appropriate cmd_* function.
- * Expected wire format: {"cmd": "<name>", ...params...}
- * Returns the result of the dispatched command, or an error result on parse failure. */
-cmd_result_t cmd_dispatch_json(const char *json, size_t len);
-
-/* Subscribe to the inbound command topic (<root>/<device_id>/cmd) using the
- * registered subscribe port. Safe to call before MQTT connects; the mqtt_client
- * subscription table re-subscribes automatically on each reconnect. */
-void device_commands_subscribe_inbound(void);
 
 #ifdef __cplusplus
 }

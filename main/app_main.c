@@ -444,10 +444,8 @@ void app_main(void)
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),
-        .subscribe              = mqtt_client_get_subscribe_fn(),
         .topic_root             = topic_root,
         .device_id              = device_id,
-        .certs_status           = certs_are_provisioned,
         .protocol_id            = protocol_id,
         .device_name            = device_name,
         .device_version         = device_version,
@@ -460,7 +458,6 @@ void app_main(void)
         .uart_stream_query      = uart_available ? uart_sensors_get_stream_query_fn(): NULL,
     };
     device_commands_init(&cmd_cfg);
-    // device_commands_subscribe_inbound();
 
     /* ── Background MQTT sync (publishes PENDING measurements every 10s) ── */
     if (persistence_available) {

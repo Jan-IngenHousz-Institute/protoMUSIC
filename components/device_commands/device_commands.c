@@ -381,43 +381,6 @@ cmd_result_t cmd_mqtt_status(void)
     return make_result(ESP_OK, "MQTT: %s", connected ? "connected" : "disconnected");
 }
 
-cmd_result_t cmd_mqtt_publish(const char *topic, const char *payload)
-{
-    if (!s_initialized || s_cfg.publish == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not available");
-    }
-    if (topic == NULL || payload == NULL) {
-        return make_result(ESP_ERR_INVALID_ARG, "topic and payload required");
-    }
-    int msg_id = 0;
-    esp_err_t err = s_cfg.publish(topic, payload, strlen(payload), &msg_id);
-    if (err != ESP_OK) {
-        return make_result(err, "publish failed: %s", esp_err_to_name(err));
-    }
-    return make_result(ESP_OK, "published (msg_id=%d)", msg_id);
-}
-
-cmd_result_t cmd_mqtt_publish_raw(const char *payload)
-{
-    if (!s_initialized || s_cfg.publish == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not available");
-    }
-    if (payload == NULL) {
-        return make_result(ESP_ERR_INVALID_ARG, "payload required");
-    }
-    char topic[256];
-    snprintf(topic, sizeof(topic), "%s",
-             s_cfg.topic_root ? s_cfg.topic_root : "");
-    ESP_LOGI(TAG, "mqtt_pub → topic: %s", topic);
-    ESP_LOGI(TAG, "mqtt_pub → payload: %s", payload);
-    int msg_id = 0;
-    esp_err_t err = s_cfg.publish(topic, payload, strlen(payload), &msg_id);
-    if (err != ESP_OK) {
-        return make_result(err, "publish failed: %s", esp_err_to_name(err));
-    }
-    return make_result(ESP_OK, "published to %s (msg_id=%d)", topic, msg_id);
-}
-
 /* ── Event store + publish (one row/event; one message per measure_id) ── */
 
 cmd_result_t cmd_store_event(int64_t measure_id, const char *device, const char *sensor,
@@ -607,15 +570,6 @@ void device_commands_measurement_end(void)
     if (s_measurement_active > 0) s_measurement_active--;
 }
 bool device_commands_measurement_active(void) { return s_measurement_active > 0; }
-
-cmd_result_t cmd_cert_status(void)
-{
-    if (!s_initialized || s_cfg.certs_status == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "cert status not available");
-    }
-    bool ok = s_cfg.certs_status();
-    return make_result(ESP_OK, "certs: %s", ok ? "provisioned" : "not provisioned");
-}
 
 /* ── UART sensor commands — raw interface (Phase 7) ─────────────── */
 
@@ -1130,119 +1084,3 @@ cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t 
     return ambit_action(ch, cmd, metadata, len, 5000);
 }
 
-/* ── inbound command dispatch ────────────────────────────────────── */
-
-cmd_result_t cmd_dispatch_json(const char *json, size_t len)
-{
-    (void)len;
-    cmd_result_t res = make_result(ESP_ERR_INVALID_ARG, "no command executed");
-
-    cJSON *root = cJSON_Parse(json);
-    if (root == NULL) {
-        return make_result(ESP_ERR_INVALID_ARG, "JSON parse error");
-    }
-
-    cJSON *cmd_field = cJSON_GetObjectItemCaseSensitive(root, "cmd");
-    if (!cJSON_IsString(cmd_field) || cmd_field->valuestring == NULL) {
-        res = make_result(ESP_ERR_INVALID_ARG, "missing or invalid 'cmd' field");
-        goto done;
-    }
-
-    {
-        const char *cmd = cmd_field->valuestring;
-
-        if (strcmp(cmd, "set_rgb") == 0) {
-            cJSON *r = cJSON_GetObjectItemCaseSensitive(root, "r");
-            cJSON *g = cJSON_GetObjectItemCaseSensitive(root, "g");
-            cJSON *b = cJSON_GetObjectItemCaseSensitive(root, "b");
-            if (!cJSON_IsNumber(r) || !cJSON_IsNumber(g) || !cJSON_IsNumber(b)) {
-                res = make_result(ESP_ERR_INVALID_ARG, "set_rgb requires r,g,b");
-            } else {
-                res = cmd_set_rgb((uint8_t)r->valueint,
-                                  (uint8_t)g->valueint,
-                                  (uint8_t)b->valueint);
-            }
-
-        } else if (strcmp(cmd, "read_env") == 0) {
-            float t = 0, h = 0, p = 0;
-            res = cmd_read_env(&t, &h, &p);
-
-        } else if (strcmp(cmd, "status") == 0) {
-            bool bme = false, rtc = false;
-            time_t ts = 0;
-            res = cmd_device_status(&bme, &rtc, &ts);
-
-        } else if (strcmp(cmd, "publish_next_batch") == 0 ||
-                   strcmp(cmd, "publish_next_event") == 0) {
-            res = cmd_mqtt_publish_next_event();
-
-        } else if (strcmp(cmd, "mqtt_status") == 0) {
-            res = cmd_mqtt_status();
-
-        } else if (strcmp(cmd, "cert_status") == 0) {
-            res = cmd_cert_status();
-
-        } else if (strcmp(cmd, "sleep_ms") == 0) {
-            cJSON *ms_field = cJSON_GetObjectItemCaseSensitive(root, "ms");
-            if (!cJSON_IsNumber(ms_field)) {
-                res = make_result(ESP_ERR_INVALID_ARG, "sleep_ms requires 'ms'");
-            } else {
-                res = cmd_sleep_ms((uint32_t)ms_field->valueint);
-            }
-
-        } else if (strcmp(cmd, "log") == 0) {
-            cJSON *msg_field = cJSON_GetObjectItemCaseSensitive(root, "msg");
-            if (!cJSON_IsString(msg_field) || msg_field->valuestring == NULL) {
-                res = make_result(ESP_ERR_INVALID_ARG, "log requires 'msg'");
-            } else {
-                res = cmd_log(msg_field->valuestring);
-            }
-
-        } else if (strcmp(cmd, "uart_ping") == 0) {
-            cJSON *ch_field = cJSON_GetObjectItemCaseSensitive(root, "channel");
-            if (!cJSON_IsNumber(ch_field)) {
-                res = make_result(ESP_ERR_INVALID_ARG, "uart_ping requires 'channel'");
-            } else {
-                bool conn = false;
-                res = cmd_uart_ping((uint8_t)ch_field->valueint, &conn);
-            }
-
-        } else if (strcmp(cmd, "uart_status") == 0) {
-            res = cmd_uart_status();
-
-        } else {
-            res = make_result(ESP_ERR_INVALID_ARG, "unknown command: %.63s", cmd);
-        }
-    }
-
-done:
-    cJSON_Delete(root);
-    return res;
-}
-
-static void on_inbound_command(const char *topic, const char *payload, size_t len)
-{
-    (void)topic;
-    cmd_result_t res = cmd_dispatch_json(payload, len);
-    ESP_LOGI(TAG, "inbound cmd: %s", res.message);
-}
-
-void device_commands_subscribe_inbound(void)
-{
-    if (!s_initialized || s_cfg.subscribe == NULL) {
-        ESP_LOGW(TAG, "subscribe port not available — skipping inbound command topic");
-        return;
-    }
-
-    char topic[MQTT_TOPIC_MAX];
-    snprintf(topic, sizeof(topic), "%s/%s/cmd",
-             s_cfg.topic_root ? s_cfg.topic_root : "",
-             s_cfg.device_id  ? s_cfg.device_id  : "");
-
-    esp_err_t err = s_cfg.subscribe(topic, on_inbound_command);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "subscribe failed: %s", esp_err_to_name(err));
-    } else {
-        ESP_LOGI(TAG, "subscribed to inbound command topic: %s", topic);
-    }
-}

@@ -154,91 +154,6 @@ static int cli_cmd_read_env(int argc, char **argv)
     return 0;
 }
 
-static int cli_cmd_cert_status(int argc, char **argv)
-{
-    (void)argv;
-    if (argc != 1) {
-        printf("Usage: cert_status\r\n");
-        return 1;
-    }
-
-    cmd_result_t res = cmd_cert_status();
-    printf("%s\r\n", res.message);
-    return (res.status == ESP_OK) ? 0 : 1;
-}
-
-static int cli_cmd_test_t52(int argc, char **argv)
-{
-    (void)argc; (void)argv;
-
-    /* PASS = function returned at all (no crash/panic).
-     * Both ESP_OK (port available, succeeded) and any error (port unavailable or
-     * MQTT disconnected) are graceful outcomes. Only a panic is a hard FAIL,
-     * which would prevent reaching the result line below. */
-#define T52_CHECK(label, call) do { \
-    cmd_result_t _r = (call); \
-    const char *_tag = (_r.status == ESP_OK)               ? "OK  " : \
-                       (_r.status == ESP_ERR_NOT_SUPPORTED) ? "N/A " : \
-                       (_r.status == ESP_ERR_INVALID_STATE) ? "DIS " : "ERR "; \
-    printf("[T5.2] %-42s PASS [%s] %s\r\n", label, _tag, _r.message); \
-    pass++; total++; \
-} while (0)
-
-    int pass = 0, total = 0;
-
-    /* ── MQTT port guards ──────────────────────────────────────────── */
-    T52_CHECK("cmd_mqtt_status",
-              cmd_mqtt_status());
-    T52_CHECK("cmd_mqtt_publish",
-              cmd_mqtt_publish("test/topic", "test"));
-    T52_CHECK("cmd_mqtt_publish_raw",
-              cmd_mqtt_publish_raw("test"));
-    T52_CHECK("cmd_mqtt_publish_next_event",
-              cmd_mqtt_publish_next_event());
-    T52_CHECK("cmd_cert_status",
-              cmd_cert_status());
-
-    /* ── Persistence port guards (event-document model) ────────────── */
-    T52_CHECK("cmd_store_event",
-              cmd_store_event(999999LL, "", "test", 1, 1, NULL,
-                              "{\"temperature\":1.0}"));
-
-    int64_t nid = 0;
-    T52_CHECK("cmd_next_measure_id",
-              cmd_next_measure_id(&nid));
-
-#undef T52_CHECK
-
-    /* If we reached here, all calls returned — no crash. */
-    printf("[T5.2] Result: %d/%d returned gracefully (no panic)\r\n", pass, total);
-    printf("[T5.2] Tags: OK=succeeded  N/A=port NULL  DIS=MQTT disconnected  ERR=other error\r\n");
-    return 0;
-}
-
-static int cli_cmd_mqtt_pub(int argc, char **argv)
-{
-    if (argc < 2) {
-        printf("Usage: mqtt_pub <payload>\r\n");
-        return 1;
-    }
-
-    /* Rejoin all tokens — allows JSON with spaces without requiring quotes */
-    static char s_payload[480];
-    int pos = 0;
-    for (int i = 1; i < argc && pos < (int)sizeof(s_payload) - 1; i++) {
-        if (i > 1 && pos < (int)sizeof(s_payload) - 2) {
-            s_payload[pos++] = ' ';
-        }
-        int n = snprintf(s_payload + pos, sizeof(s_payload) - (size_t)pos, "%s", argv[i]);
-        if (n > 0) pos += n;
-    }
-    s_payload[pos] = '\0';
-
-    cmd_result_t res = cmd_mqtt_publish_raw(s_payload);
-    printf("%s\r\n", res.message);
-    return (res.status == ESP_OK) ? 0 : 1;
-}
-
 static int cli_cmd_i2cscan(int argc, char **argv)
 {
     (void)argv;
@@ -597,21 +512,6 @@ static esp_err_t cli_register_commands(void)
         .help = "scan the shared I2C bus for responding 7-bit addresses",
         .func = cli_cmd_i2cscan,
     };
-    static const esp_console_cmd_t cert_status_cmd = {
-        .command = "cert_status",
-        .help = "print whether TLS certificates have been provisioned",
-        .func = cli_cmd_cert_status,
-    };
-    static const esp_console_cmd_t mqtt_pub_cmd = {
-        .command = "mqtt_pub",
-        .help = "mqtt_pub <payload>  publish string to <topic_root>/<device_id>/cli",
-        .func = cli_cmd_mqtt_pub,
-    };
-    static const esp_console_cmd_t test_t52_cmd = {
-        .command = "test_t52",
-        .help = "T5.2: verify all port-guarded cmd_* return gracefully when ports are unavailable",
-        .func = cli_cmd_test_t52,
-    };
     static const esp_console_cmd_t ping_uart_cmd = {
         .command = "ping_uart",
         .help    = "ping_uart <0-3>  check if AMBIT sensor on channel is connected",
@@ -684,21 +584,6 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&i2cscan_cmd);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = esp_console_cmd_register(&cert_status_cmd);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = esp_console_cmd_register(&mqtt_pub_cmd);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = esp_console_cmd_register(&test_t52_cmd);
     if (err != ESP_OK) {
         return err;
     }

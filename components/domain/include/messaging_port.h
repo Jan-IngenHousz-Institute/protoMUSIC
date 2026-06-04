@@ -17,10 +17,6 @@ typedef void      (*message_publish_ack_fn)(int msg_id, esp_err_t status, void *
 typedef esp_err_t (*message_set_publish_ack_handler_fn)(message_publish_ack_fn handler,
                                                          void *ctx);
 
-/* Phase 6B: inbound subscribe support */
-typedef void      (*message_handler_fn)(const char *topic, const char *payload, size_t len);
-typedef esp_err_t (*message_subscribe_fn)(const char *topic, message_handler_fn handler);
-
 #ifdef __cplusplus
 }
 #endif
