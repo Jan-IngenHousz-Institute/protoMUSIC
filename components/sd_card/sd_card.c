@@ -218,7 +218,11 @@ bool sdcard_is_mounted(void)
 
 static TaskHandle_t      s_monitor_task = NULL;
 static sdcard_state_cb_t s_state_cb     = NULL;
-static uint32_t          s_monitor_period_ms = 2000;
+static uint32_t          s_monitor_period_ms = 2000;   /* removal-detection probe (card in) */
+
+/* While the card is OUT, only retry remounting this often. Probing a missing
+ * card more frequently gains nothing and just burns a failed init cycle. */
+#define SD_MONITOR_OUT_RETRY_MS  (5 * 60 * 1000)        /* 5 minutes */
 
 /* One probe step: try to detect a state transition. Returns the new mounted
  * state (or current state if no change). Takes the lock briefly. */
@@ -276,7 +280,9 @@ static void sdcard_monitor_task(void *arg)
             }
             last = now;
         }
-        vTaskDelay(pdMS_TO_TICKS(s_monitor_period_ms));
+        /* Card in → probe quickly so a pulled card is caught (and the script
+         * stopped) within seconds. Card out → retry remount every few minutes. */
+        vTaskDelay(pdMS_TO_TICKS(now ? s_monitor_period_ms : SD_MONITOR_OUT_RETRY_MS));
     }
 }
 
@@ -289,11 +295,12 @@ esp_err_t sdcard_start_monitor(uint32_t period_ms, sdcard_state_cb_t cb)
     s_monitor_period_ms = period_ms;
     s_state_cb          = cb;
 
-    /* Silence the ESP-IDF SDMMC layers' ERROR-level "no card" spam — those
-     * fire every poll while the card is out. Boot-time errors already logged
-     * before we get here. WARN/INFO from these tags is still visible. */
-    esp_log_level_set("sdmmc_common",   ESP_LOG_WARN);
-    esp_log_level_set("vfs_fat_sdmmc",  ESP_LOG_WARN);
+    /* Fully silence the ESP-IDF SDMMC layers — they log the failed card-init at
+     * ERROR level on every remount retry while the card is out, which WARN does
+     * not suppress. The sd_card component reports mount state through its own
+     * logs, so we lose no useful visibility. */
+    esp_log_level_set("sdmmc_common",   ESP_LOG_NONE);
+    esp_log_level_set("vfs_fat_sdmmc",  ESP_LOG_NONE);
 
     /* 12 KB stack: the remount path goes through esp_vfs_fat_sdmmc_mount +
      * FATFS, and the cb fans out to sqlite_persistence_on_sd_restored() which

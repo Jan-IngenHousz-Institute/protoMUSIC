@@ -24,7 +24,12 @@
 #define LUA_RUNNER_TAG "lua_runner"
 #define LUA_RUNNER_TASK_NAME "lua_runner"
 #define LUA_RUNNER_TASK_STACK 8192
-#define LUA_RUNNER_TASK_PRIORITY 5
+/* Measurement + local storage runs above all application comms tasks so a
+ * scheduled measurement fires promptly and its SQLite write is prioritised over
+ * MQTT publishing (esp-mqtt task = 5, sync_runner = 3). Kept WELL below the
+ * network stack — LwIP TCP/IP (18) and Wi-Fi (~23) must stay higher or the
+ * radio link breaks; those tasks are bursty/idle so they don't slow us. */
+#define LUA_RUNNER_TASK_PRIORITY 10
 #define LUA_QUERY_MAX_RECORDS 64
 #define LUA_SCRIPT_PATH "/sdcard/main.lua"
 
@@ -1339,7 +1344,15 @@ static void lua_runner_task(void *arg)
     }
 
     if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
-        log_lua_error(L, "lua_pcall failed");
+        if (s_should_stop) {
+            /* Deliberate stop (e.g. SD card removed) — the script was unwound on
+             * purpose via the stop hook / interruptible sleep. Not a failure. */
+            const char *msg = lua_tostring(L, -1);
+            ESP_LOGI(LUA_RUNNER_TAG, "script stopped: %s", msg ? msg : "stop requested");
+            lua_pop(L, 1);
+        } else {
+            log_lua_error(L, "lua_pcall failed");
+        }
     }
 
     ESP_LOGI(LUA_RUNNER_TAG, "Script finished, stack high water: %lu",
