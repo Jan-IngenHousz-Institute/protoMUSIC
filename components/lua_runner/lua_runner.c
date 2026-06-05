@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 
 #include "device_commands.h"
+#include "time_sync.h"
 #include "lauxlib.h"
 #include "lua.h"
 #include "lualib.h"
@@ -1135,6 +1136,162 @@ static void lua_register_ambit_module(lua_State *L)
     lua_setglobal(L, "ambit");
 }
 
+/* ── sync.* bindings (RTC-based scheduling; see components/time_sync) ──── */
+
+/* current RTC time as local Unix seconds; 0 if the RTC is unavailable */
+static int64_t sync_now(void)
+{
+    time_t t = 0;
+    cmd_read_rtc(&t);
+    return (int64_t)t;
+}
+
+/* sync.until_interval(period_s [, phase_s]) -> seconds */
+static int l_sync_until_interval(lua_State *L)
+{
+    int64_t period = (int64_t)luaL_checkinteger(L, 1);
+    int64_t phase  = (int64_t)luaL_optinteger(L, 2, 0);
+    int64_t s = time_sync_until_interval(sync_now(), period, phase);
+    if (s < 0) return lua_push_nil_reason(L, "period must be > 0");
+    lua_pushinteger(L, (lua_Integer)s);
+    return 1;
+}
+
+/* sync.until_clock(hour, min [, sec]) -> seconds */
+static int l_sync_until_clock(lua_State *L)
+{
+    int hour = (int)luaL_checkinteger(L, 1);
+    int min  = (int)luaL_checkinteger(L, 2);
+    int sec  = (int)luaL_optinteger(L, 3, 0);
+    lua_pushinteger(L, (lua_Integer)time_sync_until_clock(sync_now(), hour, min, sec));
+    return 1;
+}
+
+/* days table -> mask (accepts "mon"/"tue"… or 1=Sun..7=Sat); 0 on bad input */
+static uint8_t sync_days_mask(lua_State *L, int idx)
+{
+    uint8_t mask = 0;
+    if (!lua_istable(L, idx)) return 0;
+    lua_Integer n = luaL_len(L, idx);
+    for (lua_Integer i = 1; i <= n; i++) {
+        lua_rawgeti(L, idx, (int)i);
+        if (lua_isstring(L, -1)) {
+            int b = time_sync_day_bit(lua_tostring(L, -1));
+            if (b >= 0) mask |= (uint8_t)(1u << b);
+        } else if (lua_isinteger(L, -1)) {
+            lua_Integer d = lua_tointeger(L, -1);     /* 1=Sun..7=Sat */
+            if (d >= 1 && d <= 7) mask |= (uint8_t)(1u << (d - 1));
+        }
+        lua_pop(L, 1);
+    }
+    return mask;
+}
+
+/* sync.until_weekly(days, hour, min) -> seconds */
+static int l_sync_until_weekly(lua_State *L)
+{
+    uint8_t mask = sync_days_mask(L, 1);
+    int hour = (int)luaL_checkinteger(L, 2);
+    int min  = (int)luaL_checkinteger(L, 3);
+    int64_t s = time_sync_until_weekly(sync_now(), mask, hour, min);
+    if (s < 0) return lua_push_nil_reason(L, "no valid weekdays");
+    lua_pushinteger(L, (lua_Integer)s);
+    return 1;
+}
+
+/* sync.until_sun("sunrise"|"sunset", offset_s) -> seconds */
+static int l_sync_until_sun(lua_State *L)
+{
+    const char *ev = luaL_checkstring(L, 1);
+    int64_t offset = (int64_t)luaL_optinteger(L, 2, 0);
+    int event = (strcasecmp(ev, "sunset") == 0) ? TIME_SYNC_SUNSET : TIME_SYNC_SUNRISE;
+    int64_t s = time_sync_until_sun(sync_now(), event, offset);
+    if (s < 0) return lua_push_nil_reason(L, "no sun event (polar?)");
+    lua_pushinteger(L, (lua_Integer)s);
+    return 1;
+}
+
+/* sync.sun_today() -> sunrise_str, sunset_str  ("HH:MM" RTC, or "--:--") */
+static int l_sync_sun_today(lua_State *L)
+{
+    int64_t now = sync_now();
+    char sr[8], ss[8];
+    int64_t u;
+    int h, m;
+    if (time_sync_sun_on_date(now, TIME_SYNC_SUNRISE, &u) == ESP_OK) {
+        time_sync_localtime(u, NULL, NULL, NULL, &h, &m, NULL, NULL);
+        snprintf(sr, sizeof(sr), "%02d:%02d", h, m);
+    } else { snprintf(sr, sizeof(sr), "--:--"); }
+    if (time_sync_sun_on_date(now, TIME_SYNC_SUNSET, &u) == ESP_OK) {
+        time_sync_localtime(u, NULL, NULL, NULL, &h, &m, NULL, NULL);
+        snprintf(ss, sizeof(ss), "%02d:%02d", h, m);
+    } else { snprintf(ss, sizeof(ss), "--:--"); }
+    lua_pushstring(L, sr);
+    lua_pushstring(L, ss);
+    return 2;
+}
+
+/* sync.set_location(lat, lon [, tz_hours]) */
+static int l_sync_set_location(lua_State *L)
+{
+    double lat = luaL_checknumber(L, 1);
+    double lon = luaL_checknumber(L, 2);
+    int tz_cur;
+    time_sync_get_location(NULL, NULL, &tz_cur);
+    int tz = (int)luaL_optinteger(L, 3, tz_cur);
+    time_sync_set_location(lat, lon, tz);
+    return 0;
+}
+
+/* sync.location() -> {lat=, lon=, tz=} */
+static int l_sync_location(lua_State *L)
+{
+    double lat, lon; int tz;
+    time_sync_get_location(&lat, &lon, &tz);
+    lua_newtable(L);
+    lua_pushnumber(L, lat); lua_setfield(L, -2, "lat");
+    lua_pushnumber(L, lon); lua_setfield(L, -2, "lon");
+    lua_pushinteger(L, tz); lua_setfield(L, -2, "tz");
+    return 1;
+}
+
+/* sync.wait(seconds) — block until elapsed, polling the hardware RTC in 30 s
+ * chunks (drift-free + interruptible by lua_runner_stop). */
+static int l_sync_wait(lua_State *L)
+{
+    lua_Integer seconds = luaL_checkinteger(L, 1);
+    if (seconds < 0) return luaL_error(L, "seconds must be >= 0");
+    int64_t target = sync_now() + (int64_t)seconds;
+    while (true) {
+        if (s_should_stop) {
+            return luaL_error(L, "lua_runner: stop signaled during sync.wait");
+        }
+        int64_t remaining = target - sync_now();
+        if (remaining <= 0) break;
+        uint32_t step = (remaining < 30) ? (uint32_t)remaining : 30;
+        cmd_sleep_ms(step * 1000);
+    }
+    return 0;
+}
+
+static void lua_register_sync_module(lua_State *L)
+{
+    static const luaL_Reg sync_api[] = {
+        {"until_interval", l_sync_until_interval},
+        {"until_clock",    l_sync_until_clock},
+        {"until_weekly",   l_sync_until_weekly},
+        {"until_sun",      l_sync_until_sun},
+        {"sun_today",      l_sync_sun_today},
+        {"set_location",   l_sync_set_location},
+        {"location",       l_sync_location},
+        {"wait",           l_sync_wait},
+        {NULL, NULL},
+    };
+
+    luaL_newlib(L, sync_api);
+    lua_setglobal(L, "sync");
+}
+
 /* ── task ────────────────────────────────────────────────────────────── */
 
 static void log_lua_error(lua_State *L, const char *phase)
@@ -1169,6 +1326,7 @@ static void lua_runner_task(void *arg)
     lua_register_db_module(L);
     lua_register_mqtt_module(L);
     lua_register_ambit_module(L);
+    lua_register_sync_module(L);
 
     /* Fire the stop-check every 1000 Lua bytecode instructions — cheap and
      * gives prompt unwinding without measurable interpreter slowdown. */

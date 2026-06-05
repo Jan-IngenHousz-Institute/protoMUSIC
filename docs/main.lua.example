@@ -13,10 +13,16 @@
 -- channel). Pinging first matters — running blind on an empty channel would
 -- block for the whole run timeout.
 --
+-- Timing is RTC-synchronised via the built-in `sync` module (components/time_sync).
+-- See the scheduling block at the bottom for the options.
+--
 -- Copy this file to the SD card root as `main.lua` (firmware loads
 -- /sdcard/main.lua at boot — see components/lua_runner).
 
-local PERIOD_MS    = 30000   -- delay between rounds
+-- `sync` is a built-in firmware module. Override location/timezone if needed
+-- (defaults: 52.173, 5.819, tz +2 = NL/CEST; tz = hours the RTC is ahead of UTC):
+-- sync.set_location(52.173, 5.819, 2)
+
 local NUM_CHANNELS = 4       -- AMBIT UART channels 0..3
 
 local trace = {
@@ -25,12 +31,8 @@ local trace = {
     { pulses = 10, freq = 10, actinic = 0   },
 }
 
-device.log("ambit loop: 3-segment trace on every AMBIT every 30s")
-
--- No SD-state check needed in the script: the firmware stops this task on
--- card removal and restarts it on reinsertion. (device.sd_ready() is still
--- available if you want to gate something on it from Lua.)
-while true do
+-- One measurement round across every connected AMBIT.
+local function measure()
     local ran = 0
     for ch = 0, NUM_CHANNELS - 1 do
         if device.uart_ping(ch) then
@@ -44,10 +46,26 @@ while true do
             end
         end
     end
-    if ran == 0 then
-        device.log("no AMBIT responded on any channel")
-    end
-    device.sleep_ms(PERIOD_MS)
+    if ran == 0 then device.log("no AMBIT responded on any channel") end
+end
+
+do
+    local sr, ss = sync.sun_today()
+    device.log(string.format("ambit loop started; today sunrise=%s sunset=%s (RTC time)", sr, ss))
+end
+
+-- ── Scheduling: pick ONE trigger inside the loop ────────────────────────
+-- The firmware stops this task on SD removal and restarts it on reinsertion,
+-- so no sd_ready() check is needed here.
+while true do
+    sync.wait(sync.until_interval(600))              -- every 10 min, on :00/:10/:20…
+    -- sync.wait(sync.until_interval(1800))          -- every half hour, on :00/:30
+    -- sync.wait(sync.until_clock(8, 0))             -- daily at 08:00
+    -- sync.wait(sync.until_weekly({"mon","tue"}, 8, 0)) -- Mon & Tue at 08:00
+    -- sync.wait(sync.until_sun("sunset", -30 * 60)) -- 30 min before sunset
+    -- sync.wait(sync.until_sun("sunrise", 15 * 60)) -- 15 min after sunrise
+
+    measure()
 end
 
 

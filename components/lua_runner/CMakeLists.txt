@@ -12,6 +12,7 @@ if (HAVE_LOCAL_LUA)
             "include"
         REQUIRES
             device_commands
+            time_sync
             json
             lua
     )
@@ -36,6 +37,7 @@ else()
             "include"
         REQUIRES
             device_commands
+            time_sync
             json
     )
 

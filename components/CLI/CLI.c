@@ -14,6 +14,7 @@
 
 #include "ambit_protocol.h"
 #include "device_commands.h"
+#include "time_sync.h"
 #include "i2c_bus.h"
 #include "wifi_manager.h"
 
@@ -481,6 +482,85 @@ static int cli_cmd_reboot(int argc, char **argv)
     return 0; /* not reached */
 }
 
+/* sync [sun | loc <lat> <lon> [tz] | interval <s> [phase] | clock <hh> <mm> |
+ *       weekly <d,d,…> <hh> <mm> | sunrise|sunset [offset_s]]
+ * Computes scheduling triggers against the RTC (see components/time_sync). */
+static int cli_cmd_sync(int argc, char **argv)
+{
+    time_t now_t = 0;
+    cmd_read_rtc(&now_t);
+    const int64_t now = (int64_t)now_t;
+
+    const char *sub = (argc >= 2) ? argv[1] : "sun";
+
+    if (strcmp(sub, "sun") == 0) {
+        int y, mo, d, h, mi, s, wd;
+        time_sync_localtime(now, &y, &mo, &d, &h, &mi, &s, &wd);
+        double lat, lon; int tz;
+        time_sync_get_location(&lat, &lon, &tz);
+        char srs[8] = "--:--", sss[8] = "--:--";
+        int64_t u; int hh, mm;
+        if (time_sync_sun_on_date(now, TIME_SYNC_SUNRISE, &u) == ESP_OK) {
+            time_sync_localtime(u, NULL, NULL, NULL, &hh, &mm, NULL, NULL);
+            snprintf(srs, sizeof(srs), "%02d:%02d", hh, mm);
+        }
+        if (time_sync_sun_on_date(now, TIME_SYNC_SUNSET, &u) == ESP_OK) {
+            time_sync_localtime(u, NULL, NULL, NULL, &hh, &mm, NULL, NULL);
+            snprintf(sss, sizeof(sss), "%02d:%02d", hh, mm);
+        }
+        printf("RTC now: %04d-%02d-%02d %02d:%02d:%02d (wday %d)\r\n", y, mo, d, h, mi, s, wd);
+        printf("loc: lat=%.4f lon=%.4f tz=%+d\r\n", lat, lon, tz);
+        printf("sunrise %s  sunset %s  (RTC time)\r\n", srs, sss);
+        return 0;
+    }
+
+    if (strcmp(sub, "loc") == 0) {
+        if (argc >= 4) {
+            int tz; time_sync_get_location(NULL, NULL, &tz);
+            if (argc >= 5) tz = atoi(argv[4]);
+            time_sync_set_location(strtod(argv[2], NULL), strtod(argv[3], NULL), tz);
+        }
+        double lat, lon; int tz;
+        time_sync_get_location(&lat, &lon, &tz);
+        printf("loc: lat=%.4f lon=%.4f tz=%+d\r\n", lat, lon, tz);
+        return 0;
+    }
+
+    int64_t secs = -1;
+    if (strcmp(sub, "interval") == 0 && argc >= 3) {
+        secs = time_sync_until_interval(now, atoll(argv[2]), (argc >= 4) ? atoll(argv[3]) : 0);
+    } else if (strcmp(sub, "clock") == 0 && argc >= 4) {
+        secs = time_sync_until_clock(now, atoi(argv[2]), atoi(argv[3]), 0);
+    } else if (strcmp(sub, "weekly") == 0 && argc >= 5) {
+        uint8_t mask = 0;
+        char buf[64], *save = NULL;
+        strncpy(buf, argv[2], sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            int b = time_sync_day_bit(tok);
+            if (b >= 0) mask |= (uint8_t)(1u << b);
+        }
+        secs = time_sync_until_weekly(now, mask, atoi(argv[3]), atoi(argv[4]));
+    } else if (strcmp(sub, "sunrise") == 0 || strcmp(sub, "sunset") == 0) {
+        int ev = (strcmp(sub, "sunset") == 0) ? TIME_SYNC_SUNSET : TIME_SYNC_SUNRISE;
+        secs = time_sync_until_sun(now, ev, (argc >= 3) ? atoll(argv[2]) : 0);
+    } else {
+        printf("Usage: sync [sun | loc <lat> <lon> [tz] | interval <s> [phase] | "
+               "clock <hh> <mm> | weekly <d,d> <hh> <mm> | sunrise|sunset [offset_s]]\r\n");
+        return 1;
+    }
+
+    if (secs < 0) {
+        printf("no trigger (bad args, or polar day/night)\r\n");
+        return 1;
+    }
+    int y, mo, d, h, mi, s, wd;
+    time_sync_localtime(now + secs, &y, &mo, &d, &h, &mi, &s, &wd);
+    printf("next in %llds  -> %04d-%02d-%02d %02d:%02d:%02d\r\n",
+           (long long)secs, y, mo, d, h, mi, s);
+    return 0;
+}
+
 static esp_err_t cli_register_commands(void)
 {
     if (s_cli_commands_registered) {
@@ -557,6 +637,11 @@ static esp_err_t cli_register_commands(void)
         .help    = "PWM <duty 0-100> [freq_hz=10000] [enable 0|1=1]  drive PWM on GPIO4",
         .func    = cli_cmd_pwm,
     };
+    static const esp_console_cmd_t sync_cmd = {
+        .command = "sync",
+        .help    = "sync [sun|loc|interval|clock|weekly|sunrise|sunset …]  RTC scheduling triggers",
+        .func    = cli_cmd_sync,
+    };
     static const esp_console_cmd_t reboot_cmd = {
         .command = "reboot",
         .help    = "restart the device",
@@ -629,6 +714,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&pwm_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&sync_cmd);
     if (err != ESP_OK) {
         return err;
     }
