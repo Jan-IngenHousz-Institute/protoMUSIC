@@ -24,6 +24,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #define TAG "uart_sens"
 
@@ -49,6 +50,9 @@
 
 #define UART_BAUD_RATE      115200
 #define UART_RX_BUF_SIZE    2048
+/* do_text_query prime: ms to wait after the throwaway newline for the sensor to
+ * answer (and us to discard it) before sending the real command. */
+#define TEXT_QUERY_PRIME_MS 50
 #define WAKE_RETRIES        25
 #define WAKE_RETRY_MS       50
 #define PING_TIMEOUT_MS     2000
@@ -642,6 +646,16 @@ static esp_err_t do_text_query(uint8_t channel,
     }
 
     uart_port_t port = s_ch[channel].uart_num;
+
+    /* Prime: send a bare terminator first to flush any partial line stuck in the
+     * SENSOR's input buffer — e.g. leftover boot-time AMBIT wake bytes (0xAA)
+     * sent by the boot auto-ping on this channel. Give the sensor a moment to
+     * process + reply, then discard that reply. Without this, the leftover
+     * fragment is prepended to the first real command and the sensor answers
+     * "unknown command". */
+    uart_flush_input(port);
+    uart_write_bytes(port, terminator, term_len);
+    vTaskDelay(pdMS_TO_TICKS(TEXT_QUERY_PRIME_MS));
     uart_flush_input(port);
 
     /* Send: cmd + terminator, atomically inside the lock. */
