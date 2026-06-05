@@ -33,6 +33,7 @@ typedef struct {
     measurement_claim_next_event_fn   claim_next_event;   /* used by sync_runner */
     measurement_mark_event_synced_fn  mark_event_synced;
     measurement_mark_event_pending_fn mark_event_pending;
+    measurement_db_stats_fn           db_stats;            /* read-only event-table stats */
 
     /* Status port */
     status_set_fn               set_status;
@@ -118,6 +119,12 @@ cmd_result_t cmd_next_measure_id(int64_t *out_id);
  * message; used by the sync_runner). */
 cmd_result_t cmd_mqtt_publish_next_event(void);
 cmd_result_t cmd_mqtt_status(void);
+
+/* Event-DB / sync-backlog stats. *available = DB online (SD mounted), *total
+ * rows, *pending = rows not yet synced (sync_state != SYNCED), *next_id = next
+ * measure_id. Any out-pointer may be NULL. */
+cmd_result_t cmd_db_status(bool *available, int64_t *total,
+                           int64_t *pending, int64_t *next_id);
 
 /* UART sensor commands — raw (Phase 7) */
 cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],

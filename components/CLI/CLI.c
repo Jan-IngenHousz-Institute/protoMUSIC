@@ -69,7 +69,7 @@ static int cli_cmd_status(int argc, char **argv)
     bool bme_ready = false;
     bool rtc_ready = false;
     time_t rtc_time = 0;
-    cmd_result_t res = cmd_device_status(&bme_ready, &rtc_ready, &rtc_time);
+    cmd_device_status(&bme_ready, &rtc_ready, &rtc_time);
     printf("CLI status:\r\n");
     printf(" - BME280 ready: %s\r\n", bme_ready ? "yes" : "no");
     printf(" - RTC ready: %s\r\n", rtc_ready ? "yes" : "no");
@@ -81,7 +81,27 @@ static int cli_cmd_status(int argc, char **argv)
         strftime(now_s, sizeof(now_s), "%Y-%m-%d %H:%M:%S", &tm_now);
         printf(" - RTC now: %s (%lld)\r\n", now_s, (long long)rtc_time);
     }
-    (void)res;
+
+    /* Wi-Fi connection + provisioning state. */
+    bool provisioned = false;
+    wifi_manager_is_provisioned(&provisioned);
+    printf(" - Wi-Fi: %s (provisioned: %s)\r\n",
+           wifi_manager_is_connected() ? "connected" : "disconnected",
+           provisioned ? "yes" : "no");
+
+    /* Event DB + sync backlog. */
+    bool    db_online = false;
+    int64_t total = 0, pending = 0, next_id = 0;
+    cmd_result_t dres = cmd_db_status(&db_online, &total, &pending, &next_id);
+    if (dres.status == ESP_OK) {
+        printf(" - DB: %s\r\n", db_online ? "online" : "offline");
+        if (db_online) {
+            printf("   events: %lld total, %lld pending sync, next id %lld\r\n",
+                   (long long)total, (long long)pending, (long long)next_id);
+        }
+    } else {
+        printf(" - DB: %s\r\n", dres.message);
+    }
     return 0;
 }
 

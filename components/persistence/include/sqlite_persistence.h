@@ -34,12 +34,17 @@ esp_err_t sqlite_persistence_claim_next_event(measurement_event_t *out);
 esp_err_t sqlite_persistence_mark_event_synced(int64_t measure_id);
 esp_err_t sqlite_persistence_mark_event_pending(int64_t measure_id);
 
+/* Read-only event-table stats (see measurement_db_stats_fn). */
+esp_err_t sqlite_persistence_db_stats(bool *available, int64_t *total,
+                                      int64_t *pending, int64_t *next_id);
+
 /* Getters for function pointers */
 measurement_next_id_fn            sqlite_persistence_get_next_id_fn(void);
 measurement_store_event_fn        sqlite_persistence_get_store_event_fn(void);
 measurement_claim_next_event_fn   sqlite_persistence_get_claim_next_event_fn(void);
 measurement_mark_event_synced_fn  sqlite_persistence_get_mark_event_synced_fn(void);
 measurement_mark_event_pending_fn sqlite_persistence_get_mark_event_pending_fn(void);
+measurement_db_stats_fn           sqlite_persistence_get_db_stats_fn(void);
 
 #ifdef __cplusplus
 }

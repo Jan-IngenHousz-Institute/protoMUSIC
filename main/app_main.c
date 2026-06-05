@@ -441,6 +441,7 @@ void app_main(void)
         .claim_next_event   = persistence_available ? sqlite_persistence_get_claim_next_event_fn()   : NULL,
         .mark_event_synced  = persistence_available ? sqlite_persistence_get_mark_event_synced_fn()  : NULL,
         .mark_event_pending = persistence_available ? sqlite_persistence_get_mark_event_pending_fn() : NULL,
+        .db_stats           = persistence_available ? sqlite_persistence_get_db_stats_fn()           : NULL,
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),

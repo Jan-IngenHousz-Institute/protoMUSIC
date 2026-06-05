@@ -363,6 +363,36 @@ esp_err_t sqlite_persistence_mark_event_pending(int64_t measure_id)
     return mark_event(measure_id, (int)MEASUREMENT_SYNC_PENDING);
 }
 
+esp_err_t sqlite_persistence_db_stats(bool *available, int64_t *total,
+                                      int64_t *pending, int64_t *next_id)
+{
+    if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    bool    avail = (s_db_available && s_db != NULL);
+    int64_t tot = 0, pend = 0;
+    if (avail) {
+        sqlite3_stmt *st = NULL;
+        /* One pass: total rows + count of those not yet synced. SUM over zero
+         * rows yields NULL, which sqlite3_column_int64 reads back as 0. */
+        const char *sql = "SELECT COUNT(*), "
+                          "SUM(CASE WHEN sync_state <> 2 THEN 1 ELSE 0 END) FROM events;";
+        if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                tot  = sqlite3_column_int64(st, 0);
+                pend = sqlite3_column_int64(st, 1);
+            }
+            sqlite3_finalize(st);
+        }
+    }
+    if (available) *available = avail;
+    if (total)     *total     = tot;
+    if (pending)   *pending   = pend;
+    if (next_id)   *next_id   = s_next_id;
+    xSemaphoreGive(s_mtx);
+    return ESP_OK;
+}
+
 /* ── fn getters ──────────────────────────────────────────────────────── */
 
 measurement_next_id_fn            sqlite_persistence_get_next_id_fn(void)            { return sqlite_persistence_next_id; }
@@ -370,3 +400,4 @@ measurement_store_event_fn        sqlite_persistence_get_store_event_fn(void)   
 measurement_claim_next_event_fn   sqlite_persistence_get_claim_next_event_fn(void)   { return sqlite_persistence_claim_next_event; }
 measurement_mark_event_synced_fn  sqlite_persistence_get_mark_event_synced_fn(void)  { return sqlite_persistence_mark_event_synced; }
 measurement_mark_event_pending_fn sqlite_persistence_get_mark_event_pending_fn(void) { return sqlite_persistence_mark_event_pending; }
+measurement_db_stats_fn           sqlite_persistence_get_db_stats_fn(void)           { return sqlite_persistence_db_stats; }

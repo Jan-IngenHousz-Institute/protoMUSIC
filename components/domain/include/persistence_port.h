@@ -71,6 +71,13 @@ typedef esp_err_t (*measurement_claim_next_event_fn)(measurement_event_t *out);
 typedef esp_err_t (*measurement_mark_event_synced_fn)(int64_t measure_id);
 typedef esp_err_t (*measurement_mark_event_pending_fn)(int64_t measure_id);
 
+/* Read-only event-table stats (no mutation). *available = DB open (SD mounted);
+ * *total = row count; *pending = rows not yet synced (sync_state != SYNCED);
+ * *next_id = the next measure_id to be allocated. Any out-pointer may be NULL.
+ * Returns ESP_OK even when the DB is offline (*available=false, counts 0). */
+typedef esp_err_t (*measurement_db_stats_fn)(bool *available, int64_t *total,
+                                             int64_t *pending, int64_t *next_id);
+
 #ifdef __cplusplus
 }
 #endif

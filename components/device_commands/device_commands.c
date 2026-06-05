@@ -381,6 +381,27 @@ cmd_result_t cmd_mqtt_status(void)
     return make_result(ESP_OK, "MQTT: %s", connected ? "connected" : "disconnected");
 }
 
+cmd_result_t cmd_db_status(bool *available, int64_t *total,
+                           int64_t *pending, int64_t *next_id)
+{
+    if (!s_initialized || s_cfg.db_stats == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
+    }
+    bool    avail = false;
+    int64_t tot = 0, pend = 0, nid = 0;
+    esp_err_t err = s_cfg.db_stats(&avail, &tot, &pend, &nid);
+    if (err != ESP_OK) {
+        return make_result(err, "db stats failed: %s", esp_err_to_name(err));
+    }
+    if (available) *available = avail;
+    if (total)     *total     = tot;
+    if (pending)   *pending   = pend;
+    if (next_id)   *next_id   = nid;
+    return make_result(ESP_OK, "DB=%s total=%lld pending=%lld next_id=%lld",
+                       avail ? "online" : "offline",
+                       (long long)tot, (long long)pend, (long long)nid);
+}
+
 /* ── Event store + publish (one row/event; one message per measure_id) ── */
 
 cmd_result_t cmd_store_event(int64_t measure_id, const char *device, const char *sensor,
