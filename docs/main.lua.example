@@ -1,72 +1,82 @@
--- Runs a fluorescence trace on every connected AMBIT every 30 seconds and
--- stores the returned arrays (leaf_temp, fluor, fluoRef) to the local DB. The
--- background sync_runner (period 10 s) publishes the stored arrays over MQTT on
--- its own cadence — this script only does run + store.
+-- main.lua — declarative measurement schedule.
 --
--- Trace (3 segments, type-2 / no-IR, like the notebook's gen_cmd_arr_line):
---   10 points @ 10 Hz, actinic 0    (dark baseline)
---   10 points @ 10 Hz, actinic 255  (full actinic)
---   10 points @ 10 Hz, actinic 0    (relaxation)
+-- Built on two firmware-bundled modules (nothing to copy besides this file):
+--   sync   — RTC clock/sun math      (components/time_sync)
+--   sched  — the job scheduler below (components/lua_runner/sched.lua)
 --
--- "Every AMBIT": each round pings UART channels 0..3 and runs only on the ones
--- that answer (device.uart_ping wakes the AMBIT; ~2 s timeout on an empty
--- channel). Pinging first matters — running blind on an empty channel would
--- block for the whole run timeout.
+-- You declare *what* runs and *when*; sched.run() owns the loop. Each round it
+-- asks every job when it is next due, sleeps until the soonest, then fires every
+-- job due at that instant. every()/cron() jobs can be gated to day or night.
 --
--- Timing is RTC-synchronised via the built-in `sync` module (components/time_sync).
--- See the scheduling block at the bottom for the options.
+--   sched.every(period, fn [, {when=}])  -- clock-aligned: "5m" -> :00/:05/:10…
+--   sched.cron(minutes, fn [, {when=}])  -- at given minutes of the hour
+--   sched.sun(event, offset, fn)         -- once/day at sunrise|sunset ± offset s
+--   sched.run()                          -- never returns
+--   when = "day" | "night" | nil         -- gate on sun state (nil = always)
+--
+-- This schedule:
+--   • 30 min after sunset   → one trace        (dark edge)
+--   • 30 min before sunrise → one trace        (dark edge)
+--   • daytime, every 5 min  → record a spectrum
+--   • daytime, :00/:15/:30/:45 → record + push a trace over MQTT
 --
 -- Copy this file to the SD card root as `main.lua` (firmware loads
 -- /sdcard/main.lua at boot — see components/lua_runner).
 
--- `sync` is a built-in firmware module. Override location/timezone if needed
--- (defaults: 52.173, 5.819, tz +2 = NL/CEST; tz = hours the RTC is ahead of UTC):
+-- Override location/timezone if needed (defaults: 52.173, 5.819, tz +2 = NL/CEST;
+-- tz = hours the RTC is ahead of UTC; used only for sunrise/sunset):
 -- sync.set_location(52.173, 5.819, 2)
 
 local NUM_CHANNELS = 4       -- AMBIT UART channels 0..3
 
+-- Fluorescence trace: 3 segments, type-2 / no-IR (notebook's gen_cmd_arr_line):
+--   10 points @ 10 Hz, actinic 0    (dark baseline)
+--   10 points @ 10 Hz, actinic 255  (full actinic)
+--   10 points @ 10 Hz, actinic 0    (relaxation)
 local trace = {
     { pulses = 10, freq = 10, actinic = 0   },
     { pulses = 10, freq = 10, actinic = 255 },
     { pulses = 10, freq = 10, actinic = 0   },
 }
 
--- One measurement round across every connected AMBIT.
-local function measure()
+-- One round across every connected AMBIT: ping, run the trace, store the arrays
+-- (leaf_temp, fluor, fluoRef). Pinging first matters — running blind on an empty
+-- channel blocks for the whole run timeout. publish=true also pushes each freshly
+-- stored event over MQTT immediately (the background sync_runner streams stored
+-- events on its own cadence regardless).
+local function record(tag, publish)
     local ran = 0
     for ch = 0, NUM_CHANNELS - 1 do
         if device.uart_ping(ch) then
             local r, err = ambit.run(ch, trace, { store = true, timeout_ms = 30000 })
             if r then
                 ran = ran + 1
-                device.log(string.format("ch%d: %d points, stored %d arrays",
-                           ch, r.points, r.stored or 0))
+                if publish then mqtt.publish_next_event() end
+                device.log(string.format("%s ch%d: %d points, stored %d",
+                           tag, ch, r.points, r.stored or 0))
             else
-                device.log(string.format("ch%d: run failed: %s", ch, err or "unknown"))
+                device.log(string.format("%s ch%d: run failed: %s", tag, ch, err or "?"))
             end
         end
     end
-    if ran == 0 then device.log("no AMBIT responded on any channel") end
+    if ran == 0 then device.log(tag .. ": no AMBIT responded") end
 end
+
+-- Job bodies. Swap record_spectra's body for a lighter reading (e.g. an env-only
+-- record) if "spectrum" means something cheaper than a full trace in your setup.
+local function record_spectra() record("spectra", false) end  -- store only
+local function send_trace()     record("trace",   true)  end  -- store + publish
+local function edge_trace()     record("edge",    false) end  -- dark-edge trace
 
 do
     local sr, ss = sync.sun_today()
-    device.log(string.format("ambit loop started; today sunrise=%s sunset=%s (RTC time)", sr, ss))
+    device.log(string.format("schedule started; sunrise=%s sunset=%s (RTC)", sr, ss))
 end
 
--- ── Scheduling: pick ONE trigger inside the loop ────────────────────────
--- The firmware stops this task on SD removal and restarts it on reinsertion,
--- so no sd_ready() check is needed here.
-while true do
-    sync.wait(sync.until_interval(600))              -- every 10 min, on :00/:10/:20…
-    -- sync.wait(sync.until_interval(1800))          -- every half hour, on :00/:30
-    -- sync.wait(sync.until_clock(8, 0))             -- daily at 08:00
-    -- sync.wait(sync.until_weekly({"mon","tue"}, 8, 0)) -- Mon & Tue at 08:00
-    -- sync.wait(sync.until_sun("sunset", -30 * 60)) -- 30 min before sunset
-    -- sync.wait(sync.until_sun("sunrise", 15 * 60)) -- 15 min after sunrise
+-- ── Declarative schedule ────────────────────────────────────────────────
+sched.sun("sunset",   30 * 60, edge_trace)                  -- 30 min after sunset
+sched.sun("sunrise", -30 * 60, edge_trace)                  -- 30 min before sunrise
+sched.every("5m", record_spectra, { when = "day" })         -- daytime, every 5 min
+sched.cron({ 0, 15, 30, 45 }, send_trace, { when = "day" }) -- daytime, :00/:15/:30/:45
 
-    measure()
-end
-
-
-
+sched.run()   -- never returns; the firmware stops/restarts this task on SD eject/insert

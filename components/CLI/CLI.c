@@ -155,6 +155,24 @@ static int cli_cmd_read_env(int argc, char **argv)
     return 0;
 }
 
+static int cli_cmd_record_env(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1) {
+        printf("Usage: record_env\r\n");
+        return 1;
+    }
+
+    int64_t mid = 0;
+    cmd_result_t res = cmd_record_env(&mid);
+    if (res.status != ESP_OK) {
+        printf("record_env failed: %s\r\n", res.message);
+        return 1;
+    }
+    printf("%s\r\n", res.message);   /* "recorded env id=N: T=…C H=…% P=…Pa" */
+    return 0;
+}
+
 static int cli_cmd_i2cscan(int argc, char **argv)
 {
     (void)argv;
@@ -587,6 +605,11 @@ static esp_err_t cli_register_commands(void)
         .help = "read BME280 temperature, humidity, pressure",
         .func = cli_cmd_read_env,
     };
+    static const esp_console_cmd_t record_env_cmd = {
+        .command = "record_env",
+        .help = "read BME280 and store one T/H/P event in the DB",
+        .func = cli_cmd_record_env,
+    };
     static const esp_console_cmd_t i2cscan_cmd = {
         .command = "i2cscan",
         .help = "scan the shared I2C bus for responding 7-bit addresses",
@@ -664,6 +687,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&read_env_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&record_env_cmd);
     if (err != ESP_OK) {
         return err;
     }
