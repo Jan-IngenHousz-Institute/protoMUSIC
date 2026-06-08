@@ -53,7 +53,9 @@ typedef struct {
     uint16_t act_250;
     float    mlx_emissivity;
     float    sun_coef;
-} ambit_calibration_t;       /* expected ~136 bytes */
+    float    tick_factor;    /* PAM point-period scale (ms tick -> s); MUST match
+                              * ambit-1 nvs1.h — omitting it desyncs the framed read */
+} ambit_calibration_t;       /* expected ~140 bytes */
 
 typedef struct {
     uint8_t  major;

@@ -2278,10 +2278,6 @@ CONFIG_LITTLEFS_ASSERTS=y
 # CONFIG_LITTLEFS_MMAP_PARTITION is not set
 # CONFIG_LITTLEFS_WDT_RESET is not set
 # end of LittleFS
-
-#
-# Sqlite3
-#
 # end of Component config
 
 # CONFIG_IDF_EXPERIMENTAL_FEATURES is not set

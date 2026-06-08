@@ -174,6 +174,23 @@ cmd_result_t cmd_ambit_get_temp_raw(uint8_t ch, float *leaf, float *leaf1,
 cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
                                  uint8_t *out, size_t out_size, size_t *out_len);
 
+/* Cached per-channel AMBIT identity for event metadata. These values are static
+ * per sensor, so they're fetched once (cmd 33: FW info + calibration) and cached
+ * — a measurement reads them with zero UART cost. */
+typedef struct {
+    bool     valid;
+    char     device_id[18];   /* "AA:BB:CC:DD:EE:FF" from the AMBIT efuse MAC */
+    char     fw_version[16];   /* "major.minor.batch" */
+    uint32_t cal_version;      /* CRC32 of the calibration struct (bumps on any cal change) */
+    char     ambit_name[20];   /* calibration ambit_name, e.g. "AmbitV003" */
+} ambit_device_info_t;
+
+/* Return cached identity for `ch`, lazily fetching on first use (one-time UART
+ * cost, then free). *out is zeroed + valid=false on a fetch failure. */
+cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out);
+/* Drop a channel's cache so the next read re-fetches — call on (re)connect / swap. */
+void cmd_ambit_device_info_invalidate(uint8_t ch);
+
 /* Measurements (FSM response) */
 cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
                             uint8_t led_persist, bool allow_interrupt,

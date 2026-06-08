@@ -13,6 +13,7 @@
 #include "cJSON.h"
 
 #include "esp_log.h"
+#include "esp_rom_crc.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -1004,6 +1005,71 @@ cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
     uart_sensor_response_free(&resp);
     return make_result(ESP_OK, "AMBIT%u info(%u): %u bytes",
                        ch + 1, info_type, (unsigned)resp.raw_len);
+}
+
+/* ── Cached AMBIT device identity (deviceID / fw_version / cal_version) ──────
+ * Static per sensor, so fetched once via cmd 33 and cached; a measurement reads
+ * it with zero UART cost. Written only from the measurement (Lua) task's lazy
+ * fetch, so no lock is needed as long as that stays the only writer. */
+#define AMBIT_INFO_NUM_CH 4
+
+static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
+
+static esp_err_t ambit_info_fetch(uint8_t ch)
+{
+    /* FW info (MAC + version) is mandatory; calibration (→ cal_version) best-effort. */
+    ambit_fw_info_t fw;
+    size_t got = 0;
+    cmd_result_t r = cmd_ambit_get_info(ch, AMBIT_INFO_FW, (uint8_t *)&fw, sizeof fw, &got);
+    if (r.status != ESP_OK || got < sizeof fw) {
+        return (r.status != ESP_OK) ? r.status : ESP_FAIL;
+    }
+
+    ambit_device_info_t e;
+    memset(&e, 0, sizeof e);
+    /* getEfuseMac() packs the 6-byte MAC little-endian (byte0 = low 8 bits). */
+    uint64_t m = fw.mac;
+    snprintf(e.device_id, sizeof e.device_id, "%02X:%02X:%02X:%02X:%02X:%02X",
+             (unsigned)(m & 0xFF), (unsigned)((m >> 8) & 0xFF), (unsigned)((m >> 16) & 0xFF),
+             (unsigned)((m >> 24) & 0xFF), (unsigned)((m >> 32) & 0xFF), (unsigned)((m >> 40) & 0xFF));
+    snprintf(e.fw_version, sizeof e.fw_version, "%u.%u.%u",
+             (unsigned)fw.major, (unsigned)fw.minor, (unsigned)fw.batch);
+
+    /* cal_version = CRC32 of the calibration struct → changes whenever the sensor
+     * is recalibrated. The struct has no native version field. */
+    ambit_calibration_t cal;
+    size_t cgot = 0;
+    cmd_result_t cr = cmd_ambit_get_info(ch, AMBIT_INFO_CALIBRATION, (uint8_t *)&cal, sizeof cal, &cgot);
+    if (cr.status == ESP_OK && cgot >= sizeof cal) {
+        e.cal_version = esp_rom_crc32_le(0, (const uint8_t *)&cal, sizeof cal);
+        memcpy(e.ambit_name, cal.ambit_name, sizeof e.ambit_name - 1);
+    }
+
+    e.valid = true;
+    s_ambit_info[ch] = e;
+    return ESP_OK;
+}
+
+cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out)
+{
+    if (ch >= AMBIT_INFO_NUM_CH || out == NULL) {
+        return make_result(ESP_ERR_INVALID_ARG, "device_info: bad channel/arg");
+    }
+    if (!s_ambit_info[ch].valid) {
+        esp_err_t err = ambit_info_fetch(ch);
+        if (err != ESP_OK) {
+            memset(out, 0, sizeof *out);
+            return make_result(err, "AMBIT%u device_info fetch failed", ch + 1);
+        }
+    }
+    *out = s_ambit_info[ch];
+    return make_result(ESP_OK, "AMBIT%u %s fw=%s cal=%08lx",
+                       ch + 1, out->device_id, out->fw_version, (unsigned long)out->cal_version);
+}
+
+void cmd_ambit_device_info_invalidate(uint8_t ch)
+{
+    if (ch < AMBIT_INFO_NUM_CH) s_ambit_info[ch].valid = false;
 }
 
 /* Cmd 21 — Run an array-mode measurement on the ADPD6100.
