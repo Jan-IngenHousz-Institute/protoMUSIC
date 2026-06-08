@@ -25,6 +25,7 @@
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
 #include "sd_logger.h"
+#include "spike_log.h"
 #include "sqlite_persistence.h"
 #include "sync_runner.h"
 #include "uart_sensors.h"
@@ -233,10 +234,13 @@ void app_main(void)
 {
     /* Capture WARN/ERROR logs to the SD card (INFO/DEBUG go to the console only).
      * Verbose continuous logging concurrent with the events DB corrupted the FAT
-     * on a consumer card, so the file is now low-volume + idle-quiet by design. */
+     * on a consumer card, so the file is now low-volume + idle-quiet by design.
+     * Skipped in the SPIKE_LOG build so the spike is the ONLY writer on the SD. */
+#ifndef SPIKE_LOG
     if (sd_logger_init() != ESP_OK) {
         ESP_LOGW(APP_TAG, "SD logger failed to start");
     }
+#endif
 
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(APP_TAG, "app_main entered");
@@ -398,6 +402,18 @@ void app_main(void)
     } else {
         ESP_LOGW(APP_TAG, "SD card unavailable, buffering to LittleFS only");
     }
+
+#ifdef SPIKE_LOG
+    /* Step-0 spike: isolate the SD append pattern from SQLite. Runs the
+     * append+read-back soak and skips the whole measurement/persistence stack. */
+    if (sd_available) {
+        spike_log_start();
+    } else {
+        ESP_LOGE(APP_TAG, "SPIKE_LOG: no SD card — nothing to test");
+    }
+    ESP_LOGW(APP_TAG, "SPIKE_LOG build — normal startup skipped");
+    return;
+#endif
 
     /* ── LittleFS ─────────────────────────────────────────────────── */
     bool lfs_available = false;
