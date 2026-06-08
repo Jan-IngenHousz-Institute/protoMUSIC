@@ -16,6 +16,7 @@
 #include "device_commands.h"
 #include "time_sync.h"
 #include "i2c_bus.h"
+#include "sd_logger.h"
 #include "wifi_manager.h"
 
 static const uint8_t CLI_I2C_SCAN_FIRST_ADDR = 0x08;
@@ -190,6 +191,24 @@ static int cli_cmd_record_env(int argc, char **argv)
         return 1;
     }
     printf("%s\r\n", res.message);   /* "recorded env id=N: T=…C H=…% P=…Pa" */
+    return 0;
+}
+
+static int cli_cmd_log_status(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1) {
+        printf("Usage: log_status\r\n");
+        return 1;
+    }
+
+    bool   active = false;
+    size_t buffered = 0, dropped = 0, file_bytes = 0;
+    sd_logger_stats(&active, &buffered, &dropped, &file_bytes);
+    printf("SD log: %s\r\n", active ? "writing" : "paused (no SD?)");
+    printf(" - file: /sdcard/logs/ambyte.log (%u bytes)\r\n", (unsigned)file_bytes);
+    printf(" - buffered: %u bytes, dropped: %u bytes\r\n",
+           (unsigned)buffered, (unsigned)dropped);
     return 0;
 }
 
@@ -630,6 +649,11 @@ static esp_err_t cli_register_commands(void)
         .help = "read BME280 and store one T/H/P event in the DB",
         .func = cli_cmd_record_env,
     };
+    static const esp_console_cmd_t log_status_cmd = {
+        .command = "log_status",
+        .help = "show SD log writer state (file size, buffered/dropped bytes)",
+        .func = cli_cmd_log_status,
+    };
     static const esp_console_cmd_t i2cscan_cmd = {
         .command = "i2cscan",
         .help = "scan the shared I2C bus for responding 7-bit addresses",
@@ -712,6 +736,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&record_env_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&log_status_cmd);
     if (err != ESP_OK) {
         return err;
     }

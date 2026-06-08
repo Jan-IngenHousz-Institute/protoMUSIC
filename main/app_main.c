@@ -24,6 +24,7 @@
 #include "nvs_flash.h"
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
+#include "sd_logger.h"
 #include "sqlite_persistence.h"
 #include "sync_runner.h"
 #include "uart_sensors.h"
@@ -230,6 +231,12 @@ static void on_wifi_disconnect(void *arg, esp_event_base_t base, int32_t id, voi
 
 void app_main(void)
 {
+    /* Start capturing logs to the SD card first thing, so the whole boot
+     * sequence is recorded (the writer buffers in RAM until the card mounts). */
+    if (sd_logger_init() != ESP_OK) {
+        ESP_LOGW(APP_TAG, "SD logger failed to start");
+    }
+
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(APP_TAG, "app_main entered");
 

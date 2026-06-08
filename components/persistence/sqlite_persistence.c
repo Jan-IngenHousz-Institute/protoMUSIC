@@ -114,7 +114,10 @@ static esp_err_t db_open_and_configure(void)
     exec_pragma(s_db, "PRAGMA locking_mode = EXCLUSIVE;");
     exec_pragma(s_db, "PRAGMA synchronous = FULL;");
     exec_pragma(s_db, "PRAGMA page_size = 4096;");
-    exec_pragma(s_db, "PRAGMA cache_size = -64;");
+    /* -16 = 16 KiB page cache. The events DB is tiny and write-mostly, so a big
+     * cache buys little; the freed ~48 KiB of internal heap is needed elsewhere
+     * (Wi-Fi/TLS + the MQTT publish, which cJSON-parses the whole payload). */
+    exec_pragma(s_db, "PRAGMA cache_size = -16;");
     exec_pragma(s_db, "PRAGMA temp_store = MEMORY;");
 
     const char *create =

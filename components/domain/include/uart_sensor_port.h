@@ -13,7 +13,9 @@ extern "C" {
 #endif
 
 #define UART_SENSOR_NUM_CHANNELS  4
-#define UART_SENSOR_MAX_ARRAYS    8
+/* v2 run streams up to 8 arrays (ENV, Fluo, Fluoref, Sun, Leaf, 730, 730ref,
+ * TIMING); keep headroom so the receive loop still reads CMD_END after the last. */
+#define UART_SENSOR_MAX_ARRAYS    12
 
 /* Sentinel value for expect_raw: return immediately after CMD_DONE.
  * Used for configuration commands (set gains, set currents, etc.) that

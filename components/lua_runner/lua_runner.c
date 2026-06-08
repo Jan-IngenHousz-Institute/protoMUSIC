@@ -9,6 +9,7 @@
 
 #include "cJSON.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -895,41 +896,45 @@ static bool ambit_parse_field(const char *line, const char *key, double *out)
     return true;
 }
 
-/* Parse the CSV that follows the TAB in a COMPUTER-mode block line
- * ("Data:<tag>,Length:N\t v0,v1,...,"). Fills out[] up to cap, returns count. */
-static size_t parse_csv_after_tab(const char *line, double *out, size_t cap)
+/* Array index → JSON tag, matching the ambit fw AMBYTE send order
+ * (PAM.cpp pam_send_results): 0=ENV(leaf temp), 1=fluor, 2=fluoRef, 3=sun,
+ * 4=leaf, 5=730, 6=730ref. NULL → caller falls back to "arr<idx>". */
+static const char *ambit_array_tag(uint8_t idx)
 {
-    const char *p = strchr(line, '\t');
-    if (p == NULL) return 0;
-    p++;
-    size_t n = 0;
-    while (*p != '\0' && n < cap) {
-        char *end = NULL;
-        double v = strtod(p, &end);
-        if (end == p) break;            /* no more numbers */
-        out[n++] = v;
-        p = end;
-        while (*p == ',' || *p == ' ') p++;
+    switch (idx) {
+        case 0: return "leaf_temp";
+        case 1: return "fluor";
+        case 2: return "fluoRef";
+        case 3: return "sun";
+        case 4: return "leaf";
+        case 5: return "r730";
+        case 6: return "r730ref";
+        case 7: return "timing";   /* uint32 [tick_begin, tick_end] µs */
+        default: return NULL;
     }
-    return n;
 }
 
-/* ambit.run(channel, segments, opts) — run an AMBIT fluorescence trace using
- * the COMPUTER-mode `arrun2` command: the AMBIT runs the whole trace, then
- * dumps each array as one ASCII block ("Data:<tag>,Length:N\t v,v,...,") ending
- * with "Data sent". Unlike `arrun1` (PLOTTING) it does NOT stream per-point, so
- * there are no inter-point UART idle gaps — which is what desynced the shared
- * UART0 channels. We parse the Fluo / Fluoref / ENV blocks; other tags (SUN,
- * leaf, 730…) and interleaved AMBIT log lines are ignored.
+/* Reserved once (at module register, while the heap is still contiguous) and
+ * reused for every run's JSON payload — the run's one big allocation, kept off
+ * the fragmenting per-run path. Only the lua_runner task calls ambit.run, so a
+ * single shared buffer is safe. Sized for current point counts; larger runs
+ * truncate (logged). A uint16/compact-storage v2 will shrink this need. */
+#define AMBIT_RUN_PAYLOAD_CAP (16 * 1024)
+static char *s_ambit_payload;
+
+/* ambit.run(channel, segments, opts) — run an AMBIT fluorescence trace over the
+ * binary AMBYTE protocol (cmd 21): the ambit runs the whole trace, then streams
+ * each result array back over the FSM handshake as raw uint32 LE (no ASCII, no
+ * cJSON). cmd_ambit_run collects them into resp.arrays[] by index; we stream
+ * every array into one JSON payload keyed by tag (ENV decoded to leaf-temp degC).
  *
  *   segments : array of { pulses=, freq=, actinic= }  (positional [1],[2],[3] ok)
- *   opts     : { persist=false, store=true, timeout_ms=30000 }
+ *   opts     : { persist=false, store=true, timeout_ms=30000, interrupt=false }
  *
- * Returns { points=N, stored=K, leaf_temp=degC, fluor={..}, fluoRef={..} }.
- * leaf_temp is a single scalar (captured once); fluor/fluoRef are per-point
- * arrays. store=true persists one event whose payload is
- * {"leaf_temp":<degC>,"fluor":[…],"fluoRef":[…]} (stored=1 on success, else 0).
- * Point count is capped (heap) — large runs truncate. */
+ * Returns { points=<fluor len>, stored=K, leaf_temp=degC, arrays=N }. The per-
+ * point arrays are persisted to the DB (the point of the run), not materialised
+ * back into Lua, to keep memory bounded for large runs. store=true persists one
+ * event whose payload is {"leaf_temp":[…],"fluor":[…],"fluoRef":[…],…}. */
 static int l_ambit_run(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
@@ -941,9 +946,10 @@ static int l_ambit_run(lua_State *L)
     }
 
     /* Defaults when opts is omitted (ambit.run(ch, trace)): store + 30 s. */
-    uint8_t  persist    = 0;
-    bool     store      = true;
-    uint32_t timeout_ms = 30000;
+    uint8_t  persist        = 0;
+    bool     store          = true;
+    uint32_t timeout_ms     = 30000;
+    bool     allow_interrupt = false;
     if (lua_istable(L, 3)) {
         lua_getfield(L, 3, "persist");
         if (!lua_isnil(L, -1)) persist = lua_toboolean(L, -1) ? 1 : 0;
@@ -953,6 +959,9 @@ static int l_ambit_run(lua_State *L)
         lua_pop(L, 1);
         lua_getfield(L, 3, "timeout_ms");
         if (lua_isnumber(L, -1)) timeout_ms = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "interrupt");
+        if (!lua_isnil(L, -1)) allow_interrupt = lua_toboolean(L, -1);
         lua_pop(L, 1);
     }
 
@@ -1000,15 +1009,7 @@ static int l_ambit_run(lua_State *L)
         total_pts += (uint32_t)pulses;
     }
 
-    /* Build the ASCII arrun2 command "arrun2,<nseg>,<persist>,<bytes...>," and
-     * the run metadata, both from the packed array before it is freed. */
-    char cmd[700];
-    {
-        int off = snprintf(cmd, sizeof(cmd), "arrun2,%d,%u,", nseg, (unsigned)persist);
-        for (int i = 0; i < nseg * 8 && off > 0 && off < (int)sizeof(cmd); i++) {
-            off += snprintf(cmd + off, sizeof(cmd) - off, "%u,", (unsigned)run_arr[i]);
-        }
-    }
+    /* Run metadata (small, bounded), built from the packed segment array. */
     char metadata_json[768];
     {
         int off = snprintf(metadata_json, sizeof(metadata_json), "{\"segments\":[");
@@ -1022,111 +1023,110 @@ static int l_ambit_run(lua_State *L)
         if (off < 0 || off > (int)sizeof(metadata_json) - 3) off = (int)sizeof(metadata_json) - 3;
         snprintf(metadata_json + off, sizeof(metadata_json) - off, "]}");
     }
-    free(run_arr);
-
-    /* Cap point count for the line buffer + value arrays (limited heap).
-     * leaf_temp is a single scalar (it barely changes over a run); only the
-     * fluor (S) and fluoRef (R) signals are per-point arrays. */
-    size_t npts = total_pts < 1 ? 1 : (total_pts > 256 ? 256 : total_pts);
-    size_t text_cap = npts * 64 + 512;
-    char   *text = malloc(text_cap);
-    double *vf = malloc(npts * sizeof(double));   /* fluor signal (S) */
-    double *vr = malloc(npts * sizeof(double));   /* fluoRef (R) */
-    if (!text || !vf || !vr) {
-        free(text); free(vf); free(vr);
-        return luaL_error(L, "out of memory (npts=%u)", (unsigned)npts);
-    }
+    (void)total_pts;   /* AMBIT reports actual array lengths; no host-side cap */
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
     int64_t start_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 
-    size_t text_len = 0;
-    cmd_result_t res = cmd_uart_stream_query(ch, cmd, "Data sent", timeout_ms,
-                                             text, text_cap, &text_len);
+    /* Binary AMBYTE run (cmd 21): the ambit streams each result array back over
+     * the FSM handshake as raw uint32 LE — no ASCII text buffer, no cJSON tree.
+     * Arrays land in resp.arrays[] keyed by index (see ambit fw pam_send_results). */
+    uart_sensor_response_t resp;
+    cmd_result_t res = cmd_ambit_run(ch, run_arr, (uint8_t)nseg, persist,
+                                     allow_interrupt, &resp, timeout_ms);
+    free(run_arr);
 
     gettimeofday(&tv, NULL);
     int64_t end_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 
-    /* TEMP diagnostic: dump the raw stream so we can see whether all per-point
-     * lines arrive (and parse) or only one. Remove once point-capture is fixed. */
-    ESP_LOGI(LUA_RUNNER_TAG, "ambit.run raw stream (%u bytes):\n%s",
-             (unsigned)text_len, text);
-
-    if (res.status != ESP_OK && text_len == 0) {
-        free(text); free(vf); free(vr);
+    if (res.status != ESP_OK) {
+        uart_sensor_response_free(&resp);
         return lua_push_nil_reason(L, res.message);
     }
+    uint8_t narr = resp.array_count;
+    if (narr == 0) {
+        uart_sensor_response_free(&resp);
+        return lua_push_nil_reason(L, "ambit run returned no arrays");
+    }
 
-    /* Parse the COMPUTER-mode block dump. Each "Data:<tag>,Length:N\t<csv>"
-     * line carries one array; we want Fluo (fluor), Fluoref (fluoRef) and ENV
-     * (leaf temperature, packed as centi-°C in the low 16 bits). Other tags and
-     * AMBIT log lines are ignored. */
-    size_t count = 0;        /* fluor points */
-    size_t nref  = 0;        /* fluoRef points */
-    double leaf_temp_c = 0.0;
-    bool   have_temp   = false;
-    char *save = NULL;
-    for (char *ln = strtok_r(text, "\n", &save); ln != NULL;
-         ln = strtok_r(NULL, "\n", &save)) {
-        if (strncmp(ln, "Data:Fluoref,", 13) == 0) {
-            nref = parse_csv_after_tab(ln, vr, npts);
-        } else if (strncmp(ln, "Data:Fluo,", 10) == 0) {
-            count = parse_csv_after_tab(ln, vf, npts);
-        } else if (!have_temp && strncmp(ln, "Data:ENV,", 9) == 0) {
-            double env[8];
-            if (parse_csv_after_tab(ln, env, 8) > 0) {
-                int16_t centi = (int16_t)((uint32_t)(int64_t)env[0] & 0xFFFF);
-                leaf_temp_c = centi / 100.0;
-                have_temp   = true;
-            }
+    /* Reserve the JSON payload buffer once (lazily here; normally already done at
+     * module register, while the heap was contiguous) and reuse it every run. */
+    if (s_ambit_payload == NULL) {
+        s_ambit_payload = malloc(AMBIT_RUN_PAYLOAD_CAP);
+        if (s_ambit_payload == NULL) {
+            uart_sensor_response_free(&resp);
+            return luaL_error(L, "out of memory reserving %dB payload (free=%d, largest=%d)",
+                              (int)AMBIT_RUN_PAYLOAD_CAP,
+                              (int)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                              (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         }
     }
-    if (nref < count) count = nref;   /* keep fluor/fluoRef aligned */
-    ESP_LOGI(LUA_RUNNER_TAG,
-             "ambit.run ch%u: %u bytes, %u points parsed, leaf_temp=%.2f",
-             (unsigned)ch, (unsigned)text_len, (unsigned)count, leaf_temp_c);
-    free(text);
+
+    /* Stream every received array into the payload as "<tag>":[…]. ENV (index 0)
+     * is leaf temperature, int16 centi-degC in the low 16 bits → emitted as degC.
+     * AMB_APP truncates (logged) rather than overrun the reserved buffer; `off`
+     * stays < cap by construction, so `cap - off` never underflows. */
+    char  *pbuf = s_ambit_payload;
+    size_t cap  = AMBIT_RUN_PAYLOAD_CAP;
+    size_t off  = 0;
+    bool   trunc = false;
+    size_t fluor_len = 0;
+    double leaf_temp_c = 0.0;
+    bool   have_temp = false;
+
+#define AMB_APP(...) do {                                                      \
+        int _n = snprintf(pbuf + off, off < cap ? cap - off : 0, __VA_ARGS__); \
+        if (_n < 0 || (size_t)_n >= cap - off) trunc = true;                   \
+        else off += (size_t)_n;                                               \
+    } while (0)
+
+    AMB_APP("{");
+    for (uint8_t a = 0; a < narr && !trunc; a++) {
+        const uart_data_array_t *arr = &resp.arrays[a];
+        char tagbuf[12];
+        const char *tag = ambit_array_tag(arr->index);
+        if (tag == NULL) { snprintf(tagbuf, sizeof tagbuf, "arr%u", arr->index); tag = tagbuf; }
+
+        AMB_APP("%s\"%s\":[", a == 0 ? "" : ",", tag);
+        for (uint16_t i = 0; i < arr->length && !trunc; i++) {
+            if (arr->index == 0) {                  /* ENV → leaf temp degC */
+                double t = (int16_t)(arr->data[i] & 0xFFFF) / 100.0;
+                if (!have_temp) { leaf_temp_c = t; have_temp = true; }
+                AMB_APP("%s%.2f", i ? "," : "", t);
+            } else {
+                AMB_APP("%s%u", i ? "," : "", (unsigned)arr->data[i]);
+            }
+        }
+        AMB_APP("]");
+        if (arr->index == 1) fluor_len = arr->length;
+    }
+    AMB_APP("}");
+#undef AMB_APP
+
+    if (trunc) {
+        ESP_LOGW(LUA_RUNNER_TAG,
+                 "ambit.run payload truncated at %dB — raise AMBIT_RUN_PAYLOAD_CAP",
+                 (int)cap);
+    }
 
     int stored = 0;
-    if (store && count > 0) {
-        /* One event: payload {"leaf_temp":<scalar>,"fluor":[…],"fluoRef":[…]} */
-        cJSON *payload = cJSON_CreateObject();
-        if (payload) {
-            cJSON_AddNumberToObject(payload, "leaf_temp", leaf_temp_c);
-            cJSON_AddItemToObject(payload, "fluor",   cJSON_CreateDoubleArray(vf, (int)count));
-            cJSON_AddItemToObject(payload, "fluoRef", cJSON_CreateDoubleArray(vr, (int)count));
-            char *payload_json = cJSON_PrintUnformatted(payload);
-            cJSON_Delete(payload);
-            if (payload_json) {
-                int64_t mid = 0;
-                if (cmd_next_measure_id(&mid).status == ESP_OK &&
-                    cmd_store_event(mid, "ambit", "AMBIT", start_ms, end_ms,
-                                    metadata_json, payload_json).status == ESP_OK) {
-                    stored = 1;
-                }
-                cJSON_free(payload_json);
-            }
+    if (store && !trunc) {
+        int64_t mid = 0;
+        if (cmd_next_measure_id(&mid).status == ESP_OK &&
+            cmd_store_event(mid, "ambit", "AMBIT", start_ms, end_ms,
+                            metadata_json, s_ambit_payload).status == ESP_OK) {
+            stored = 1;
         }
     }
 
-    lua_newtable(L);
-    lua_pushinteger(L, (lua_Integer)count);
-    lua_setfield(L, -2, "points");
-    if (store) {
-        lua_pushinteger(L, stored);
-        lua_setfield(L, -2, "stored");
-    }
-    lua_pushnumber(L, leaf_temp_c);
-    lua_setfield(L, -2, "leaf_temp");
-    lua_newtable(L);
-    for (size_t i = 0; i < count; i++) { lua_pushnumber(L, vf[i]); lua_rawseti(L, -2, (int)(i + 1)); }
-    lua_setfield(L, -2, "fluor");
-    lua_newtable(L);
-    for (size_t i = 0; i < count; i++) { lua_pushnumber(L, vr[i]); lua_rawseti(L, -2, (int)(i + 1)); }
-    lua_setfield(L, -2, "fluoRef");
+    uart_sensor_response_free(&resp);
 
-    free(vf); free(vr);
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer)fluor_len);    lua_setfield(L, -2, "points");
+    lua_pushinteger(L, stored);                    lua_setfield(L, -2, "stored");
+    lua_pushnumber(L, leaf_temp_c);                lua_setfield(L, -2, "leaf_temp");
+    lua_pushinteger(L, (lua_Integer)narr);         lua_setfield(L, -2, "arrays");
     return 1;
 }
 
@@ -1136,6 +1136,17 @@ static int l_ambit_run(lua_State *L)
  * consolidating them all here is a separate cleanup. */
 static void lua_register_ambit_module(lua_State *L)
 {
+    /* Reserve the run payload buffer up front, while the heap is still
+     * contiguous — avoids a fragmentation-time failure on the first run. */
+    if (s_ambit_payload == NULL) {
+        s_ambit_payload = malloc(AMBIT_RUN_PAYLOAD_CAP);
+        if (s_ambit_payload == NULL) {
+            ESP_LOGW(LUA_RUNNER_TAG,
+                     "ambit.run payload reserve (%dB) failed; will retry per-run",
+                     (int)AMBIT_RUN_PAYLOAD_CAP);
+        }
+    }
+
     static const luaL_Reg ambit_api[] = {
         {"uart_query", l_ambit_uart_query},
         {"run",        l_ambit_run},

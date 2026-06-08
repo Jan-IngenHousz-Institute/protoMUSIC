@@ -216,73 +216,56 @@ static esp_err_t ambit_send_cmd(uart_port_t port, const uint8_t cmd[8],
     return ESP_OK;
 }
 
-/* ── Receive one FSM data array (host side of ambit's fsm_send_esp) ── */
-
+/* ── Receive one FSM data array (v2: 0xD4 header marker already consumed) ──
+ * The single wake + the 0xD4 header-start byte are consumed by
+ * receive_fsm_response. We read the rest of the 8-byte length header
+ *   {212, 150, idx, lenHi, lenLo, elem_width, dtype, csum}   csum = Σ bytes[0..6]
+ * send one 200 (ready), stream `len * elem_width` data bytes + the 4-byte
+ * trailer {212,0,0,csum}, verify the data byte-sum, ack 180, then widen each
+ * little-endian element into the uint32 array the rest of the pipeline expects.
+ * elem_width/dtype of 0 ⇒ 4/unsigned, so a v1 ambit still decodes. dtype is
+ * informational: the consumer reinterprets per array index (ENV → int16). No
+ * per-array wake and no per-array 210 — the run's single wake owns the ack. */
 static esp_err_t fsm_receive_one_array(uart_port_t port,
                                        uart_data_array_t *out,
                                        int64_t deadline)
 {
-    /* ---- Step 1: ack wake (we already consumed the 211 byte) ---- */
-    uart_write_byte(port, FSM_AWAKE);       /* 210 — ack wake */
-
-    /* ---- Step 2: send 210 again for length phase ---- */
-    vTaskDelay(pdMS_TO_TICKS(5));
-    uart_write_byte(port, FSM_AWAKE);       /* 210 — ready for length */
-
-    /* ---- Step 3: scan for length header {212, 150, ...} ---- */
-    int64_t hdr_deadline = now_us() + 2000000LL; /* 2 s max for length step */
+    int64_t hdr_deadline = now_us() + 2000000LL;   /* 2 s for the header tail */
     if (hdr_deadline > deadline) {
         hdr_deadline = deadline;
     }
 
     uint8_t hdr[8];
-    memset(hdr, 0, sizeof(hdr));
-    bool hdr_found = false;
-    while (!deadline_reached(hdr_deadline)) {
-        uint8_t b;
-        int n = uart_read_bytes(port, &b, 1, pdMS_TO_TICKS(50));
-        if (n != 1) {
-            continue;
-        }
-        if (b != FSM_DATA_HDR) {
-            continue;                       /* skip debug / echo bytes */
-        }
-        hdr[0] = FSM_DATA_HDR;
-        esp_err_t err = uart_read_exact(port, hdr + 1, 7, hdr_deadline);
-        if (err != ESP_OK) {
-            return err;
-        }
-        if (hdr[1] != FSM_LEN_MARKER) {
-            continue;                       /* stray 212, keep scanning */
-        }
-        hdr_found = true;
-        break;
+    hdr[0] = FSM_DATA_HDR;                          /* consumed by the caller */
+    esp_err_t err = uart_read_exact(port, hdr + 1, 7, hdr_deadline);
+    if (err != ESP_OK) {
+        return err;
     }
-    if (!hdr_found) {
-        return ESP_ERR_TIMEOUT;
+    if (hdr[1] != FSM_LEN_MARKER) {
+        return ESP_ERR_NOT_FOUND;                  /* stray 0xD4 — caller rescans */
     }
 
-    uint8_t arr_idx = hdr[2];
-    uint16_t arr_len = ((uint16_t)hdr[3] << 8) | hdr[4];
+    uint8_t  arr_idx    = hdr[2];
+    uint16_t arr_len    = ((uint16_t)hdr[3] << 8) | hdr[4];
+    uint8_t  elem_width = hdr[5] ? hdr[5] : 4;     /* 0 ⇒ v1 default */
 
-    /* Verify header checksum */
     uint8_t cs = 0;
     for (int i = 0; i < 7; i++) {
         cs += hdr[i];
     }
     if (cs != hdr[7]) {
-        ESP_LOGW(TAG, "FSM header checksum mismatch (got 0x%02X, want 0x%02X)",
-                 hdr[7], cs);
+        ESP_LOGW(TAG, "FSM header checksum mismatch (got 0x%02X, want 0x%02X)", hdr[7], cs);
+        uart_write_byte(port, FSM_RESET);
+        return ESP_ERR_INVALID_CRC;
+    }
+    if (elem_width != 2 && elem_width != 4) {
+        ESP_LOGW(TAG, "FSM array %u bad elem_width %u", arr_idx, elem_width);
         uart_write_byte(port, FSM_RESET);
         return ESP_ERR_INVALID_CRC;
     }
 
-    /* ---- Step 4: send ready for data ---- */
-    uart_write_byte(port, FSM_READY);       /* 200 */
-    vTaskDelay(pdMS_TO_TICKS(5));
-    uart_write_byte(port, FSM_READY);       /* 200 again for data phase */
+    uart_write_byte(port, FSM_READY);              /* 200 — ready for data (once) */
 
-    /* ---- Step 5: read binary data (arr_len * 4 bytes) ---- */
     if (arr_len == 0) {
         out->index  = arr_idx;
         out->data   = NULL;
@@ -291,99 +274,127 @@ static esp_err_t fsm_receive_one_array(uart_port_t port,
         return ESP_OK;
     }
 
-    uint32_t *data = malloc((size_t)arr_len * sizeof(uint32_t));
-    if (data == NULL) {
+    size_t    nbytes = (size_t)arr_len * elem_width;
+    uint8_t  *raw    = malloc(nbytes);
+    uint32_t *data   = malloc((size_t)arr_len * sizeof(uint32_t));
+    if (raw == NULL || data == NULL) {
+        free(raw);
+        free(data);
         return ESP_ERR_NO_MEM;
     }
 
-    /* Retry loop for data phase — ambit resends on 200 (up to 6 checksum errors) */
-    for (int data_attempt = 0; data_attempt < 4; data_attempt++) {
+    /* Data phase, with resend on mismatch (ambit waits for a 200 to resend). */
+    for (int attempt = 0; attempt < 4; attempt++) {
         int64_t data_deadline = now_us() + 10000000LL;  /* 10 s per attempt */
         if (data_deadline > deadline) {
             data_deadline = deadline;
         }
 
-        /* Send 200 to tell ambit we are ready for (re)send */
-        if (data_attempt > 0) {
-            uart_write_byte(port, FSM_READY);   /* 200 = resend */
-            /* Ambit's fsm_send_data waits for 200 before sending */
+        if (attempt > 0) {
+            uart_write_byte(port, FSM_READY);           /* 200 = resend */
         }
 
-        esp_err_t err = uart_read_exact(port, (uint8_t *)data,
-                                        (size_t)arr_len * 4, data_deadline);
+        err = uart_read_exact(port, raw, nbytes, data_deadline);
         if (err != ESP_OK) {
-            free(data);
+            free(raw); free(data);
             return err;
         }
 
-        /* ---- Step 6: read trailer {212, 0, 0, checksum} ---- */
-        uint8_t trailer[4];
+        uint8_t trailer[4];                             /* {212, 0, 0, csum} */
         err = uart_read_exact(port, trailer, 4, data_deadline);
         if (err != ESP_OK) {
-            free(data);
+            free(raw); free(data);
             return err;
         }
 
-        /* Verify data checksum: sum of every data byte mod 256. The ambit's
-         * dataclass::send byte-sums to match (u32_byte_sum over each element). */
-        uint8_t data_cs = 0;
-        const uint8_t *raw_bytes = (const uint8_t *)data;
-        for (size_t i = 0; i < (size_t)arr_len * 4; i++) {
-            data_cs += raw_bytes[i];
+        uint8_t dcs = 0;                                /* byte-sum of the data bytes */
+        for (size_t i = 0; i < nbytes; i++) {
+            dcs += raw[i];
         }
-        if (data_cs == trailer[3]) {
-            /* ---- Step 7: ack data pass ---- */
-            uart_write_byte(port, FSM_DATA_PASS);   /* 180 */
-
+        if (dcs == trailer[3]) {
+            uart_write_byte(port, FSM_DATA_PASS);       /* 180 */
+            for (uint16_t i = 0; i < arr_len; i++) {    /* widen LE → uint32 */
+                uint32_t v = 0;
+                for (uint8_t k = 0; k < elem_width; k++) {
+                    v |= (uint32_t)raw[(size_t)i * elem_width + k] << (8 * k);
+                }
+                data[i] = v;
+            }
+            free(raw);
             out->index  = arr_idx;
             out->data   = data;
             out->length = arr_len;
             return ESP_OK;
         }
         ESP_LOGW(TAG, "FSM data checksum mismatch for array %u (attempt %d)",
-                 arr_idx, data_attempt + 1);
+                 arr_idx, attempt + 1);
     }
 
-    /* All retries exhausted */
-    free(data);
-    uart_write_byte(port, FSM_RESET);       /* 222 = give up on this array */
+    free(raw); free(data);
+    uart_write_byte(port, FSM_RESET);                   /* 222 = give up on this array */
     return ESP_ERR_INVALID_CRC;
 }
 
-/* ── Receive full FSM response (multiple arrays) ───────────────────── */
-
+/* ── Receive full FSM response (v2: one wake, then arrays until CMD_END) ──
+ * After CMD_DONE the ambit runs, then wakes the host once (0xD3 → we ack 0xD2
+ * exactly once) and streams every result array back-to-back as
+ * {header}{data}{trailer}, finishing with 0xF0 (CMD_END). We must NOT send a
+ * 210 per array — the single wake owns the ack; each array gets one 200 (ready)
+ * and one 180 (pass). */
 static esp_err_t receive_fsm_response(uart_port_t port,
                                       uart_sensor_response_t *resp,
                                       int64_t deadline)
 {
-    /* We arrive here after CMD_DONE.  Scan for FSM_WAKE or CMD_END. */
-    while (resp->array_count < UART_SENSOR_MAX_ARRAYS &&
-           !deadline_reached(deadline)) {
+    /* Step 1: single wake handshake. Ack the first 0xD3 with one 0xD2. A run
+     * that produced nothing jumps straight to CMD_END. */
+    bool awake = false;
+    while (!deadline_reached(deadline)) {
         uint8_t b;
-        int n = uart_read_bytes(port, &b, 1, pdMS_TO_TICKS(500));
-        if (n != 1) {
+        if (uart_read_bytes(port, &b, 1, pdMS_TO_TICKS(500)) != 1) {
             continue;
         }
-
+        if (b == FSM_WAKE) {
+            uart_write_byte(port, FSM_AWAKE);            /* 210 — ack, exactly once */
+            awake = true;
+            break;
+        }
         if (b == AMBIT_CMD_END) {
             resp->status = ESP_OK;
             return ESP_OK;
         }
+        /* skip stray bytes (debug / boot-idle) */
+    }
+    if (!awake) {
+        resp->status = ESP_ERR_TIMEOUT;
+        return ESP_ERR_TIMEOUT;
+    }
 
-        if (b == FSM_WAKE) {
-            esp_err_t err = fsm_receive_one_array(
-                port, &resp->arrays[resp->array_count], deadline);
-            if (err == ESP_OK) {
-                resp->array_count++;
-            } else if (err == ESP_ERR_INVALID_CRC) {
-                ESP_LOGW(TAG, "FSM array checksum error, ambit may retry");
-                /* Ambit will retry the same array (its state resets to WAKEUPCALLS) */
-            } else {
-                resp->status = err;
-                return err;
-            }
+    /* Step 2: arrays until CMD_END. Each starts with the 0xD4 header marker;
+     * leftover 0xD3 wake bytes (queued before our ack landed) are skipped. */
+    while (resp->array_count < UART_SENSOR_MAX_ARRAYS && !deadline_reached(deadline)) {
+        uint8_t b;
+        if (uart_read_bytes(port, &b, 1, pdMS_TO_TICKS(500)) != 1) {
+            continue;
         }
-        /* Other bytes (debug output, echoes) are silently discarded */
+        if (b == AMBIT_CMD_END) {
+            resp->status = ESP_OK;
+            return ESP_OK;
+        }
+        if (b != FSM_DATA_HDR) {
+            continue;                                    /* 0xD3 leftover / debug */
+        }
+
+        esp_err_t err = fsm_receive_one_array(
+            port, &resp->arrays[resp->array_count], deadline);
+        if (err == ESP_OK) {
+            resp->array_count++;
+        } else if (err == ESP_ERR_INVALID_CRC || err == ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(TAG, "FSM array error %s, continuing", esp_err_to_name(err));
+            /* checksum: ambit resends; stray header: keep scanning */
+        } else {
+            resp->status = err;
+            return err;
+        }
     }
 
     resp->status = ESP_ERR_TIMEOUT;

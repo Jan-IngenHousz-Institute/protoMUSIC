@@ -461,57 +461,64 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         return make_result(err, "claim_next_event failed: %s", esp_err_to_name(err));
     }
 
-    cJSON *root   = cJSON_CreateObject();
-    cJSON *sample = cJSON_CreateArray();
-    cJSON *data   = cJSON_Parse(e.payload_json); /* payload is a JSON object */
-    if (root == NULL || sample == NULL || data == NULL) {
-        if (root)   cJSON_Delete(root);
-        if (sample) cJSON_Delete(sample);
-        if (data)   cJSON_Delete(data);
-        s_cfg.mark_event_pending(e.measure_id);
-        measurement_event_free(&e);
-        return make_result(ESP_ERR_NO_MEM, "cJSON build failed");
-    }
-    cJSON_AddItemToObject(root, "sample", sample);
-    cJSON_AddStringToObject(root, "device_firmware",  s_cfg.device_firmware  ? s_cfg.device_firmware  : "");
-    cJSON_AddStringToObject(root, "device_id",        s_mac_str);
-    cJSON_AddStringToObject(root, "device_name",      s_cfg.device_name      ? s_cfg.device_name      : "");
-    cJSON_AddStringToObject(root, "device_version",   s_cfg.device_version   ? s_cfg.device_version   : "");
-    cJSON_AddStringToObject(root, "firmware_version", s_cfg.firmware_version ? s_cfg.firmware_version : "");
-
+    /* Build the MQTT envelope as a string, splicing the already-valid payload
+     * (and metadata) JSON in verbatim — no cJSON_Parse round-trip. The old
+     * parse→tree→print path needed ~4× the payload in heap (a node per number),
+     * which OOMs on this tight heap for multi-array runs, and scaled with point
+     * count. This needs one buffer ≈ payload size + a fixed envelope. The
+     * device/sensor/config strings are controlled (provisioned, no JSON
+     * metacharacters) so they are quoted directly; payload_json/metadata_json
+     * are already valid JSON. Structure/field-order matches the old output. */
     char ts_str[32];
-    time_t ts = time(NULL);
-    struct tm tm_info;
-    gmtime_r(&ts, &tm_info);
-    strftime(ts_str, sizeof(ts_str), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
-    cJSON_AddStringToObject(root, "timestamp", ts_str);
-
-    cJSON *obj = cJSON_CreateObject();
-    cJSON_AddNumberToObject(obj, "measure_id", (double)e.measure_id);
-    cJSON_AddNumberToObject(obj, "startTicks", (double)e.start_ticks_ms);
-    cJSON_AddNumberToObject(obj, "endTicks",   (double)e.end_ticks_ms);
-    if (e.device[0] == '\0') cJSON_AddNullToObject(obj, "device");
-    else                     cJSON_AddStringToObject(obj, "device", e.device);
-    cJSON_AddStringToObject(obj, "sensor", e.sensor);
-    if (e.metadata_json == NULL) {
-        cJSON_AddNullToObject(obj, "metadata");
-    } else {
-        cJSON *meta = cJSON_Parse(e.metadata_json);
-        if (meta) cJSON_AddItemToObject(obj, "metadata", meta);
-        else      cJSON_AddStringToObject(obj, "metadata", e.metadata_json);
+    {
+        time_t ts = time(NULL);
+        struct tm tm_info;
+        gmtime_r(&ts, &tm_info);
+        strftime(ts_str, sizeof(ts_str), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
     }
-    cJSON_AddItemToObject(obj, "data", data); /* root owns data */
-    cJSON_AddItemToArray(sample, obj);
 
-    char *payload = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
+    char devbuf[32];
+    if (e.device[0] != '\0') snprintf(devbuf, sizeof(devbuf), "\"%s\"", e.device);
+    else                     strcpy(devbuf, "null");
+
+    const char *meta = e.metadata_json;          /* already a JSON object, or NULL */
+    const char *fw   = s_cfg.device_firmware  ? s_cfg.device_firmware  : "";
+    const char *dn   = s_cfg.device_name      ? s_cfg.device_name      : "";
+    const char *dv   = s_cfg.device_version   ? s_cfg.device_version   : "";
+    const char *fv   = s_cfg.firmware_version ? s_cfg.firmware_version : "";
+
+    size_t cap = strlen(e.payload_json) + (meta ? strlen(meta) : 4)
+               + strlen(e.sensor) + strlen(devbuf)
+               + strlen(fw) + strlen(dn) + strlen(dv) + strlen(fv)
+               + strlen(s_mac_str) + strlen(ts_str)
+               + 256;                            /* fixed keys + numbers + punctuation */
+    char *payload = malloc(cap);
     if (payload == NULL) {
         s_cfg.mark_event_pending(e.measure_id);
         measurement_event_free(&e);
-        return make_result(ESP_ERR_NO_MEM, "cJSON print failed");
+        return make_result(ESP_ERR_NO_MEM, "envelope alloc failed (%u B)", (unsigned)cap);
     }
 
-    size_t payload_len = strlen(payload);
+    int n = snprintf(payload, cap,
+        "{\"sample\":[{"
+            "\"measure_id\":%lld,\"startTicks\":%lld,\"endTicks\":%lld,"
+            "\"device\":%s,\"sensor\":\"%s\",\"metadata\":%s,\"data\":%s"
+        "}],"
+        "\"device_firmware\":\"%s\",\"device_id\":\"%s\",\"device_name\":\"%s\","
+        "\"device_version\":\"%s\",\"firmware_version\":\"%s\",\"timestamp\":\"%s\"}",
+        (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
+        devbuf, e.sensor, meta ? meta : "null", e.payload_json,
+        fw, s_mac_str, dn, dv, fv, ts_str);
+
+    if (n < 0 || (size_t)n >= cap) {
+        free(payload);
+        s_cfg.mark_event_pending(e.measure_id);
+        measurement_event_free(&e);
+        return make_result(ESP_ERR_NO_MEM, "envelope build failed (n=%d cap=%u)",
+                           n, (unsigned)cap);
+    }
+
+    size_t payload_len = (size_t)n;
     if (payload_len >= MQTT_PAYLOAD_MAX) {
         ESP_LOGW(TAG, "event payload %u bytes exceeds %u; may be rejected",
                  (unsigned)payload_len, (unsigned)MQTT_PAYLOAD_MAX);
