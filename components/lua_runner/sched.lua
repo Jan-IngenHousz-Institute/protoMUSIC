@@ -75,6 +75,12 @@ function sched.run()
                 end
             end
         end
+        -- Reclaim this cycle's garbage now. Jobs build large transient tables
+        -- (160-point AMBIT result arrays), but between cycles the task blocks in
+        -- C (sync.wait / ambit.run / sleep_ms), which starves Lua's allocation-
+        -- driven incremental GC — so without this the Lua heap grows ~6 KB/min
+        -- until OOM. A full collect on this small heap is sub-millisecond.
+        collectgarbage("collect")
     end
 end
 

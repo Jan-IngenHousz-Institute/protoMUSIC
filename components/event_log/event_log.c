@@ -427,8 +427,18 @@ esp_err_t event_log_store_event(int64_t measure_id, const char *device, const ch
     w += fwrite(payload_json, 1, plen, s_wf);
     w += fwrite("\n", 1, 1, s_wf);
     if (w != total) {
-        ESP_LOGE(TAG, "store_event: short write (%u/%u) for id %lld — SD error",
+        /* A failed/short write (e.g. sdmmc couldn't get a DMA buffer under low
+         * heap) leaves a torn partial record. Roll the file back to the last good
+         * boundary so the partial can't merge with — and corrupt the framing of —
+         * the NEXT record. The event is simply dropped (not counted as pending).
+         * Best-effort: under severe OOM even the truncate may fail, but then the
+         * reader's skip-bad still discards the torn line on read. */
+        ESP_LOGE(TAG, "store_event: short write (%u/%u) for id %lld — SD error; rolling back",
                  (unsigned)w, (unsigned)total, (long long)measure_id);
+        fflush(s_wf);
+        if (ftruncate(fileno(s_wf), s_tail_size) != 0) {
+            ESP_LOGW(TAG, "store_event: rollback truncate failed (torn record left; reader will skip)");
+        }
         xSemaphoreGive(s_mtx);
         return ESP_FAIL;
     }

@@ -44,3 +44,11 @@ CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
 # real risk on our mutual-TLS link. Held back; revisit only if DYNAMIC_BUFFER
 # alone doesn't give enough headroom (watch the sync_runner "heap:" line).
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# Standalone heap leak tracing — DIAGNOSTIC ONLY. It found the leak (a Lua GC
+# starvation: sched.run blocks in C between cycles, starving Lua's alloc-driven
+# incremental GC, so measurement result tables piled up ~6 KB/min). Fixed with a
+# collectgarbage("collect") per sched.run cycle. Re-enable these two lines (the
+# `heaptrace start|stop|dump` CLI command compiles back in via #ifdef) if another
+# leak ever needs chasing; off by default to reclaim ~17 KiB static .bss.
+# CONFIG_HEAP_TRACING_STANDALONE=y
+# CONFIG_HEAP_TRACING_STACK_DEPTH=4

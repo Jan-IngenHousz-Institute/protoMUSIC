@@ -19,6 +19,10 @@
 #include "sd_logger.h"
 #include "wifi_manager.h"
 
+#ifdef CONFIG_HEAP_TRACING_STANDALONE
+#include "esp_heap_trace.h"
+#endif
+
 static const uint8_t CLI_I2C_SCAN_FIRST_ADDR = 0x08;
 static const uint8_t CLI_I2C_SCAN_LAST_ADDR = 0x77;
 static const uint8_t CLI_RTC_I2C_ADDR = (uint8_t)(0xA6 >> 1);
@@ -618,6 +622,46 @@ static int cli_cmd_sync(int argc, char **argv)
     return 0;
 }
 
+#ifdef CONFIG_HEAP_TRACING_STANDALONE
+/* Diagnostic: standalone heap-leak tracing. `heaptrace start` → run a few minutes
+ * while the leak accumulates → `heaptrace dump` prints every allocation made since
+ * start that is still un-freed, with the allocating call stack. addr2line the
+ * call-stack PCs against firmware.elf to find the leaking function. The ring is
+ * static .bss so it doesn't compete with the heap under test. */
+#define CLI_HEAP_TRACE_RECORDS 300
+static heap_trace_record_t s_heap_trace_buf[CLI_HEAP_TRACE_RECORDS];
+static bool s_heap_trace_inited = false;
+
+static int cli_cmd_heaptrace(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: heaptrace <start|stop|dump>\r\n");
+        return 1;
+    }
+    if (!s_heap_trace_inited) {
+        esp_err_t e = heap_trace_init_standalone(s_heap_trace_buf, CLI_HEAP_TRACE_RECORDS);
+        if (e != ESP_OK) {
+            printf("heaptrace: init failed: %s\r\n", esp_err_to_name(e));
+            return 1;
+        }
+        s_heap_trace_inited = true;
+    }
+    if (strcmp(argv[1], "start") == 0) {
+        esp_err_t e = heap_trace_start(HEAP_TRACE_LEAKS);
+        printf("heaptrace start: %s (ring=%d records). Let the leak run, then 'heaptrace dump'.\r\n",
+               esp_err_to_name(e), CLI_HEAP_TRACE_RECORDS);
+    } else if (strcmp(argv[1], "stop") == 0) {
+        printf("heaptrace stop: %s\r\n", esp_err_to_name(heap_trace_stop()));
+    } else if (strcmp(argv[1], "dump") == 0) {
+        heap_trace_dump();   /* prints un-freed allocations + call stacks to console */
+    } else {
+        printf("Usage: heaptrace <start|stop|dump>\r\n");
+        return 1;
+    }
+    return 0;
+}
+#endif /* CONFIG_HEAP_TRACING_STANDALONE */
+
 static esp_err_t cli_register_commands(void)
 {
     if (s_cli_commands_registered) {
@@ -714,6 +758,13 @@ static esp_err_t cli_register_commands(void)
         .help    = "restart the device",
         .func    = cli_cmd_reboot,
     };
+#ifdef CONFIG_HEAP_TRACING_STANDALONE
+    static const esp_console_cmd_t heaptrace_cmd = {
+        .command = "heaptrace",
+        .help    = "heaptrace <start|stop|dump>  diagnostic heap-leak trace",
+        .func    = cli_cmd_heaptrace,
+    };
+#endif
 
     esp_err_t err = esp_console_cmd_register(&status_cmd);
     if (err != ESP_OK) {
@@ -804,6 +855,13 @@ static esp_err_t cli_register_commands(void)
     if (err != ESP_OK) {
         return err;
     }
+
+#ifdef CONFIG_HEAP_TRACING_STANDALONE
+    err = esp_console_cmd_register(&heaptrace_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+#endif
 
     s_cli_commands_registered = true;
     return ESP_OK;
