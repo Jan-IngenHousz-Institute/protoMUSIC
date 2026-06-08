@@ -898,17 +898,17 @@ static bool ambit_parse_field(const char *line, const char *key, double *out)
 
 /* Array index → JSON tag, matching the ambit fw AMBYTE send order
  * (PAM.cpp pam_send_results): 0=ENV(leaf temp), 1=fluor, 2=fluoRef, 3=sun,
- * 4=leaf, 5=730, 6=730ref. NULL → caller falls back to "arr<idx>". */
+ * 4=leaf, 5=730, 6=730ref, 7=TIMING. NULL → caller falls back to "arr<idx>". */
 static const char *ambit_array_tag(uint8_t idx)
 {
     switch (idx) {
-        case 0: return "leaf_temp";
-        case 1: return "fluor";
-        case 2: return "fluoRef";
+        case 0: return "env";      /* ENV — leaf temperature, degC */
+        case 1: return "s_fluo";   /* Fluo — fluorescence signal */
+        case 2: return "r_fluo";   /* Fluoref — fluorescence reference */
         case 3: return "sun";
         case 4: return "leaf";
-        case 5: return "r730";
-        case 6: return "r730ref";
+        case 5: return "s_730";    /* 730 signal */
+        case 6: return "r_730";    /* 730 reference */
         case 7: return "timing";   /* uint32 [tick_begin, tick_end] µs */
         default: return NULL;
     }
@@ -1112,9 +1112,11 @@ static int l_ambit_run(lua_State *L)
 
     int stored = 0;
     if (store && !trunc) {
+        char sensor_name[16];
+        snprintf(sensor_name, sizeof sensor_name, "AMBIT_%u", (unsigned)(ch + 1));
         int64_t mid = 0;
         if (cmd_next_measure_id(&mid).status == ESP_OK &&
-            cmd_store_event(mid, "ambit", "AMBIT", start_ms, end_ms,
+            cmd_store_event(mid, "ambit", sensor_name, start_ms, end_ms,
                             metadata_json, s_ambit_payload).status == ESP_OK) {
             stored = 1;
         }
