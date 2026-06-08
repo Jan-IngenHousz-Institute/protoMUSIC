@@ -1041,7 +1041,8 @@ static esp_err_t ambit_info_fetch(uint8_t ch)
     size_t cgot = 0;
     cmd_result_t cr = cmd_ambit_get_info(ch, AMBIT_INFO_CALIBRATION, (uint8_t *)&cal, sizeof cal, &cgot);
     if (cr.status == ESP_OK && cgot >= sizeof cal) {
-        e.cal_version = esp_rom_crc32_le(0, (const uint8_t *)&cal, sizeof cal);
+        e.cal_version   = esp_rom_crc32_le(0, (const uint8_t *)&cal, sizeof cal);
+        e.actinic_coef  = cal.actinic_coef;
         memcpy(e.ambit_name, cal.ambit_name, sizeof e.ambit_name - 1);
     }
 

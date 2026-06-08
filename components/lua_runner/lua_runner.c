@@ -935,6 +935,23 @@ static char *s_ambit_payload;
  * point arrays are persisted to the DB (the point of the run), not materialised
  * back into Lua, to keep memory bounded for large runs. store=true persists one
  * event whose payload is {"leaf_temp":[…],"fluor":[…],"fluoRef":[…],…}. */
+/* Actinic value → AMBIT LED-current byte, matching the original WRENCH ambyte
+ * (protocol.cpp::generate_arr): a negative value (-255..-1) is an exact DAC level
+ * (|value|); a positive value (1..9999) is PAR in µmol → byte = par_coef × PAR,
+ * floored at 4 and capped at 255; anything else (0 / out of range) = 0 (off).
+ * par_coef is the AMBIT's actinic calibration (fallback 0.05 byte/µmol). */
+static uint8_t ambit_actinic_to_dac(lua_Integer actinic, float par_coef)
+{
+    if (actinic < 0 && actinic > -256) return (uint8_t)(-actinic);
+    if (actinic > 0 && actinic < 10000) {
+        float t = par_coef * (float)actinic;
+        if (t < 4.0f)   return 4;
+        if (t > 255.0f) return 255;
+        return (uint8_t)t;
+    }
+    return 0;
+}
+
 static int l_ambit_run(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
@@ -968,6 +985,12 @@ static int l_ambit_run(lua_State *L)
     uint8_t *run_arr = malloc((size_t)nseg * 8);
     if (!run_arr) return luaL_error(L, "out of memory");
 
+    /* This AMBIT's PAR→DAC actinic coefficient — lazily fetched once + cached
+     * (cmd 33). Fallback 0.05 byte/µmol if the calibration can't be read. */
+    ambit_device_info_t info;
+    cmd_ambit_device_info(ch, &info);
+    float par_coef = (info.valid && info.actinic_coef > 0.0f) ? info.actinic_coef : 0.05f;
+
     uint32_t total_pts = 0;
     for (int i = 1; i <= nseg; i++) {
         lua_rawgeti(L, 2, i);
@@ -995,7 +1018,8 @@ static int l_ambit_run(lua_State *L)
 
         if (pulses < 1 || pulses > 65535) { free(run_arr); return luaL_error(L, "segment %d: pulses must be 1-65535", i); }
         if (freq   < 1 || freq   > 65535) { free(run_arr); return luaL_error(L, "segment %d: freq must be 1-65535", i); }
-        if (actinic < 0 || actinic > 255) { free(run_arr); return luaL_error(L, "segment %d: actinic must be 0-255", i); }
+        /* actinic: WRENCH convention — -255..-1 = raw DAC, 1..9999 = PAR (µmol),
+         * 0 / out-of-range = off. Converted per the AMBIT's calibration below. */
 
         uint8_t *line = run_arr + (i - 1) * 8;
         line[0] = 2;                              /* type 2: no IR (notebook default) */
@@ -1004,7 +1028,7 @@ static int l_ambit_run(lua_State *L)
         line[3] = (uint8_t)(pulses & 0xFF);
         line[4] = (uint8_t)((freq >> 8) & 0xFF);
         line[5] = (uint8_t)(freq & 0xFF);
-        line[6] = (uint8_t)actinic;
+        line[6] = ambit_actinic_to_dac(actinic, par_coef);
         line[7] = 1;                              /* subsampling: every point */
         total_pts += (uint32_t)pulses;
     }

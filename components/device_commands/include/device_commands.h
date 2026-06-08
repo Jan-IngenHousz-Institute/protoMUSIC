@@ -183,6 +183,7 @@ typedef struct {
     char     fw_version[16];   /* "major.minor.batch" */
     uint32_t cal_version;      /* CRC32 of the calibration struct (bumps on any cal change) */
     char     ambit_name[20];   /* calibration ambit_name, e.g. "AmbitV003" */
+    float    actinic_coef;     /* PAR(µmol)→DAC byte = actinic_coef × PAR; 0 if cal unread */
 } ambit_device_info_t;
 
 /* Return cached identity for `ch`, lazily fetching on first use (one-time UART
