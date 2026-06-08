@@ -31,3 +31,16 @@ CONFIG_FATFS_MAX_LFN=255
 # still holds the broker's TLS handshake cert record. OUT stays 4 KiB
 # (asymmetric content len is already enabled).
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+# Dynamic TLS record buffers: free the 8 KiB IN / 4 KiB OUT record buffers
+# *between* records and reallocate per-record sized to need, instead of holding
+# all 12 KiB for the connection's lifetime. This is the targeted fix for the OOM
+# death-spiral seen under load: an MQTT write stall -> esp-mqtt auto-reconnect
+# churned those 12 KiB through an already-fragmented heap until a 3 KiB malloc
+# and the Wi-Fi driver (wifi:m f null) starved. We publish one ~3 KiB event every
+# few seconds, so we are heap-bound, not throughput-bound — a great trade.
+# The further cert/key-free options (FREE_CA_CERT, ~6 KiB) are gated behind
+# MBEDTLS_DYNAMIC_FREE_CONFIG_DATA, which frees the client private key after the
+# handshake and is flagged in IDF's own help as problematic for reconnects — a
+# real risk on our mutual-TLS link. Held back; revisit only if DYNAMIC_BUFFER
+# alone doesn't give enough headroom (watch the sync_runner "heap:" line).
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y

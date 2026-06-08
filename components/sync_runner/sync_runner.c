@@ -2,6 +2,7 @@
 
 #include "device_commands.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -71,6 +72,14 @@ static void sync_runner_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_PERIOD_MS));
 
     while (1) {
+        /* Heap trend: free vs largest contiguous block in the byte-addressable
+         * heap that malloc/TLS/Wi-Fi draw from. A falling `largest` with steady
+         * `free` is fragmentation (the OOM-spiral signature); both falling and
+         * not recovering is a leak. Cheap, once per 10 s. */
+        ESP_LOGI(TAG, "heap: free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
         if (sync_runner_is_allowed()) {
             /* Burst-drain all pending events while idle (one msg per id). */
             sync_runner_drain();

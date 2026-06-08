@@ -26,7 +26,7 @@
 #include "sd_card.h"
 #include "sd_logger.h"
 #include "spike_log.h"
-#include "sqlite_persistence.h"
+#include "event_log.h"
 #include "sync_runner.h"
 #include "uart_sensors.h"
 #include "wifi_manager.h"
@@ -143,7 +143,7 @@ static void app_on_sd_state_change(bool mounted)
 {
     if (mounted) {
         /* DB first (the script will hit cmd_store_event almost immediately). */
-        sqlite_persistence_on_sd_restored();
+        event_log_on_sd_restored();
         esp_err_t err = lua_runner_start();
         if (err == ESP_OK) {
             ESP_LOGI(APP_TAG, "Lua runner restarted (SD inserted)");
@@ -156,7 +156,7 @@ static void app_on_sd_state_change(bool mounted)
          * unwind from a sleep / short read; longer UART reads will finish in
          * the background and the task will exit on its own. */
         lua_runner_stop(5000);
-        sqlite_persistence_on_sd_lost();
+        event_log_on_sd_lost();
     }
 }
 
@@ -424,10 +424,10 @@ void app_main(void)
         ESP_LOGE(APP_TAG, "LittleFS unavailable, persistence disabled");
     }
 
-    /* ── Persistence (SQLite) ─────────────────────────────────────── */
+    /* ── Persistence (append-only event log) ──────────────────────── */
     bool persistence_available = false;
     if (lfs_available) {
-        err = sqlite_persistence_init();
+        err = event_log_init();
         if (err == ESP_OK) {
             persistence_available = true;
             ESP_LOGI(APP_TAG, "Persistence layer ready");
@@ -460,12 +460,12 @@ void app_main(void)
         .read_clock             = pcf2131tfy_rtc_get_clock_read_fn(),
         .set_status             = ambyte_status_get_set_fn(),
         .sd_ready               = sd_available ? sdcard_is_mounted : NULL,
-        .next_id            = persistence_available ? sqlite_persistence_get_next_id_fn()            : NULL,
-        .store_event        = persistence_available ? sqlite_persistence_get_store_event_fn()        : NULL,
-        .claim_next_event   = persistence_available ? sqlite_persistence_get_claim_next_event_fn()   : NULL,
-        .mark_event_synced  = persistence_available ? sqlite_persistence_get_mark_event_synced_fn()  : NULL,
-        .mark_event_pending = persistence_available ? sqlite_persistence_get_mark_event_pending_fn() : NULL,
-        .db_stats           = persistence_available ? sqlite_persistence_get_db_stats_fn()           : NULL,
+        .next_id            = persistence_available ? event_log_get_next_id_fn()            : NULL,
+        .store_event        = persistence_available ? event_log_get_store_event_fn()        : NULL,
+        .claim_next_event   = persistence_available ? event_log_get_claim_next_event_fn()   : NULL,
+        .mark_event_synced  = persistence_available ? event_log_get_mark_event_synced_fn()  : NULL,
+        .mark_event_pending = persistence_available ? event_log_get_mark_event_pending_fn() : NULL,
+        .db_stats           = persistence_available ? event_log_get_db_stats_fn()           : NULL,
         .publish                = mqtt_client_get_publish_fn(),
         .message_is_connected   = mqtt_client_get_is_connected_fn(),
         .set_publish_ack_handler = mqtt_client_get_set_ack_handler_fn(),

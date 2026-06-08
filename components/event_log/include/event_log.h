@@ -1,0 +1,68 @@
+#ifndef AMBYTE_EVENT_LOG_H
+#define AMBYTE_EVENT_LOG_H
+
+#include "esp_err.h"
+#include "persistence_port.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * Append-only event log — drop-in replacement for the SQLite persistence layer
+ * behind the same `persistence_port.h` interface.
+ *
+ * Why: SQLite's in-place page + header rewrites on every commit corrupt FATFS/SD
+ * under load. The workload is a store-and-forward FIFO, not a relational query,
+ * so an append-only log is both the right tool and the proven-robust one (the
+ * prior firmware logged to a TXT file on the same card for months without
+ * corruption; the Step-0 spike reproduced that result — see
+ * docs/append-log-persistence-plan.md).
+ *
+ * Storage model: /sdcard/events/ holds rotating files ev-000001.log, … (monotonic
+ * seq). One newline-terminated, tab-delimited record per event:
+ *   <measure_id>\t<device>\t<sensor>\t<start_ms>\t<end_ms>\t<metadata>\t<payload>\n
+ * The tail file is appended to (store) with PERIODIC flush; a fresh read handle
+ * after fsync serves claims (the read+append handshake the per-file-cache FATFS
+ * build needs). The read cursor and a next_id high-water mark live in NVS
+ * (internal flash), keeping the SD to appends only. mark_synced advances the
+ * cursor; a fully-drained rotated file is deleted to reclaim space. The reader
+ * skips any record it can't parse, so a power-loss-torn final record needs no
+ * boot-time repair.
+ */
+esp_err_t event_log_init(void);
+
+/* Called by the SD hot-plug monitor when the card is pulled/reinserted. */
+esp_err_t event_log_on_sd_lost(void);
+esp_err_t event_log_on_sd_restored(void);
+
+/* Event store / claim / mark (see persistence_port.h for semantics). */
+esp_err_t event_log_next_id(int64_t *out_id);
+esp_err_t event_log_store_event(int64_t measure_id,
+                                const char *device, const char *sensor,
+                                int64_t start_ms, int64_t end_ms,
+                                const char *metadata_json,
+                                const char *payload_json);
+esp_err_t event_log_claim_next_event(measurement_event_t *out);
+esp_err_t event_log_mark_event_synced(int64_t measure_id);
+esp_err_t event_log_mark_event_pending(int64_t measure_id);
+
+/* Read-only stats (see measurement_db_stats_fn). *total == *pending: every
+ * record physically present in the log is not-yet-synced (synced records are
+ * dropped as the cursor advances and drained files are deleted). */
+esp_err_t event_log_db_stats(bool *available, int64_t *total,
+                             int64_t *pending, int64_t *next_id);
+
+/* Getters for function pointers (wired into device_commands_config_t). */
+measurement_next_id_fn            event_log_get_next_id_fn(void);
+measurement_store_event_fn        event_log_get_store_event_fn(void);
+measurement_claim_next_event_fn   event_log_get_claim_next_event_fn(void);
+measurement_mark_event_synced_fn  event_log_get_mark_event_synced_fn(void);
+measurement_mark_event_pending_fn event_log_get_mark_event_pending_fn(void);
+measurement_db_stats_fn           event_log_get_db_stats_fn(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
