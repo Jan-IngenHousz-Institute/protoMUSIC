@@ -210,6 +210,39 @@ static int l_device_log(lua_State *L)
     return 0;
 }
 
+/* device.status_report() → string. Builds the compact status block (Wi-Fi, DB,
+ * power incl. source/charge/publish-gate) and logs it at WARN so it lands on
+ * both the serial console and the SD log, then returns the text so the caller
+ * can also forward it (e.g. device.publish_status). nil,err on failure. */
+static int l_device_status_report(lua_State *L)
+{
+    char buf[320];
+    cmd_result_t res = cmd_status_report(buf, sizeof(buf));
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+    ESP_LOGW(LUA_RUNNER_TAG, "status:\n%s", buf);
+    lua_pushstring(L, buf);
+    return 1;
+}
+
+/* device.publish_status(payload) → true | false,err. Publishes the payload to
+ * "<topic_root>/status" when the broker is connected (heartbeat: bypasses the
+ * event DB and the publish power gate). */
+static int l_device_publish_status(lua_State *L)
+{
+    size_t len = 0;
+    const char *payload = luaL_checklstring(L, 1, &len);
+    cmd_result_t res = cmd_publish_status(payload, len);
+    if (res.status != ESP_OK) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, res.message);
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 /* device.PWM(duty, freq, enable)
  *   duty   0..100  float, default 0
  *   freq   Hz,     default 10000
@@ -866,6 +899,8 @@ static void lua_register_device_module(lua_State *L)
         {"sd_ready",               l_device_sd_ready},
         {"sleep_ms",               l_device_sleep_ms},
         {"log",                    l_device_log},
+        {"status_report",          l_device_status_report},
+        {"publish_status",         l_device_publish_status},
         {"PWM",                    l_device_pwm},
         /* UART raw */
         {"uart_ping",              l_device_uart_ping},

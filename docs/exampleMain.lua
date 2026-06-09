@@ -67,6 +67,15 @@ local function ss_round()   run_trace("SS",   SS,  false) end
 local function mpf_round()  run_trace("MPF",  MPF, true)  end
 local function edge_round() run_trace("edge", MPF, false) end
 
+-- Status heartbeat: device.status_report() builds the block (Wi-Fi, DB, power +
+-- source/charge/publish-gate) and logs it to serial + SD; we forward the same
+-- text to <topic_root>/status whenever the broker is connected. The heartbeat
+-- bypasses the publish power gate, so it still reports while running on battery.
+local function status_round()
+    local s = device.status_report()
+    if s and mqtt.status() then device.publish_status(s) end
+end
+
 do
     local sr, ss = sync.sun_today()
     device.log(string.format("schedule started; sunrise=%s sunset=%s", sr, ss))
@@ -78,6 +87,7 @@ sched.every("1m", record_spectra, { when = "day" }) -- spectrum, daytime
 sched.every("5m", mpf_round,      { when = "day" }) -- MPF, daytime
 sched.sun("sunset",   30 * 60, edge_round)          -- dark-edge trace
 sched.sun("sunrise", -30 * 60, edge_round)
+sched.every("5m", status_round)                     -- status heartbeat (log + MQTT)
 sched.every(3, heartbeat)                           -- liveness blink
 
 sched.run()

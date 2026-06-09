@@ -115,6 +115,17 @@ cmd_result_t cmd_sd_ready(bool *out_ready);
 cmd_result_t cmd_log(const char *msg);
 cmd_result_t cmd_sleep_ms(uint32_t ms);
 
+/* Build a compact multi-line device-status block into `out` (Wi-Fi + provision,
+ * event DB, MP2731 power incl. source/charge/publish-gate) — the same fields the
+ * `status` CLI prints, formatted identically. NUL-terminated; truncation is an
+ * error. Used by the Lua heartbeat. */
+cmd_result_t cmd_status_report(char *out, size_t cap);
+
+/* Publish a status/heartbeat payload to "<topic_root>/status" directly (no DB,
+ * no in-flight tracking, NOT subject to the publish power gate). Returns
+ * ESP_ERR_INVALID_STATE when the broker isn't connected. */
+cmd_result_t cmd_publish_status(const char *payload, size_t len);
+
 /* Store one measurement event. payload_json is a JSON object of quantities
  * (required); metadata_json may be NULL; device "" / NULL = onboard. Writes
  * straight to SQLite — requires the SD-backed DB. */

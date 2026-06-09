@@ -17,6 +17,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "wifi_manager.h"
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -627,6 +628,89 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     int64_t mid = e.measure_id;
     measurement_event_free(&e);
     return make_result(ESP_OK, "published event id=%lld msg_id=%d", (long long)mid, msg_id);
+}
+
+/* ── Status report + heartbeat publish ─────────────────────────────────── */
+
+cmd_result_t cmd_status_report(char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return make_result(ESP_ERR_INVALID_ARG, "status_report: null buf");
+    }
+    out[0] = '\0';
+
+    const bool wifi_conn = wifi_manager_is_connected();
+    bool provisioned = false;
+    (void)wifi_manager_is_provisioned(&provisioned);
+
+    bool    db_online = false;
+    int64_t total = 0, pending = 0, next_id = 0;
+    const bool db_known =
+        (cmd_db_status(&db_online, &total, &pending, &next_id).status == ESP_OK);
+
+    size_t off = 0;
+    int n = snprintf(out + off, cap - off, "Wi-Fi: %s (provisioned: %s)\n",
+                     wifi_conn ? "connected" : "disconnected",
+                     provisioned ? "yes" : "no");
+    if (n < 0 || (size_t)n >= cap - off) return make_result(ESP_ERR_NO_MEM, "status truncated");
+    off += (size_t)n;
+
+    if (db_known && db_online) {
+        n = snprintf(out + off, cap - off, "DB: online (%lld total, %lld pending)\n",
+                     (long long)total, (long long)pending);
+    } else {
+        n = snprintf(out + off, cap - off, "DB: offline\n");
+    }
+    if (n < 0 || (size_t)n >= cap - off) return make_result(ESP_ERR_NO_MEM, "status truncated");
+    off += (size_t)n;
+
+    power_reading_t pw;
+    if (s_cfg.read_power != NULL && s_cfg.read_power(&pw) == ESP_OK) {
+        static const char *const charge_str[] = {"idle", "pre-charge", "charging", "charged"};
+        n = snprintf(out + off, cap - off,
+            "Power: Vbat %.2f V, Vin %.2f V, Vsys %.2f V, Iin %u mA, Icharge %u mA\n",
+            pw.battery_mv / 1000.0, pw.input_mv / 1000.0, pw.system_mv / 1000.0,
+            pw.input_ma, pw.charge_ma);
+        if (n < 0 || (size_t)n >= cap - off) return make_result(ESP_ERR_NO_MEM, "status truncated");
+        off += (size_t)n;
+        n = snprintf(out + off, cap - off, "source: %s, charge: %s, publish gate: %s",
+                     pw.input_present ? "external" : "battery",
+                     charge_str[pw.charge_status & 0x03],
+                     device_commands_publish_power_ok() ? "OPEN" : "CLOSED");
+    } else {
+        n = snprintf(out + off, cap - off, "Power: unavailable");
+    }
+    if (n < 0 || (size_t)n >= cap - off) return make_result(ESP_ERR_NO_MEM, "status truncated");
+    off += (size_t)n;
+
+    return make_result(ESP_OK, "status report (%u B)", (unsigned)off);
+}
+
+cmd_result_t cmd_publish_status(const char *payload, size_t len)
+{
+    if (payload == NULL) {
+        return make_result(ESP_ERR_INVALID_ARG, "publish_status: null payload");
+    }
+    if (!s_initialized || s_cfg.publish == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not available");
+    }
+    if (s_cfg.message_is_connected != NULL && !s_cfg.message_is_connected()) {
+        return make_result(ESP_ERR_INVALID_STATE, "MQTT not connected");
+    }
+
+    char topic[MQTT_TOPIC_MAX];
+    snprintf(topic, sizeof(topic), "%s/status",
+             (s_cfg.topic_root && s_cfg.topic_root[0]) ? s_cfg.topic_root : "ambyte");
+
+    /* Fire-and-forget heartbeat: no in-flight latch (those are reserved for the
+     * one-event-at-a-time measurement pipeline). */
+    int msg_id = 0;
+    esp_err_t err = s_cfg.publish(topic, payload, len, &msg_id);
+    if (err != ESP_OK) {
+        return make_result(err, "status publish failed: %s", esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "status published to %s (%u B, msg_id=%d)",
+                       topic, (unsigned)len, msg_id);
 }
 
 cmd_result_t cmd_uart_stream_query(uint8_t channel, const char *cmd,
