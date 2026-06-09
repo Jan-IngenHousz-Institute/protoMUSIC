@@ -210,36 +210,39 @@ static int l_device_log(lua_State *L)
     return 0;
 }
 
-/* device.status_report() → string. Builds the compact status block (Wi-Fi, DB,
- * power incl. source/charge/publish-gate) and logs it at WARN so it lands on
- * both the serial console and the SD log, then returns the text so the caller
- * can also forward it (e.g. device.publish_status). nil,err on failure. */
+/* device.status_report() → table | nil,err. Point-in-time device state (Wi-Fi,
+ * provisioning, event DB, MP2731 power + source/charge/publish-gate). Intended
+ * to be stored via db.store_event{ sensor="status", data=... } so the sole
+ * publisher (sync_runner) forwards it under the power gate. */
 static int l_device_status_report(lua_State *L)
 {
-    char buf[320];
-    cmd_result_t res = cmd_status_report(buf, sizeof(buf));
+    device_status_snapshot_t s;
+    cmd_result_t res = cmd_status_report(&s);
     if (res.status != ESP_OK) {
         return lua_push_nil_reason(L, res.message);
     }
-    ESP_LOGW(LUA_RUNNER_TAG, "status:\n%s", buf);
-    lua_pushstring(L, buf);
-    return 1;
-}
 
-/* device.publish_status(payload) → true | false,err. Publishes the payload to
- * "<topic_root>/status" when the broker is connected (heartbeat: bypasses the
- * event DB and the publish power gate). */
-static int l_device_publish_status(lua_State *L)
-{
-    size_t len = 0;
-    const char *payload = luaL_checklstring(L, 1, &len);
-    cmd_result_t res = cmd_publish_status(payload, len);
-    if (res.status != ESP_OK) {
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, res.message);
-        return 2;
+    lua_newtable(L);
+    lua_pushboolean(L, s.wifi_connected);    lua_setfield(L, -2, "wifi");
+    lua_pushboolean(L, s.provisioned);       lua_setfield(L, -2, "provisioned");
+    lua_pushboolean(L, s.db_online);         lua_setfield(L, -2, "db_online");
+    lua_pushboolean(L, s.publish_gate_open); lua_setfield(L, -2, "publish_gate");
+    if (s.power_valid) {
+        lua_pushnumber(L, (lua_Number)s.power.battery_mv / 1000.0);
+        lua_setfield(L, -2, "battery_v");
+        lua_pushnumber(L, (lua_Number)s.power.input_mv / 1000.0);
+        lua_setfield(L, -2, "input_v");
+        lua_pushnumber(L, (lua_Number)s.power.system_mv / 1000.0);
+        lua_setfield(L, -2, "system_v");
+        lua_pushinteger(L, (lua_Integer)s.power.input_ma);
+        lua_setfield(L, -2, "input_ma");
+        lua_pushinteger(L, (lua_Integer)s.power.charge_ma);
+        lua_setfield(L, -2, "charge_ma");
+        lua_pushboolean(L, s.power.input_present);
+        lua_setfield(L, -2, "input_present");
+        lua_pushinteger(L, (lua_Integer)s.power.charge_status);
+        lua_setfield(L, -2, "charge_status");
     }
-    lua_pushboolean(L, 1);
     return 1;
 }
 
@@ -856,34 +859,10 @@ static int l_db_next_id(lua_State *L)
     return 1;
 }
 
-/* ── mqtt.* bindings ─────────────────────────────────────────────────── */
-
-static int l_mqtt_status(lua_State *L)
-{
-    cmd_result_t res = cmd_mqtt_status();
-    /* ESP_ERR_NOT_SUPPORTED → not wired; "MQTT: connected" / "MQTT: disconnected" otherwise */
-    lua_pushboolean(L, res.status == ESP_OK &&
-                       strstr(res.message, "disconnected") == NULL);
-    return 1;
-}
-
-/* Force the sync runner's next-event publish path immediately (one
- * measure_id = one message). Returns true if an event was sent, false (with
- * reason) if nothing to send or one is still in flight, nil,err on failure. */
-static int l_mqtt_publish_next_event(lua_State *L)
-{
-    cmd_result_t res = cmd_mqtt_publish_next_event();
-    if (res.status == ESP_ERR_NOT_FOUND || res.status == ESP_ERR_INVALID_STATE) {
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, res.message);
-        return 2;
-    }
-    if (res.status != ESP_OK) {
-        return lua_push_nil_reason(L, res.message);
-    }
-    lua_pushboolean(L, 1);
-    return 1;
-}
+/* NOTE: there is deliberately no Lua MQTT module. Publishing is owned solely by
+ * sync_runner, which drains the event DB under the power gate. Lua scripts only
+ * *store* (db.store_event); the runner forwards. This keeps the gate in one
+ * place and makes the store the single, durable source of truth. */
 
 /* ── module registration ─────────────────────────────────────────────── */
 
@@ -900,7 +879,6 @@ static void lua_register_device_module(lua_State *L)
         {"sleep_ms",               l_device_sleep_ms},
         {"log",                    l_device_log},
         {"status_report",          l_device_status_report},
-        {"publish_status",         l_device_publish_status},
         {"PWM",                    l_device_pwm},
         /* UART raw */
         {"uart_ping",              l_device_uart_ping},
@@ -937,18 +915,6 @@ static void lua_register_db_module(lua_State *L)
 
     luaL_newlib(L, db_api);
     lua_setglobal(L, "db");
-}
-
-static void lua_register_mqtt_module(lua_State *L)
-{
-    static const luaL_Reg mqtt_api[] = {
-        {"status",              l_mqtt_status},
-        {"publish_next_event",  l_mqtt_publish_next_event},
-        {NULL, NULL},
-    };
-
-    luaL_newlib(L, mqtt_api);
-    lua_setglobal(L, "mqtt");
 }
 
 /* Parse "<key><number>" out of an ASCII line (e.g. key "T:" from
@@ -1444,7 +1410,6 @@ static void lua_runner_task(void *arg)
     luaL_openlibs(L);
     lua_register_device_module(L);
     lua_register_db_module(L);
-    lua_register_mqtt_module(L);
     lua_register_ambit_module(L);
     lua_register_sync_module(L);
 

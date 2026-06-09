@@ -8,24 +8,30 @@ extern "C" {
 #endif
 
 /**
- * @brief Start the background MQTT sync task.
+ * @brief Start the background MQTT sync task — the sole MQTT publisher.
  *
- * Wakes every SYNC_RUNNER_PERIOD_MS, walks the known measure types, and
- * calls cmd_mqtt_publish_unsynced() on each until either one publish is
- * accepted (one in-flight slot at a time — see device_commands.c) or no
- * pending groups remain. Idempotent; subsequent calls are no-ops.
+ * Blocks until woken (a measurement event was stored, or a measurement burst
+ * finished) or a fallback timeout fires, then drains all pending events while
+ * sync_runner_is_allowed() holds: one in-flight slot at a time (see
+ * device_commands.c). Registers its wake hook via device_commands_set_sync_notifier().
+ * Idempotent; subsequent calls are no-ops.
  *
- * Power gating: each cycle checks sync_runner_is_allowed() before doing
- * anything. The default implementation always returns true; replace it
- * with a power_monitor-backed check once the solar/charge sensor lands.
+ * Power gating: the drain only runs while sync_runner_is_allowed() is true
+ * (no measurement in progress AND device on external power). Events otherwise
+ * stay PENDING and drain when the gate reopens (caught by the fallback timer).
  */
 esp_err_t sync_runner_start(void);
 
 /**
- * @brief Gate hook for the future power-aware policy.
- *
- * Override behaviour by re-defining as needed; today returns true so the
- * sync task runs unconditionally whenever MQTT is connected.
+ * @brief Wake the sync task to (re)evaluate the drain. Safe before start
+ *        (no-op until the task exists). Registered as the store/measurement-end
+ *        notifier so publishing is event-driven, not polled.
+ */
+void sync_runner_notify(void);
+
+/**
+ * @brief Gate hook for the power-aware policy. Weak; returns true only when no
+ *        measurement is active AND the device is on external power.
  */
 bool sync_runner_is_allowed(void);
 

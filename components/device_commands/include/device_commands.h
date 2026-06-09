@@ -76,6 +76,12 @@ void device_commands_measurement_begin(void);
 void device_commands_measurement_end(void);
 bool device_commands_measurement_active(void);
 
+/* Register a callback fired whenever a measurement event is stored, and when a
+ * measurement burst finishes — the sync_runner registers its task-notify here so
+ * it can wake and drain on demand instead of polling. NULL clears it. The hook
+ * runs in the caller's (storing) task context; keep it cheap (a task notify). */
+void device_commands_set_sync_notifier(void (*fn)(void));
+
 /* Phase-1 power gate: true when it's OK to drain the MQTT backlog — i.e. the
  * device is on external (solar/USB) power, so battery-only operation doesn't
  * spend the radio's energy budget. Keyed on VIN-present (not input current) and
@@ -115,16 +121,20 @@ cmd_result_t cmd_sd_ready(bool *out_ready);
 cmd_result_t cmd_log(const char *msg);
 cmd_result_t cmd_sleep_ms(uint32_t ms);
 
-/* Build a compact multi-line device-status block into `out` (Wi-Fi + provision,
- * event DB, MP2731 power incl. source/charge/publish-gate) — the same fields the
- * `status` CLI prints, formatted identically. NUL-terminated; truncation is an
- * error. Used by the Lua heartbeat. */
-cmd_result_t cmd_status_report(char *out, size_t cap);
+/* Point-in-time device status (Wi-Fi + provisioning, event DB, MP2731 power and
+ * publish-gate state) — the same facts the `status` CLI prints. Gathered by
+ * cmd_status_report() for the Lua heartbeat, which stores it as a sensor="status"
+ * event so the sole publisher (sync_runner) forwards it under the power gate. */
+typedef struct {
+    bool            wifi_connected;
+    bool            provisioned;
+    bool            db_online;
+    bool            power_valid;        /* false if no charger / read failed */
+    power_reading_t power;              /* valid only when power_valid */
+    bool            publish_gate_open;  /* device_commands_publish_power_ok() */
+} device_status_snapshot_t;
 
-/* Publish a status/heartbeat payload to "<topic_root>/status" directly (no DB,
- * no in-flight tracking, NOT subject to the publish power gate). Returns
- * ESP_ERR_INVALID_STATE when the broker isn't connected. */
-cmd_result_t cmd_publish_status(const char *payload, size_t len);
+cmd_result_t cmd_status_report(device_status_snapshot_t *out);
 
 /* Store one measurement event. payload_json is a JSON object of quantities
  * (required); metadata_json may be NULL; device "" / NULL = onboard. Writes

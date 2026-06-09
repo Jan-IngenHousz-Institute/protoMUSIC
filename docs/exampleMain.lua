@@ -44,14 +44,15 @@ local function record_spectra()                   -- spectrum + PAR per AMBIT
     if stored == 0 then device.log("spectra: no AMBIT responded") end
 end
 
-local function run_trace(tag, trace, publish)     -- a trace on every connected AMBIT
+local function run_trace(tag, trace)              -- a trace on every connected AMBIT
     local ran = 0
     for ch = 0, NUM_CHANNELS - 1 do
         if device.uart_ping(ch) then
+            -- store=true persists the run; the sync_runner publishes it when the
+            -- power gate is open. Lua never publishes directly.
             local r, err = ambit.run(ch, trace, { store = true, timeout_ms = 30000 })
             if r then
                 ran = ran + 1
-                if publish then mqtt.publish_next_event() end
                 device.log(string.format("%s ch%d: %d points, stored %d",
                            tag, ch, r.points, r.stored or 0))
             else
@@ -63,17 +64,23 @@ local function run_trace(tag, trace, publish)     -- a trace on every connected 
 end
 
 -- ── Job bodies ───────────────────────────────────────────────────────────
-local function ss_round()   run_trace("SS",   SS,  false) end
-local function mpf_round()  run_trace("MPF",  MPF, true)  end
-local function edge_round() run_trace("edge", MPF, false) end
+local function ss_round()   run_trace("SS",   SS)  end
+local function mpf_round()  run_trace("MPF",  MPF) end
+local function edge_round() run_trace("edge", MPF) end
 
--- Status heartbeat: device.status_report() builds the block (Wi-Fi, DB, power +
--- source/charge/publish-gate) and logs it to serial + SD; we forward the same
--- text to <topic_root>/status whenever the broker is connected. The heartbeat
--- bypasses the publish power gate, so it still reports while running on battery.
+-- Status heartbeat: store the current device state (Wi-Fi, DB, power, source/
+-- charge/publish-gate) as a sensor="status" event. db.store_event stamps it with
+-- the capture time in startTicks, and the sync_runner publishes it when the
+-- power gate is open — i.e. on external power, alongside the measurement backlog.
 local function status_round()
     local s = device.status_report()
-    if s and mqtt.status() then device.publish_status(s) end
+    if s then
+        db.store_event{ sensor = "status", data = s }
+        device.log(string.format("status: src=%s gate=%s Vbat=%.2f Iin=%d",
+                   s.input_present and "external" or "battery",
+                   s.publish_gate and "OPEN" or "CLOSED",
+                   s.battery_v or 0, s.input_ma or 0))
+    end
 end
 
 do

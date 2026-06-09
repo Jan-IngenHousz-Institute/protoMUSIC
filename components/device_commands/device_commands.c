@@ -61,6 +61,20 @@ static cmd_result_t make_result(esp_err_t status, const char *fmt, ...)
     return r;
 }
 
+/* ── Sync-runner wake hook ───────────────────────────────────────────────
+ * The sole publisher (sync_runner) registers a task-notify here so it can sleep
+ * until there's work instead of polling. Fired after every stored event and when
+ * a measurement burst finishes (so a drain deferred during the burst resumes). */
+static void (*s_sync_notifier)(void) = NULL;
+
+void device_commands_set_sync_notifier(void (*fn)(void)) { s_sync_notifier = fn; }
+
+static inline void notify_sync(void)
+{
+    void (*fn)(void) = s_sync_notifier;   /* single read; set once at boot */
+    if (fn != NULL) fn();
+}
+
 /* Internal ack handler — called by mqtt_client on MQTT_EVENT_PUBLISHED */
 static void on_publish_ack(int msg_id, esp_err_t status, void *ctx)
 {
@@ -397,6 +411,7 @@ cmd_result_t cmd_record_env(int64_t *out_measure_id)
     if (err != ESP_OK) {
         return make_result(err, "store failed: %s", esp_err_to_name(err));
     }
+    notify_sync();   /* wake the publisher */
 
     if (out_measure_id) *out_measure_id = mid;
     return make_result(ESP_OK,
@@ -492,6 +507,7 @@ cmd_result_t cmd_store_event(int64_t measure_id, const char *device, const char 
     if (err != ESP_OK) {
         return make_result(err, "store_event(%s) failed: %s", sensor, esp_err_to_name(err));
     }
+    notify_sync();   /* wake the publisher */
     return make_result(ESP_OK, "stored event id=%lld (%s)", (long long)measure_id, sensor);
 }
 
@@ -511,12 +527,9 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     if (s_cfg.message_is_connected != NULL && !s_cfg.message_is_connected()) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not connected");
     }
-    /* Phase-1 power gate. sync_runner already checks this before draining, but
-     * guard here too so the Lua mqtt.publish_next_event() path can't bypass it.
-     * Events stay PENDING and drain when external power returns. */
-    if (!device_commands_publish_power_ok()) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "deferred: on battery (no external power)");
-    }
+    /* Power gate lives solely in sync_runner_is_allowed() now — sync_runner is
+     * the only caller of this function (Lua can no longer publish directly), so
+     * one check there is sufficient and unbypassable. */
     if (s_inflight_mtx == NULL) {
         return make_result(ESP_ERR_INVALID_STATE, "inflight mutex not initialised");
     }
@@ -632,85 +645,25 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
 
 /* ── Status report + heartbeat publish ─────────────────────────────────── */
 
-cmd_result_t cmd_status_report(char *out, size_t cap)
+cmd_result_t cmd_status_report(device_status_snapshot_t *out)
 {
-    if (out == NULL || cap == 0) {
-        return make_result(ESP_ERR_INVALID_ARG, "status_report: null buf");
+    if (out == NULL) {
+        return make_result(ESP_ERR_INVALID_ARG, "status_report: null out");
     }
-    out[0] = '\0';
+    memset(out, 0, sizeof(*out));
 
-    const bool wifi_conn = wifi_manager_is_connected();
-    bool provisioned = false;
-    (void)wifi_manager_is_provisioned(&provisioned);
+    out->wifi_connected = wifi_manager_is_connected();
+    (void)wifi_manager_is_provisioned(&out->provisioned);
 
-    bool    db_online = false;
     int64_t total = 0, pending = 0, next_id = 0;
-    const bool db_known =
-        (cmd_db_status(&db_online, &total, &pending, &next_id).status == ESP_OK);
+    (void)cmd_db_status(&out->db_online, &total, &pending, &next_id);
 
-    size_t off = 0;
-    int n = snprintf(out + off, cap - off, "Wi-Fi: %s (provisioned: %s)\n",
-                     wifi_conn ? "connected" : "disconnected",
-                     provisioned ? "yes" : "no");
-    if (n < 0 || (size_t)n >= cap - off) return make_result(ESP_ERR_NO_MEM, "status truncated");
-    off += (size_t)n;
-
-    if (db_known && db_online) {
-        n = snprintf(out + off, cap - off, "DB: online (%lld total, %lld pending)\n",
-                     (long long)total, (long long)pending);
-    } else {
-        n = snprintf(out + off, cap - off, "DB: offline\n");
+    if (s_cfg.read_power != NULL && s_cfg.read_power(&out->power) == ESP_OK) {
+        out->power_valid = true;
     }
-    if (n < 0 || (size_t)n >= cap - off) return make_result(ESP_ERR_NO_MEM, "status truncated");
-    off += (size_t)n;
+    out->publish_gate_open = device_commands_publish_power_ok();
 
-    power_reading_t pw;
-    if (s_cfg.read_power != NULL && s_cfg.read_power(&pw) == ESP_OK) {
-        static const char *const charge_str[] = {"idle", "pre-charge", "charging", "charged"};
-        n = snprintf(out + off, cap - off,
-            "Power: Vbat %.2f V, Vin %.2f V, Vsys %.2f V, Iin %u mA, Icharge %u mA\n",
-            pw.battery_mv / 1000.0, pw.input_mv / 1000.0, pw.system_mv / 1000.0,
-            pw.input_ma, pw.charge_ma);
-        if (n < 0 || (size_t)n >= cap - off) return make_result(ESP_ERR_NO_MEM, "status truncated");
-        off += (size_t)n;
-        n = snprintf(out + off, cap - off, "source: %s, charge: %s, publish gate: %s",
-                     pw.input_present ? "external" : "battery",
-                     charge_str[pw.charge_status & 0x03],
-                     device_commands_publish_power_ok() ? "OPEN" : "CLOSED");
-    } else {
-        n = snprintf(out + off, cap - off, "Power: unavailable");
-    }
-    if (n < 0 || (size_t)n >= cap - off) return make_result(ESP_ERR_NO_MEM, "status truncated");
-    off += (size_t)n;
-
-    return make_result(ESP_OK, "status report (%u B)", (unsigned)off);
-}
-
-cmd_result_t cmd_publish_status(const char *payload, size_t len)
-{
-    if (payload == NULL) {
-        return make_result(ESP_ERR_INVALID_ARG, "publish_status: null payload");
-    }
-    if (!s_initialized || s_cfg.publish == NULL) {
-        return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not available");
-    }
-    if (s_cfg.message_is_connected != NULL && !s_cfg.message_is_connected()) {
-        return make_result(ESP_ERR_INVALID_STATE, "MQTT not connected");
-    }
-
-    char topic[MQTT_TOPIC_MAX];
-    snprintf(topic, sizeof(topic), "%s/status",
-             (s_cfg.topic_root && s_cfg.topic_root[0]) ? s_cfg.topic_root : "ambyte");
-
-    /* Fire-and-forget heartbeat: no in-flight latch (those are reserved for the
-     * one-event-at-a-time measurement pipeline). */
-    int msg_id = 0;
-    esp_err_t err = s_cfg.publish(topic, payload, len, &msg_id);
-    if (err != ESP_OK) {
-        return make_result(err, "status publish failed: %s", esp_err_to_name(err));
-    }
-    return make_result(ESP_OK, "status published to %s (%u B, msg_id=%d)",
-                       topic, (unsigned)len, msg_id);
+    return make_result(ESP_OK, "status report");
 }
 
 cmd_result_t cmd_uart_stream_query(uint8_t channel, const char *cmd,
@@ -758,6 +711,7 @@ void device_commands_measurement_begin(void) { s_measurement_active++; }
 void device_commands_measurement_end(void)
 {
     if (s_measurement_active > 0) s_measurement_active--;
+    if (s_measurement_active == 0) notify_sync();  /* burst done — let the runner drain */
 }
 bool device_commands_measurement_active(void) { return s_measurement_active > 0; }
 
@@ -937,6 +891,8 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
                     free(pj);
                     if (store_err != ESP_OK) {
                         ESP_LOGW(TAG, "uart_text_query: save failed: %s", esp_err_to_name(store_err));
+                    } else {
+                        notify_sync();   /* wake the publisher */
                     }
                 }
             }

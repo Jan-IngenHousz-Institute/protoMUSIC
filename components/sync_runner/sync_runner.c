@@ -8,7 +8,12 @@
 
 #define TAG "sync_runner"
 
-#define SYNC_RUNNER_PERIOD_MS    10000U
+/* Stagger the first drain past boot-time noise (Wi-Fi join, TLS, DB boot scan). */
+#define SYNC_RUNNER_START_DELAY_MS  10000U
+/* Fallback re-check when nothing notifies us — catches power-gate openings
+ * (battery→external power, which is not a store event) and any missed wake.
+ * Most drains are notification-driven; this is just the safety heartbeat. */
+#define SYNC_RUNNER_FALLBACK_MS     30000U
 #define SYNC_RUNNER_TASK_NAME    "sync_runner"
 /* 8 KiB matches lua_runner. cmd_mqtt_publish_next_event heap-allocates the
  * payload buffer and cJSON tree itself, so the task stack stays light. */
@@ -23,6 +28,16 @@
 #define SYNC_RUNNER_MAX_ACK_POLLS 50
 
 static TaskHandle_t s_task_handle = NULL;
+
+/* Wake the drain task. Registered as the device_commands store/measurement-end
+ * notifier; also safe to call directly. No-op until the task exists. */
+void sync_runner_notify(void)
+{
+    TaskHandle_t h = s_task_handle;
+    if (h != NULL) {
+        xTaskNotifyGive(h);
+    }
+}
 
 /* Sync gate: pause publishing while a measurement is in progress so MQTT does
  * not compete with latency-sensitive sensor reads, AND while the device is on
@@ -71,17 +86,21 @@ static void sync_runner_task(void *arg)
 
     /* Stagger the first run so we don't compete with boot-time noise
      * (Wi-Fi join, MQTT TLS handshake, event_log boot scan). */
-    vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_PERIOD_MS));
+    vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_START_DELAY_MS));
 
     while (1) {
+        /* Sleep until something stores an event / a measurement burst ends
+         * (sync_runner_notify), or the fallback timer fires. pdTRUE clears the
+         * notification count on take, so a burst of N stores collapses into one
+         * drain pass. The CPU can idle in between — no fixed-rate polling. */
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(SYNC_RUNNER_FALLBACK_MS));
+
         if (sync_runner_is_allowed()) {
-            /* Burst-drain all pending events while idle (one msg per id). */
+            /* Burst-drain all pending events (one msg per id). */
             sync_runner_drain();
         } else {
             ESP_LOGD(TAG, "sync gate closed (measurement active or on battery) — deferring");
         }
-
-        vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_PERIOD_MS));
     }
 }
 
@@ -103,7 +122,9 @@ esp_err_t sync_runner_start(void)
         s_task_handle = NULL;
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "background sync started (period=%u ms)",
-             (unsigned)SYNC_RUNNER_PERIOD_MS);
+    /* Become the wake target for every stored event + measurement-end. */
+    device_commands_set_sync_notifier(sync_runner_notify);
+    ESP_LOGI(TAG, "background sync started (wake-on-store, fallback=%u ms)",
+             (unsigned)SYNC_RUNNER_FALLBACK_MS);
     return ESP_OK;
 }
