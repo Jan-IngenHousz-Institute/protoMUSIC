@@ -29,11 +29,14 @@
 #define MP2731_STATUS_VIN(reg)    (((reg) >> 5) & 0x07U)
 #define MP2731_STATUS_CHARGE(reg) (((reg) >> 3) & 0x03U)
 
-/* VIN above this is treated as "external source attached" even if the charger's
- * VIN-status field hasn't latched yet. Comfortably above ADC noise / a floating
- * input and below the charger's ~4.3 V VIN_MIN, so a connected USB/panel always
- * clears it. */
-#define MP2731_INPUT_PRESENT_MV   4000U
+/* VIN at/above this counts as a real external source. Picked from captured
+ * field data: a 6 V-class panel delivering power sits at 5.0-7.0 V, while a
+ * panel floating at open-circuit in twilight collapses to ~4.3 V (and can't
+ * charge). 4.7 V sits in that gap — above the dusk float, below the lowest
+ * real-source reading we've seen. NOTE: this is below the charger's own ~4.3 V
+ * VIN_MIN comparator, so we deliberately don't trust the chip's VIN-status bit
+ * here (it flickers at the margin); we threshold the ADC voltage instead. */
+#define MP2731_VIN_MIN_MV   4700U
 
 /* All ADC channels convert in well under this; the original firmware allowed
  * ~50 ms per pass. 80 ms is a comfortable margin for a fresh one-shot result. */
@@ -154,11 +157,16 @@ esp_err_t mp2731_read_power(power_reading_t *out)
     out->charge_ma  = (uint16_t)(175 * (uint16_t)icc / 10);
     out->input_ma   = (uint16_t)(133 * (uint16_t)iin / 10);
 
-    /* External power present per the charger's own VIN-status field, or VIN
-     * voltage above UVLO as a fallback. Used by the publish power gate. */
+    /* External power present = the source is actually delivering usable power,
+     * not floating at open-circuit in twilight. True when the battery is taking
+     * real charge current (charge_ma, an analog reading we trust), OR when VIN
+     * sits solidly above the dusk-float voltage (covers a full/idle battery that
+     * is still externally powered, e.g. VIN 5 V with charge_ma 0). We do NOT key
+     * off charge_status: it reports "fast charge" even at the dusk float where
+     * charge_ma is 0. Used by the publish power gate. */
     out->charge_status = (uint8_t)MP2731_STATUS_CHARGE(status);
-    out->input_present = (MP2731_STATUS_VIN(status) != 0U) ||
-                         (out->input_mv >= MP2731_INPUT_PRESENT_MV);
+    out->input_present = (out->charge_ma > 0U) ||
+                         (out->input_mv >= MP2731_VIN_MIN_MV);
     return ESP_OK;
 }
 
