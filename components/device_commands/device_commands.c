@@ -310,6 +310,62 @@ static int64_t now_ms(void)
     return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
 }
 
+/* ── Publish power gate (Phase 1) ─────────────────────────────────────────
+ * Only drain the MQTT backlog while on external power. Keyed on VIN-present
+ * (input voltage / charger VIN status) rather than input current: Iin has a
+ * ~13 mA ADC step and reads near-zero when the battery is full even in full
+ * sun, so it under-reports available power. The charger reading is cached
+ * (PUB_GATE_EVAL_INTERVAL_MS) so the drain loop's frequent re-checks stay cheap,
+ * and the gate is debounced with asymmetric dwell times so a reading hovering
+ * at the threshold can't toggle publishing on/off rapidly. */
+#define PUB_GATE_EVAL_INTERVAL_MS   5000    /* re-read the charger at most this often */
+#define PUB_GATE_ON_DWELL_MS       15000    /* power present this long ⇒ open the gate  */
+#define PUB_GATE_OFF_DWELL_MS      60000    /* power absent this long  ⇒ close the gate */
+
+static bool    s_pub_gate_open    = false;  /* debounced gate state (closed at boot) */
+static bool    s_pub_gate_cand    = false;  /* last instantaneous reading vs. gate */
+static int64_t s_pub_gate_cand_ms = 0;      /* when cand first differed from the gate */
+static int64_t s_pub_gate_eval_ms = 0;      /* last charger evaluation (0 = never) */
+
+bool device_commands_publish_power_ok(void)
+{
+    /* No power monitor wired in (dev board / absent charger): never gate, so
+     * publishing behaves exactly as before this feature existed. */
+    if (!s_initialized || s_cfg.read_power == NULL) {
+        return true;
+    }
+
+    const int64_t now = now_ms();
+    if (s_pub_gate_eval_ms != 0 &&
+        (now - s_pub_gate_eval_ms) < PUB_GATE_EVAL_INTERVAL_MS) {
+        return s_pub_gate_open;   /* cached between evaluations */
+    }
+    s_pub_gate_eval_ms = now;
+
+    power_reading_t p;
+    if (s_cfg.read_power(&p) != ESP_OK) {
+        /* Transient I2C/ADC failure: hold the last decision rather than flap. */
+        return s_pub_gate_open;
+    }
+    const bool present = p.input_present;
+
+    if (present == s_pub_gate_open) {
+        s_pub_gate_cand = present;            /* steady — clear any pending change */
+    } else if (present != s_pub_gate_cand) {
+        s_pub_gate_cand    = present;         /* new candidate — start the dwell timer */
+        s_pub_gate_cand_ms = now;
+    } else {
+        const int64_t dwell = present ? PUB_GATE_ON_DWELL_MS : PUB_GATE_OFF_DWELL_MS;
+        if ((now - s_pub_gate_cand_ms) >= dwell) {
+            s_pub_gate_open = present;        /* debounce satisfied — flip the gate */
+            ESP_LOGI(TAG, "publish gate %s (Vin=%umV Ibat=%umA)",
+                     present ? "OPEN (external power)" : "CLOSED (on battery)",
+                     p.input_mv, p.charge_ma);
+        }
+    }
+    return s_pub_gate_open;
+}
+
 cmd_result_t cmd_record_env(int64_t *out_measure_id)
 {
     if (!s_initialized || s_cfg.read_env == NULL ||
@@ -453,6 +509,12 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
      * next cycle and lets sync_runner_drain exit silently. */
     if (s_cfg.message_is_connected != NULL && !s_cfg.message_is_connected()) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "MQTT not connected");
+    }
+    /* Phase-1 power gate. sync_runner already checks this before draining, but
+     * guard here too so the Lua mqtt.publish_next_event() path can't bypass it.
+     * Events stay PENDING and drain when external power returns. */
+    if (!device_commands_publish_power_ok()) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "deferred: on battery (no external power)");
     }
     if (s_inflight_mtx == NULL) {
         return make_result(ESP_ERR_INVALID_STATE, "inflight mutex not initialised");

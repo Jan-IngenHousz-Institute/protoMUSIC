@@ -10,9 +10,11 @@
 
 #define TAG "mp2731"
 
-/* Register map (subset we touch). REG03 holds the ADC control bits; REG0E..REG13
- * are the ADC result registers (one byte each, refreshed after a conversion). */
+/* Register map (subset we touch). REG03 holds the ADC control bits; REG0C is the
+ * system-status register; REG0E..REG13 are the ADC result registers (one byte
+ * each, refreshed after a conversion). */
 #define MP2731_REG_ADC_CTRL   0x03
+#define MP2731_REG_STATUS     0x0C
 #define MP2731_REG_VBAT       0x0E
 #define MP2731_REG_VSYS       0x0F
 #define MP2731_REG_VIN        0x11
@@ -21,6 +23,17 @@
 
 /* REG03 bit7 = ADC_START (one-shot, self-clearing once the conversion ends). */
 #define MP2731_ADC_START_BIT  (1U << 7)
+
+/* REG0C status fields: bits[7:5] = VIN source status (0 = no input), bits[4:3] =
+ * charge status (0 idle / 1 pre / 2 fast / 3 done). */
+#define MP2731_STATUS_VIN(reg)    (((reg) >> 5) & 0x07U)
+#define MP2731_STATUS_CHARGE(reg) (((reg) >> 3) & 0x03U)
+
+/* VIN above this is treated as "external source attached" even if the charger's
+ * VIN-status field hasn't latched yet. Comfortably above ADC noise / a floating
+ * input and below the charger's ~4.3 V VIN_MIN, so a connected USB/panel always
+ * clears it. */
+#define MP2731_INPUT_PRESENT_MV   4000U
 
 /* All ADC channels convert in well under this; the original firmware allowed
  * ~50 ms per pass. 80 ms is a comfortable margin for a fresh one-shot result. */
@@ -120,12 +133,13 @@ esp_err_t mp2731_read_power(power_reading_t *out)
     }
     vTaskDelay(pdMS_TO_TICKS(MP2731_ADC_CONV_MS));
 
-    uint8_t vbat = 0, vsys = 0, vin = 0, icc = 0, iin = 0;
+    uint8_t vbat = 0, vsys = 0, vin = 0, icc = 0, iin = 0, status = 0;
     if ((err = mp2731_read_reg(MP2731_REG_VBAT, &vbat)) != ESP_OK ||
         (err = mp2731_read_reg(MP2731_REG_VSYS, &vsys)) != ESP_OK ||
         (err = mp2731_read_reg(MP2731_REG_VIN, &vin)) != ESP_OK ||
         (err = mp2731_read_reg(MP2731_REG_ICHARGE, &icc)) != ESP_OK ||
-        (err = mp2731_read_reg(MP2731_REG_IIN, &iin)) != ESP_OK) {
+        (err = mp2731_read_reg(MP2731_REG_IIN, &iin)) != ESP_OK ||
+        (err = mp2731_read_reg(MP2731_REG_STATUS, &status)) != ESP_OK) {
         return err;
     }
 
@@ -139,6 +153,12 @@ esp_err_t mp2731_read_power(power_reading_t *out)
     out->input_mv   = (uint16_t)(60 * vin);
     out->charge_ma  = (uint16_t)(175 * (uint16_t)icc / 10);
     out->input_ma   = (uint16_t)(133 * (uint16_t)iin / 10);
+
+    /* External power present per the charger's own VIN-status field, or VIN
+     * voltage above UVLO as a fallback. Used by the publish power gate. */
+    out->charge_status = (uint8_t)MP2731_STATUS_CHARGE(status);
+    out->input_present = (MP2731_STATUS_VIN(status) != 0U) ||
+                         (out->input_mv >= MP2731_INPUT_PRESENT_MV);
     return ESP_OK;
 }
 

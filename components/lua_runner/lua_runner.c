@@ -151,6 +151,10 @@ static int l_device_power(lua_State *L)
     lua_setfield(L, -2, "input_ma");
     lua_pushinteger(L, (lua_Integer)p.charge_ma);
     lua_setfield(L, -2, "charge_ma");
+    lua_pushboolean(L, p.input_present);
+    lua_setfield(L, -2, "input_present");
+    lua_pushboolean(L, p.charge_status != 0);
+    lua_setfield(L, -2, "charging");
     return 1;
 }
 

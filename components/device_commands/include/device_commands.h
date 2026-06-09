@@ -76,6 +76,15 @@ void device_commands_measurement_begin(void);
 void device_commands_measurement_end(void);
 bool device_commands_measurement_active(void);
 
+/* Phase-1 power gate: true when it's OK to drain the MQTT backlog — i.e. the
+ * device is on external (solar/USB) power, so battery-only operation doesn't
+ * spend the radio's energy budget. Keyed on VIN-present (not input current) and
+ * debounced with on/off dwell times to avoid flapping near the threshold. The
+ * charger reading is cached so the 10 s sync cycle and the back-to-back drain
+ * loop don't each pay an ADC conversion. Returns true (never gates) when no
+ * power monitor is wired in, preserving behaviour on boards without the charger. */
+bool device_commands_publish_power_ok(void);
+
 cmd_result_t cmd_set_rgb(uint8_t r, uint8_t g, uint8_t b);
 cmd_result_t cmd_read_rtc(time_t *out_time);
 cmd_result_t cmd_device_status(bool *bme_ready, bool *rtc_ready, time_t *rtc_time);

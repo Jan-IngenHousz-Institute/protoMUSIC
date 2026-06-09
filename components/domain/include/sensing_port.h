@@ -1,6 +1,7 @@
 #ifndef AMBYTE_SENSING_PORT_H
 #define AMBYTE_SENSING_PORT_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -26,6 +27,8 @@ typedef struct {
     uint16_t input_mv;     /* input (VBUS / panel) voltage */
     uint16_t charge_ma;    /* battery charge current */
     uint16_t input_ma;     /* input current */
+    bool     input_present;/* external source detected (VIN status or voltage > UVLO) */
+    uint8_t  charge_status;/* 0=idle 1=pre-charge 2=fast-charge 3=charge-done (REG0C) */
 } power_reading_t;
 
 typedef esp_err_t (*power_read_fn)(power_reading_t *out);

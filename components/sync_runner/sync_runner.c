@@ -25,11 +25,14 @@
 static TaskHandle_t s_task_handle = NULL;
 
 /* Sync gate: pause publishing while a measurement is in progress so MQTT does
- * not compete with latency-sensitive sensor reads; drain during idle/sleep.
- * Weak so a future power_monitor can add a solar/charge condition on top. */
+ * not compete with latency-sensitive sensor reads, AND while the device is on
+ * battery (Phase 1 power gate) so we only spend the radio budget on external
+ * power. Both conditions drain naturally once they clear — events stay PENDING
+ * in the event_log DB meanwhile. Weak so a future power_monitor can override. */
 __attribute__((weak)) bool sync_runner_is_allowed(void)
 {
-    return !device_commands_measurement_active();
+    return !device_commands_measurement_active() &&
+           device_commands_publish_power_ok();
 }
 
 /* Publish pending events back-to-back until the queue drains, the gate closes,
@@ -75,7 +78,7 @@ static void sync_runner_task(void *arg)
             /* Burst-drain all pending events while idle (one msg per id). */
             sync_runner_drain();
         } else {
-            ESP_LOGD(TAG, "measurement in progress — deferring sync");
+            ESP_LOGD(TAG, "sync gate closed (measurement active or on battery) — deferring");
         }
 
         vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_PERIOD_MS));

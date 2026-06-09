@@ -112,9 +112,14 @@ static int cli_cmd_status(int argc, char **argv)
     power_reading_t pw;
     cmd_result_t pres = cmd_read_power(&pw);
     if (pres.status == ESP_OK) {
+        static const char *const charge_str[] = {"idle", "pre-charge", "charging", "charged"};
         printf(" - Power: Vbat %.2f V, Vin %.2f V, Vsys %.2f V, Iin %u mA, Icharge %u mA\r\n",
                pw.battery_mv / 1000.0, pw.input_mv / 1000.0, pw.system_mv / 1000.0,
                pw.input_ma, pw.charge_ma);
+        printf("   source: %s, charge: %s, publish gate: %s\r\n",
+               pw.input_present ? "external" : "battery",
+               charge_str[pw.charge_status & 0x03],
+               device_commands_publish_power_ok() ? "OPEN" : "CLOSED");
     } else {
         printf(" - Power: %s\r\n", pres.message);
     }
