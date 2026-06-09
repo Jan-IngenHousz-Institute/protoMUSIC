@@ -21,6 +21,7 @@
 #include "esp_wifi.h"
 #include "i2c_bus.h"
 #include "lua_runner.h"
+#include "mp2731.h"
 #include "nvs_flash.h"
 #include "pcf2131tfy_rtc_api.h"
 #include "sd_card.h"
@@ -107,6 +108,12 @@ static esp_err_t app_init_i2c_and_sensors(void)
         ESP_LOGE(APP_TAG, "BME280 init failed: %s", esp_err_to_name(err));
     } else {
         ESP_LOGI(APP_TAG, "BME280 initialized");
+    }
+
+    /* MP2731 charger — provides battery/input power telemetry. Absent on dev
+     * boards without the charger; the read path degrades gracefully. */
+    if (mp2731_init() == ESP_OK) {
+        ESP_LOGI(APP_TAG, "MP2731 charger initialized");
     }
 
     return ESP_OK;
@@ -458,6 +465,7 @@ void app_main(void)
     device_commands_config_t cmd_cfg = {
         .read_env               = bme280_get_sensor_read_fn(),
         .read_clock             = pcf2131tfy_rtc_get_clock_read_fn(),
+        .read_power             = mp2731_is_ready() ? mp2731_get_power_read_fn() : NULL,
         .set_status             = ambyte_status_get_set_fn(),
         .sd_ready               = sd_available ? sdcard_is_mounted : NULL,
         .next_id            = persistence_available ? event_log_get_next_id_fn()            : NULL,

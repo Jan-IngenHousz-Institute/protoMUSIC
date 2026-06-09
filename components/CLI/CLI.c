@@ -107,6 +107,17 @@ static int cli_cmd_status(int argc, char **argv)
     } else {
         printf(" - DB: %s\r\n", dres.message);
     }
+
+    /* Battery / input power (MP2731 charger). */
+    power_reading_t pw;
+    cmd_result_t pres = cmd_read_power(&pw);
+    if (pres.status == ESP_OK) {
+        printf(" - Power: Vbat %.2f V, Vin %.2f V, Vsys %.2f V, Iin %u mA, Icharge %u mA\r\n",
+               pw.battery_mv / 1000.0, pw.input_mv / 1000.0, pw.system_mv / 1000.0,
+               pw.input_ma, pw.charge_ma);
+    } else {
+        printf(" - Power: %s\r\n", pres.message);
+    }
     return 0;
 }
 

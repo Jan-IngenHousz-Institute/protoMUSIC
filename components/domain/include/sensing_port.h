@@ -1,6 +1,7 @@
 #ifndef AMBYTE_SENSING_PORT_H
 #define AMBYTE_SENSING_PORT_H
 
+#include <stdint.h>
 #include <time.h>
 
 #include "esp_err.h"
@@ -17,6 +18,17 @@ typedef struct {
 
 typedef esp_err_t (*sensor_read_fn)(measurement_t *out);
 typedef esp_err_t (*clock_read_fn)(time_t *out);
+
+/* On-board power telemetry from the MP2731 charger (mV / mA). */
+typedef struct {
+    uint16_t battery_mv;   /* battery voltage */
+    uint16_t system_mv;    /* system rail voltage */
+    uint16_t input_mv;     /* input (VBUS / panel) voltage */
+    uint16_t charge_ma;    /* battery charge current */
+    uint16_t input_ma;     /* input current */
+} power_reading_t;
+
+typedef esp_err_t (*power_read_fn)(power_reading_t *out);
 
 #ifdef __cplusplus
 }

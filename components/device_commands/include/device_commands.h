@@ -26,6 +26,7 @@ typedef struct {
     /* Sensing ports */
     sensor_read_fn              read_env;
     clock_read_fn               read_clock;
+    power_read_fn               read_power;   /* MP2731 charger telemetry; NULL = absent */
 
     /* Persistence ports — one row per measurement event (event-document model) */
     measurement_next_id_fn            next_id;
@@ -79,6 +80,12 @@ cmd_result_t cmd_set_rgb(uint8_t r, uint8_t g, uint8_t b);
 cmd_result_t cmd_read_rtc(time_t *out_time);
 cmd_result_t cmd_device_status(bool *bme_ready, bool *rtc_ready, time_t *rtc_time);
 cmd_result_t cmd_read_env(float *temp, float *hum, float *pres);
+
+/* Read on-board power telemetry (battery / input / system voltage, charge /
+ * input current) from the MP2731 charger. Pass NULL to ignore the values; the
+ * result message carries a human-readable summary. ESP_ERR_NOT_SUPPORTED when
+ * no power monitor is wired in. */
+cmd_result_t cmd_read_power(power_reading_t *out);
 
 /* Drive a PWM signal on GPIO4 via LEDC. duty_pct is 0..100 (float precision);
  * freq_hz is the PWM frequency in Hz (e.g. 10000). When enable is false the

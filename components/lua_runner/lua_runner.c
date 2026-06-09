@@ -129,6 +129,31 @@ static int l_device_read_env(lua_State *L)
     return 1;
 }
 
+/* device.power() → { battery_v, input_v, system_v, input_ma, charge_ma }
+ * or nil,err. Reads the MP2731 charger telemetry (voltages in volts, currents
+ * in mA). */
+static int l_device_power(lua_State *L)
+{
+    power_reading_t p;
+    cmd_result_t res = cmd_read_power(&p);
+    if (res.status != ESP_OK) {
+        return lua_push_nil_reason(L, res.message);
+    }
+
+    lua_newtable(L);
+    lua_pushnumber(L, (lua_Number)p.battery_mv / 1000.0);
+    lua_setfield(L, -2, "battery_v");
+    lua_pushnumber(L, (lua_Number)p.input_mv / 1000.0);
+    lua_setfield(L, -2, "input_v");
+    lua_pushnumber(L, (lua_Number)p.system_mv / 1000.0);
+    lua_setfield(L, -2, "system_v");
+    lua_pushinteger(L, (lua_Integer)p.input_ma);
+    lua_setfield(L, -2, "input_ma");
+    lua_pushinteger(L, (lua_Integer)p.charge_ma);
+    lua_setfield(L, -2, "charge_ma");
+    return 1;
+}
+
 /* device.record_env() — read BME280 + persist T/H/P as three rows sharing one
  * measure_id. Returns that measure_id (int) or nil,err. */
 static int l_device_record_env(lua_State *L)
@@ -832,6 +857,7 @@ static void lua_register_device_module(lua_State *L)
         {"read_rtc",               l_device_read_rtc},
         {"status",                 l_device_status},
         {"read_env",               l_device_read_env},
+        {"power",                  l_device_power},
         {"record_env",             l_device_record_env},
         {"sd_ready",               l_device_sd_ready},
         {"sleep_ms",               l_device_sleep_ms},

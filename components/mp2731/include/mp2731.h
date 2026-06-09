@@ -1,0 +1,41 @@
+#ifndef AMBYTE_MP2731_H
+#define AMBYTE_MP2731_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "esp_err.h"
+#include "sensing_port.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* MP2731 single-cell battery charger / power-path manager (I2C @ 0x4B on the
+ * shared platform bus). Provides the on-board power telemetry — battery, input
+ * and system voltages plus charge / input currents — read from its internal
+ * ADC. Mirrors the readings the original Ambyte firmware reported via
+ * mp2731_readADC(). The platform I2C bus must be initialized before mp2731_init().
+ */
+#define MP2731_I2C_ADDR ((uint8_t)0x4B)
+
+/* Probe the charger on the I2C bus. Returns ESP_OK and marks the driver ready
+ * when the device ACKs at MP2731_I2C_ADDR; otherwise the driver stays "absent"
+ * and mp2731_read_power() reports ESP_ERR_INVALID_STATE. Safe to call once at
+ * boot after i2c_bus_init(). */
+esp_err_t mp2731_init(void);
+bool mp2731_is_ready(void);
+
+/* Trigger a one-shot ADC conversion and read battery/input/system voltages and
+ * charge/input currents into *out. Values are scaled to mV / mA per the MP2731
+ * datasheet step sizes. Returns ESP_ERR_INVALID_STATE if the charger is absent. */
+esp_err_t mp2731_read_power(power_reading_t *out);
+
+/* Port adapter for the device_commands composition root. */
+power_read_fn mp2731_get_power_read_fn(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

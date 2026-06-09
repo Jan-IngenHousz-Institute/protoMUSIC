@@ -285,6 +285,21 @@ cmd_result_t cmd_read_env(float *temp, float *hum, float *pres)
                        m.temperature_c, m.humidity_percent, m.pressure_pa);
 }
 
+cmd_result_t cmd_read_power(power_reading_t *out)
+{
+    if (!s_initialized || s_cfg.read_power == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "power monitor not available");
+    }
+    power_reading_t p;
+    esp_err_t err = s_cfg.read_power(&p);
+    if (err != ESP_OK) {
+        return make_result(err, "power read failed: %s", esp_err_to_name(err));
+    }
+    if (out != NULL) *out = p;
+    return make_result(ESP_OK, "Vbat=%umV Vin=%umV Vsys=%umV Iin=%umA Icc=%umA",
+                       p.battery_mv, p.input_mv, p.system_mv, p.input_ma, p.charge_ma);
+}
+
 /* Return current UTC milliseconds since epoch, sourced from the IDF's internal
  * clock (settimeofday'd from the RTC at boot — see components/pcf2131tfy_rtc).
  * Cheap: one syscall, no I2C transactions. */
