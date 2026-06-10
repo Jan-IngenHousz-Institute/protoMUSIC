@@ -33,6 +33,12 @@ int ota_spike_run(const char *url)
         .crt_bundle_attach = esp_crt_bundle_attach,  /* validates github.com AND the CDN host across the 302 */
         .timeout_ms        = 20000,
         .keep_alive_enable = true,
+        /* The 512 B defaults are too small for GitHub: the 302 redirects to a very
+         * long signed CDN URL (X-Amz-* query params) that overflows the TX buffer,
+         * and Fastly/S3 return verbose response headers that overflow the RX buffer
+         * -> "HTTP_CLIENT: Out of buffer". Heap is plentiful here, so size up. */
+        .buffer_size       = 4096,   /* RX: response headers + data reads */
+        .buffer_size_tx    = 4096,   /* TX: request line incl. the long redirected URL */
     };
     esp_https_ota_config_t ota_cfg = {
         .http_config = &http_cfg,
@@ -43,10 +49,12 @@ int ota_spike_run(const char *url)
     const int64_t t0 = esp_timer_get_time();
     esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
     if (err != ESP_OK || handle == NULL) {
-        ESP_LOGE(TAG, "*** BEGIN/HANDSHAKE FAILED: %s ***", esp_err_to_name(err));
-        ESP_LOGE(TAG, "    free=%u largest_internal=%u — if heap is still high, the 8 KiB "
-                      "TLS record buffer could not hold GitHub's handshake (raise "
-                      "MBEDTLS_SSL_IN_CONTENT_LEN or host the image elsewhere).",
+        ESP_LOGE(TAG, "*** BEGIN FAILED: %s ***", esp_err_to_name(err));
+        ESP_LOGE(TAG, "    free=%u largest_internal=%u — diagnose by the lines ABOVE: "
+                      "'Certificate validated' = TLS handshake OK (so it is NOT the 8 KiB "
+                      "record buffer); 'HTTP_CLIENT: Out of buffer' = HTTP buffers too small "
+                      "for GitHub's redirect (raise buffer_size/buffer_size_tx); a TLS/esp-tls "
+                      "error with heap still high = raise MBEDTLS_SSL_IN_CONTENT_LEN.",
                  (unsigned)esp_get_free_heap_size(), (unsigned)internal_largest_block());
         ESP_LOGW(TAG, "==== OTA SPIKE END (handshake failed) ====");
         return err;

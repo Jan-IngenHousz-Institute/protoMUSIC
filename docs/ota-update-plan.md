@@ -35,12 +35,33 @@ Lua-script push that shares the same inbound channel.
 
 ---
 
-## Stage 0 — TLS/heap feasibility spike  ⟵ *implemented, awaiting a run*
+## Stage 0 — TLS/heap feasibility spike  ⟵ *PASSED 2026-06-10 on hardware*
 
-**Question it answers (make-or-break):** does an HTTPS firmware download from
-GitHub work on this board, given `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192` and a
-~17 KiB largest free block (no PSRAM)? AWS IoT's handshake fits in 8 KiB; GitHub
-(Fastly CDN, different cert chain) is the unknown.
+**Question it answered (make-or-break):** does an HTTPS firmware download from
+GitHub work on this board? **YES.** A full 1.36 MB esp32s3 image downloaded from a
+public GitHub release (`protoMUSIC/releases/ota-spike-test`) end-to-end:
+- TLS handshake validated against **both** github.com AND the Fastly CDN across the
+  302 redirect (cert bundle), `complete_image = YES`, ~53 KiB/s.
+- **Heap floor 131 KB largest-internal, flat** the entire download (measured in the
+  quiesced pre-MQTT state Stage 3 will reproduce) — heap is a non-issue.
+
+**Proven production settings (carry into the Stage-3 handler / config):**
+1. `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y` + `_DEFAULT_FULL=y` — validates github.com
+   + the CDN host.
+2. `esp_http_client_config`: **`buffer_size=4096`, `buffer_size_tx=4096`** — the 512 B
+   defaults overflow on GitHub's long signed-redirect URL + verbose CDN headers
+   (`HTTP_CLIENT: Out of buffer`).
+3. **`CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384`** (raised back from 8192) — S3/Fastly
+   stream the body in full 16 KiB TLS records; with `DYNAMIC_BUFFER` on, a record
+   over the cap fails on the first data read with `-0x7100` (BAD_INPUT_DATA). Safe
+   to raise because `DYNAMIC_BUFFER` makes it a *transient per-record ceiling*: MQTT's
+   small records still alloc small. **Caveat to verify:** this is now in
+   `sdkconfig.defaults` so it affects NORMAL builds too — confirm steady-state MQTT is
+   unaffected (watch the `sync_runner` "heap:" line) after reflashing normal firmware.
+
+The progression itself validated the spike approach: each run peeled off one mundane
+fixable layer (HTTP buffer → TLS record size) while the genuinely risky unknown (the
+handshake) passed on the first attempt and held every run.
 
 **What landed:**
 - `components/ota_spike/` — runs the real `esp_https_ota` advanced API against a
@@ -58,13 +79,13 @@ GitHub work on this board, given `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192` and a
 2. Delete `sdkconfig.esp32-s3-devkitm-1` so the cert-bundle change regenerates.
 3. Build + flash, watch the serial log for `OTA SPIKE RESULT` / `VERDICT`.
 
-**Gate / branches:**
-- **Handshake OK + healthy heap floor** → proceed to Stage 1, GitHub is viable.
-- **Handshake fails with heap still high** → 8 KiB record buffer too small for
-  GitHub. Either raise `MBEDTLS_SSL_IN_CONTENT_LEN` (and re-confront the heap
-  ceiling) or host the image behind the AWS channel we already trust.
-- **Handshake OK but heap floor dangerously low** → OTA must quiesce Lua + MQTT
-  publishing during download (Stage 3 already plans to).
+**Gate: PASSED → GitHub-hosted OTA is viable; proceed to Stage 1.**
+Cleanup after the run: re-comment the `SPIKE_OTA` `build_flags` in `platformio.ini`
+and reflash normal firmware; the `sdkconfig.defaults` changes (cert bundle +
+`IN_CONTENT_LEN=16384`) STAY — they are production settings. The throwaway
+`ota-spike-test` release can be deleted and `protoMUSIC` re-privated (but production
+then needs a public source or the private-repo signed-URL auth path). The
+`components/ota_spike/` harness can stay as a re-runnable test until Stage 3 lands.
 
 ---
 
