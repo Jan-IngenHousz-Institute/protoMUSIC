@@ -29,6 +29,7 @@
 #include "sd_card.h"
 #include "sd_logger.h"
 #include "spike_log.h"
+#include "ota_spike.h"
 #include "event_log.h"
 #include "sync_runner.h"
 #include "uart_sensors.h"
@@ -411,6 +412,30 @@ void app_main(void)
     } else {
         ESP_LOGW(APP_TAG, "Wi-Fi connect failed: %s", esp_err_to_name(err));
     }
+
+#ifdef SPIKE_OTA
+    /* Stage-0 OTA spike (docs/ota-update-plan.md). Runs the real esp_https_ota
+     * download against a GitHub URL to answer the gating question (does the TLS
+     * handshake fit in the 8 KiB record buffer + does the streaming download stay
+     * within the internal-RAM budget) and then ABORTS — it never sets the boot
+     * partition. Deliberately placed BEFORE MQTT/sensors/persistence start, so it
+     * runs with maximal free heap: a failure here is a pure TLS-buffer verdict,
+     * not heap exhaustion. Set the URL with -DSPIKE_OTA_URL=\"https://...\". */
+#ifndef SPIKE_OTA_URL
+#define SPIKE_OTA_URL "https://raw.githubusercontent.com/OWNER/REPO/BRANCH/firmware.bin"
+#endif
+    /* Give Wi-Fi a moment if the initial connect timed out (background reconnect). */
+    for (int i = 0; i < 30 && !wifi_manager_is_connected(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (wifi_manager_is_connected()) {
+        ota_spike_run(SPIKE_OTA_URL);
+    } else {
+        ESP_LOGE(APP_TAG, "SPIKE_OTA: Wi-Fi not connected — cannot run OTA spike");
+    }
+    ESP_LOGW(APP_TAG, "SPIKE_OTA build — normal startup skipped");
+    return;
+#endif
 
     /* ── Wi-Fi → MQTT lifecycle event handlers ────────────────────── */
     /* Registered after the provisioning/connect block so they cannot fire

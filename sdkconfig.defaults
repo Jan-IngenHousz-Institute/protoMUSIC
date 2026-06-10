@@ -44,6 +44,16 @@ CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
 # real risk on our mutual-TLS link. Held back; revisit only if DYNAMIC_BUFFER
 # alone doesn't give enough headroom (watch the sync_runner "heap:" line).
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# Mozilla CA certificate bundle — lets esp_https_ota validate arbitrary public
+# TLS hosts (GitHub + its Fastly CDN across the release/raw 302 redirect) without
+# pinning a single cert. Required by the OTA download path (and the Stage-0 spike,
+# components/ota_spike). FULL bundle covers the roots GitHub/Fastly chain to.
+# Costs ~64 KiB flash; it is in EVERY build once enabled (the firmware is ~1.36 MB
+# in a 3 MB partition, so there is ample room).
+# NOTE: editing this file alone does NOT re-apply — delete the per-env generated
+# sdkconfig (sdkconfig.esp32-s3-devkitm-1) so PlatformIO regenerates it.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # Standalone heap leak tracing — DIAGNOSTIC ONLY. It found the leak (a Lua GC
 # starvation: sched.run blocks in C between cycles, starving Lua's alloc-driven
 # incremental GC, so measurement result tables piled up ~6 KB/min). Fixed with a
