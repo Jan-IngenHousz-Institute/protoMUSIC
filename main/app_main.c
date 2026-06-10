@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
@@ -17,6 +18,7 @@
 #include "esp_event.h"
 #include "esp_littlefs.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "i2c_bus.h"
@@ -37,6 +39,28 @@
 /* Re-sync the ESP system clock from the RTC at this cadence (drift correction +
  * recovery if the RTC is set/validated after boot). */
 #define APP_RTC_SYNC_INTERVAL_S 3600U
+
+/* Replace the first occurrence of `token` in NUL-terminated `buf` (capacity
+ * `cap`) with `repl`, in place. No-op if the token is absent or the result
+ * wouldn't fit. Used to expand a {MAC} placeholder in the provisioned MQTT
+ * client-id / topic-root so every board gets a unique, MAC-derived identity
+ * (avoids the AWS IoT duplicate-client-id disconnect loop when several boards
+ * share one .env / certificate). */
+static void subst_token(char *buf, size_t cap, const char *token, const char *repl)
+{
+    char *at = strstr(buf, token);
+    if (at == NULL) {
+        return;
+    }
+    size_t tok_len = strlen(token);
+    size_t rep_len = strlen(repl);
+    size_t tail    = strlen(at + tok_len);            /* chars after the token (excl. NUL) */
+    if ((size_t)(at - buf) + rep_len + tail + 1 > cap) {
+        return;                                       /* would overflow — leave as-is */
+    }
+    memmove(at + rep_len, at + tok_len, tail + 1);    /* shift tail, incl. NUL */
+    memcpy(at, repl, rep_len);
+}
 
 static const i2c_bus_config_t s_i2c_bus_cfg = {
     .port = I2C_BUS_DEFAULT_PORT,
@@ -301,6 +325,25 @@ void app_main(void)
         strncpy(topic_root, CONFIG_AMBYTE_MQTT_TOPIC_ROOT, sizeof(topic_root) - 1);
         topic_root[sizeof(topic_root) - 1] = '\0';
     }
+
+    /* Expand a {MAC} placeholder in the provisioned client-id / topic-root with
+     * this board's Wi-Fi STA MAC, so boards sharing one .env get unique MQTT
+     * identities (no AWS IoT duplicate-client-id disconnect loop). esp_read_mac
+     * reads the efuse MAC directly — valid here even though Wi-Fi isn't started
+     * yet (MQTT is configured before wifi_manager init). If neither value
+     * contains {MAC}, this is a no-op and behaviour is unchanged.
+     * NOTE: the resulting client-id/topic must be permitted by the device's AWS
+     * IoT policy (which often pins them to the thing name) or the broker will
+     * reject the connection. Colons match AMBYTE_DEVICE_ID style; switch the
+     * format to colon-free hex here if AWS rejects them. */
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    subst_token(mqtt_client_id, sizeof(mqtt_client_id), "{MAC}", mac_str);
+    subst_token(topic_root,     sizeof(topic_root),     "{MAC}", mac_str);
+    ESP_LOGI(APP_TAG, "MQTT identity: client_id=%s", mqtt_client_id);
     if (device_config_get_device_id(device_id, sizeof(device_id)) != ESP_OK) {
         strncpy(device_id, CONFIG_AMBYTE_DEVICE_ID, sizeof(device_id) - 1);
         device_id[sizeof(device_id) - 1] = '\0';
