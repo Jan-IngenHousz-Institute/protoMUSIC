@@ -13,6 +13,7 @@
 #include "certs.h"
 #include "device_config.h"
 #include "bme280.h"
+#include "command_router.h"
 #include "device_commands.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -367,6 +368,13 @@ void app_main(void)
         firmware_version[0] = '\0';
     }
 
+    /* Inbound command channel (Stage 2): subscribe to "<topic_root>/cmd", reply on
+     * "<topic_root>/status". The AWS IoT policy must grant Subscribe/Receive on the
+     * cmd topic. */
+    static char command_topic[288], status_topic[288];
+    snprintf(command_topic, sizeof(command_topic), "%s/cmd",    topic_root);
+    snprintf(status_topic,  sizeof(status_topic),  "%s/status", topic_root);
+
     /* ── MQTT Client ─────────────────────────────────────────────── */
     bool certs_ok = certs_are_provisioned();
     mqtt_client_config_t mqtt_cfg = {
@@ -375,10 +383,23 @@ void app_main(void)
         .ca_cert_pem     = certs_ok ? certs_get_ca_cert()     : NULL,
         .device_cert_pem = certs_ok ? certs_get_device_cert() : NULL,
         .device_key_pem  = certs_ok ? certs_get_device_key()  : NULL,
+        .command_topic   = command_topic,
     };
     err = mqtt_client_init(&mqtt_cfg);
     if (err != ESP_OK) {
         ESP_LOGW(APP_TAG, "MQTT client init failed: %s — MQTT disabled", esp_err_to_name(err));
+    }
+
+    /* Route inbound commands (ping/ota_update/script_update) to the command router. */
+    command_router_config_t cr_cfg = {
+        .publish          = mqtt_client_get_publish_fn(),
+        .status_topic     = status_topic,
+        .device_id        = device_id,
+        .firmware_version = firmware_version,
+    };
+    if (command_router_init(&cr_cfg) == ESP_OK) {
+        mqtt_client_get_set_received_handler_fn()(command_router_get_received_fn(), NULL);
+        ESP_LOGI(APP_TAG, "command router wired (cmd topic: %s)", command_topic);
     }
 
     /* ── Wi-Fi init + start ───────────────────────────────────────── */

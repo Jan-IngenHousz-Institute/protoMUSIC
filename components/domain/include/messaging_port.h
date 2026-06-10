@@ -17,6 +17,16 @@ typedef void      (*message_publish_ack_fn)(int msg_id, esp_err_t status, void *
 typedef esp_err_t (*message_set_publish_ack_handler_fn)(message_publish_ack_fn handler,
                                                          void *ctx);
 
+/* Callback delivered when a complete message arrives on a subscribed topic.
+ * `topic` and `payload` are NUL-terminated copies valid only for the duration of
+ * the call (the transport reassembles multi-part MQTT_EVENT_DATA before calling).
+ * `payload_len` excludes the terminating NUL. Runs in the transport's task
+ * context — keep work light or hand off to another task. */
+typedef void      (*message_received_fn)(const char *topic, const char *payload,
+                                         size_t payload_len, void *ctx);
+typedef esp_err_t (*message_set_received_handler_fn)(message_received_fn handler,
+                                                     void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

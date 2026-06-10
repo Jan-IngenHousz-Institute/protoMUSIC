@@ -10,6 +10,15 @@
 
 #define TAG                  "mqtt_client"
 
+/* Reassembly cap for an inbound command. esp-mqtt delivers payloads larger than
+ * CONFIG_MQTT_BUFFER_SIZE across several MQTT_EVENT_DATA fragments; we stitch them
+ * here. Commands (ping, ota_update) are well under 1 KiB; a 128 KiB inline-Lua
+ * script_update (Stage 4) will need a larger / streaming buffer — for now anything
+ * over this cap is dropped with a warning. Static (BSS) to avoid heap churn in the
+ * mqtt task. */
+#define INBOUND_MSG_MAX      2048
+#define INBOUND_TOPIC_MAX    192
+
 static esp_mqtt_client_handle_t s_client    = NULL;
 static volatile bool            s_connected = false;
 static bool                     s_started   = false;
@@ -17,6 +26,15 @@ static bool                     s_started   = false;
 /* Outbound ack callback */
 static message_publish_ack_fn s_ack_handler = NULL;
 static void                  *s_ack_ctx     = NULL;
+
+/* Inbound: subscribe target + received-message callback + reassembly state */
+static char                 s_command_topic[INBOUND_TOPIC_MAX] = {0};
+static message_received_fn  s_msg_handler = NULL;
+static void                *s_msg_ctx     = NULL;
+static char                 s_rx_buf[INBOUND_MSG_MAX + 1];
+static char                 s_rx_topic[INBOUND_TOPIC_MAX];
+static int                  s_rx_len      = 0;
+static bool                 s_rx_overflow = false;
 
 /* ── port implementations ──────────────────────────────────────────── */
 
@@ -48,6 +66,53 @@ static esp_err_t mqtt_set_ack_handler_impl(message_publish_ack_fn handler, void 
     return ESP_OK;
 }
 
+static esp_err_t mqtt_set_received_handler_impl(message_received_fn handler, void *ctx)
+{
+    s_msg_handler = handler;
+    s_msg_ctx     = ctx;
+    return ESP_OK;
+}
+
+/* Stitch one MQTT_EVENT_DATA fragment into s_rx_buf and, on the final fragment,
+ * deliver the whole NUL-terminated payload to the registered handler. esp-mqtt
+ * provides the topic only on the first fragment (current_data_offset == 0). */
+static void handle_inbound_data(esp_mqtt_event_handle_t event)
+{
+    if (event->current_data_offset == 0) {
+        s_rx_len      = 0;
+        s_rx_overflow = (event->total_data_len > INBOUND_MSG_MAX);
+        size_t tl = (event->topic_len > 0 && (size_t)event->topic_len < sizeof(s_rx_topic))
+                        ? (size_t)event->topic_len : 0;
+        if (tl > 0) {
+            memcpy(s_rx_topic, event->topic, tl);
+        }
+        s_rx_topic[tl] = '\0';
+    }
+
+    if (!s_rx_overflow && event->data_len > 0) {
+        if (event->current_data_offset + event->data_len <= INBOUND_MSG_MAX) {
+            memcpy(s_rx_buf + event->current_data_offset, event->data, event->data_len);
+            s_rx_len = event->current_data_offset + event->data_len;
+        } else {
+            s_rx_overflow = true;
+        }
+    }
+
+    /* Final fragment? */
+    if (event->current_data_offset + event->data_len >= event->total_data_len) {
+        if (s_rx_overflow) {
+            ESP_LOGW(TAG, "inbound message %d B > cap %d — dropped (topic=%s)",
+                     event->total_data_len, INBOUND_MSG_MAX, s_rx_topic);
+            return;
+        }
+        s_rx_buf[s_rx_len] = '\0';
+        ESP_LOGI(TAG, "inbound %d B on %s", s_rx_len, s_rx_topic);
+        if (s_msg_handler != NULL) {
+            s_msg_handler(s_rx_topic, s_rx_buf, (size_t)s_rx_len, s_msg_ctx);
+        }
+    }
+}
+
 /* ── MQTT event handler ────────────────────────────────────────────── */
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
@@ -61,6 +126,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         s_connected = true;
         ESP_LOGI(TAG, "MQTT connected");
+        /* (Re)subscribe to the command topic on every connect — a clean session
+         * drops subscriptions, so this must run on each reconnect, not once. */
+        if (s_command_topic[0] != '\0') {
+            int sub_id = esp_mqtt_client_subscribe(s_client, s_command_topic, 1);
+            ESP_LOGI(TAG, "subscribing to %s (msg_id=%d)", s_command_topic, sub_id);
+        }
+        break;
+
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT subscribed msg_id=%d", event->msg_id);
+        break;
+
+    case MQTT_EVENT_DATA:
+        handle_inbound_data(event);
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -98,6 +177,14 @@ esp_err_t mqtt_client_init(const mqtt_client_config_t *cfg)
     bool tls_ok = cfg->ca_cert_pem     != NULL && cfg->ca_cert_pem[0]     != '\0' &&
                   cfg->device_cert_pem != NULL && cfg->device_cert_pem[0] != '\0' &&
                   cfg->device_key_pem  != NULL && cfg->device_key_pem[0]  != '\0';
+
+    /* Retain the command topic for (re)subscription on each connect. */
+    if (cfg->command_topic != NULL && cfg->command_topic[0] != '\0') {
+        strncpy(s_command_topic, cfg->command_topic, sizeof(s_command_topic) - 1);
+        s_command_topic[sizeof(s_command_topic) - 1] = '\0';
+    } else {
+        s_command_topic[0] = '\0';
+    }
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker = {
@@ -171,4 +258,9 @@ message_is_connected_fn mqtt_client_get_is_connected_fn(void)
 message_set_publish_ack_handler_fn mqtt_client_get_set_ack_handler_fn(void)
 {
     return mqtt_set_ack_handler_impl;
+}
+
+message_set_received_handler_fn mqtt_client_get_set_received_handler_fn(void)
+{
+    return mqtt_set_received_handler_impl;
 }
