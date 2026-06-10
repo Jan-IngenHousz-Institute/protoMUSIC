@@ -68,23 +68,85 @@ local function record_spectra()
     if stored == 0 then device.log("spectra: no AMBIT responded") end
 end
 
--- Run a trace on every connected AMBIT. store=true persists each run as an event;
--- sync_runner publishes it later when the power gate is open. Lua never publishes.
+-- ── Parallel run tuning ─────────────────────────────────────────────────────
+local POLL_INTERVAL_MS    = 500     -- gap between poll sweeps
+local POLL_START_FRAC     = 0.9     -- don't poll a channel until 90% of its estimate elapsed
+local DEADLINE_MARGIN_MS  = 15000   -- est + this without a result ⇒ ambit considered broken
+local SEG_OVERHEAD_MS     = 300     -- per-segment config/light-sleep slack in the estimate
+
+-- Approximate a trace's run time (ms): each segment ≈ pulses/freq seconds, plus a
+-- fixed per-segment overhead. Used to schedule polling and bound a broken ambit.
+local function estimate_ms(trace)
+    local total = 0
+    for _, seg in ipairs(trace) do
+        local pulses = seg.pulses or seg[1] or 0
+        local freq   = seg.freq   or seg[2] or 1
+        if freq < 1 then freq = 1 end
+        total = total + (pulses / freq) * 1000 + SEG_OVERHEAD_MS
+    end
+    return math.floor(total)
+end
+
+-- Trigger the trace on every connected AMBIT back-to-back, then poll and fetch
+-- each as it finishes. The 4 ambits measure concurrently, so wall-time ≈ the
+-- slowest run plus the (serialized) result fetches, instead of the sum of four.
+-- store=true persists each run as an event; sync_runner publishes it later when
+-- the power gate is open. Lua never publishes. The measurement window is held
+-- across the whole cycle so the publisher can't race a fetch on the tight heap.
 local function run_trace(tag, trace)
-    local ran = 0
+    device.measurement_window(true)
+
+    local est     = estimate_ms(trace)
+    local pending = {}                 -- ch -> t0 (uptime_ms at trigger)
+    local count   = 0
     for ch = 0, NUM_CHANNELS - 1 do
         if device.uart_ping(ch) then
-            local r, err = ambit.run(ch, trace, { store = true, timeout_ms = 30000 })
-            if r then
-                ran = ran + 1
-                device.log(string.format("%s ch%d: %d points, %.1fC, stored %d",
-                           tag, ch, r.points, r.leaf_temp or 0, r.stored or 0))
+            local ok, err = ambit.trigger(ch, trace, { interrupt = false })
+            if ok then
+                pending[ch] = device.uptime_ms()
+                count = count + 1
             else
-                device.log(string.format("%s ch%d: run failed: %s", tag, ch, err or "?"))
+                device.log(string.format("%s ch%d: trigger failed: %s", tag, ch, err or "?"))
             end
         end
     end
-    if ran == 0 then device.log(tag .. ": no AMBIT responded") end
+
+    -- Poll + fetch loop. Stay off a channel's wire until ~90% of its estimate has
+    -- elapsed (a poll's wake bytes reach a measuring sensor). Only "done"/"error"
+    -- are terminal; a silent channel past the deadline is treated as broken.
+    while count > 0 do
+        device.sleep_ms(POLL_INTERVAL_MS)
+        local now = device.uptime_ms()
+        for ch = 0, NUM_CHANNELS - 1 do
+            local t0 = pending[ch]
+            if t0 then
+                local elapsed = now - t0
+                if elapsed >= est * POLL_START_FRAC then
+                    local st = ambit.poll(ch)
+                    if st == "done" then
+                        local r, err = ambit.fetch(ch, { store = true })
+                        if r then
+                            device.log(string.format("%s ch%d: %d points, %.1fC, stored %d",
+                                       tag, ch, r.points, r.leaf_temp or 0, r.stored or 0))
+                        else
+                            device.log(string.format("%s ch%d: fetch failed: %s", tag, ch, err or "?"))
+                        end
+                        pending[ch] = nil; count = count - 1
+                    elseif st == "error" then
+                        device.log(string.format("%s ch%d: ambit reported run error", tag, ch))
+                        pending[ch] = nil; count = count - 1
+                    elseif elapsed > est + DEADLINE_MARGIN_MS then
+                        device.log(string.format("%s ch%d: no result after %dms — ambit broken?",
+                                   tag, ch, elapsed))
+                        pending[ch] = nil; count = count - 1
+                    end
+                    -- else "busy"/"idle": keep waiting
+                end
+            end
+        end
+    end
+
+    device.measurement_window(false)
 end
 
 -- Periodic device status, stored as a sensor="status" event. db.store_event

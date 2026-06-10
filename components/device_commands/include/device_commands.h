@@ -69,6 +69,10 @@ typedef struct {
 
 esp_err_t device_commands_init(const device_commands_config_t *cfg);
 
+/* This device's Wi-Fi STA MAC as "AA:BB:CC:DD:EE:FF" (read once at init). Returns
+ * an empty string if the MAC was unavailable when device_commands_init ran. */
+const char *device_commands_get_mac(void);
+
 /* Measurement-activity gate. Bracket any latency-sensitive sensor transaction
  * with begin()/end(); the background sync runner pauses publishing while the
  * count is non-zero and drains once it returns to idle. Safe to nest. */
@@ -236,6 +240,18 @@ cmd_result_t cmd_ambit_run(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
 cmd_result_t cmd_ambit_run_mpf(uint8_t ch, uint16_t length, uint8_t interval,
                                 bool change_act, uint8_t act,
                                 uart_sensor_response_t *response, uint32_t timeout_ms);
+
+/* Parallel measurement protocol (trigger → poll → fetch). cmd_ambit_trigger
+ * (cmd 22) starts a retained run and returns on ack; cmd_ambit_poll (cmd 23)
+ * reads the async state byte (AMBIT_ASYNC_* in ambit_protocol.h), mapping a
+ * timeout to "busy"; cmd_ambit_fetch (cmd 24) streams the buffered arrays,
+ * yielding the same `response` as cmd_ambit_run. */
+cmd_result_t cmd_ambit_trigger(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
+                                uint8_t led_persist, bool allow_interrupt,
+                                uint32_t timeout_ms);
+cmd_result_t cmd_ambit_poll(uint8_t ch, uint8_t *state, uint32_t timeout_ms);
+cmd_result_t cmd_ambit_fetch(uint8_t ch, uart_sensor_response_t *response,
+                                uint32_t timeout_ms);
 
 /* Actions (wait for CMD_END, no response data) */
 cmd_result_t cmd_ambit_blink(uint8_t ch, uint8_t ambit_id, uint8_t intensity);

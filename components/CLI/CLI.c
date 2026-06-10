@@ -95,6 +95,10 @@ static int cli_cmd_status(int argc, char **argv)
            wifi_manager_is_connected() ? "connected" : "disconnected",
            provisioned ? "yes" : "no");
 
+    /* STA MAC — board identity (e.g. to spot a duplicate MQTT client ID). */
+    const char *mac = device_commands_get_mac();
+    printf(" - MAC: %s\r\n", (mac && mac[0]) ? mac : "(unavail)");
+
     /* Event DB + sync backlog. */
     bool    db_online = false;
     int64_t total = 0, pending = 0, next_id = 0;

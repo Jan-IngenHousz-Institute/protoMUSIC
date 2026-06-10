@@ -134,6 +134,11 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
     return ESP_OK;
 }
 
+const char *device_commands_get_mac(void)
+{
+    return s_mac_str;   /* "" if esp_wifi_get_mac failed at init */
+}
+
 cmd_result_t cmd_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 {
     if (!s_initialized || s_cfg.set_status == NULL) {
@@ -1247,6 +1252,83 @@ cmd_result_t cmd_ambit_run_mpf(uint8_t ch, uint16_t length, uint8_t interval,
     }
     return make_result(ESP_OK, "AMBIT%u mpf: %u arrays",
                        ch + 1, response->array_count);
+}
+
+/* ── Parallel measurement protocol (trigger → poll → fetch) ─────────────────
+ * Lets the host start a run on every AMBIT back-to-back and collect them
+ * afterwards, instead of blocking the whole run per channel. The four C3s
+ * measure concurrently; the host only ever holds the (single shared) bus for a
+ * short trigger/poll/fetch transaction. These deliberately do NOT bracket the
+ * measurement gate — the Lua orchestrator asserts it once across the cycle. */
+
+/* Cmd 22 — Trigger an async (retained) run. Same payload as cmd 21; the ambit
+ * acks CMD_DONE (ACK_ONLY) and then runs into its own buffers, staying silent
+ * until FETCH. Keep timeout_ms short — this only covers wake + ack. */
+cmd_result_t cmd_ambit_trigger(uint8_t ch, const uint8_t *run_arr, uint8_t arr_len,
+                               uint8_t led_persist, bool allow_interrupt,
+                               uint32_t timeout_ms)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    if (arr_len == 0 || arr_len > 16 || run_arr == NULL) {
+        return make_result(ESP_ERR_INVALID_ARG, "arr_len must be 1-16");
+    }
+    uint8_t cmd[8] = { AMBIT_CMD_RUN_START, arr_len, led_persist,
+                       (uint8_t)(allow_interrupt ? 1 : 0), 0, 0, 0, 0 };
+    uart_sensor_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, run_arr, (size_t)arr_len * 8,
+                                     UART_QUERY_ACK_ONLY, &resp, timeout_ms);
+    uart_sensor_response_free(&resp);
+    if (err != ESP_OK) {
+        return make_result(err, "AMBIT%u trigger failed: %s", ch + 1, esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "AMBIT%u triggered", ch + 1);
+}
+
+/* Cmd 23 — Poll async run state into *state (AMBIT_ASYNC_IDLE|DONE|ERROR). A
+ * measuring ambit doesn't answer, so ESP_ERR_TIMEOUT here means "busy" — the
+ * caller maps it. Keep timeout_ms short (a few wake retries) so a busy/locked
+ * channel fails fast instead of spraying wake bytes at a measuring sensor. */
+cmd_result_t cmd_ambit_poll(uint8_t ch, uint8_t *state, uint32_t timeout_ms)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    if (state) *state = 0xFF;   /* unknown until the ambit answers */
+    uint8_t cmd[8] = { AMBIT_CMD_STATUS, 0, 0, 0, 0, 0, 0, 0 };
+    uart_sensor_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0,
+                                     AMBIT_RESP_STATUS_SIZE, &resp, timeout_ms);
+    if (err != ESP_OK || resp.raw == NULL || resp.raw_len < AMBIT_RESP_STATUS_SIZE) {
+        uart_sensor_response_free(&resp);
+        return make_result(err != ESP_OK ? err : ESP_FAIL,
+                           "AMBIT%u poll: no answer", ch + 1);
+    }
+    if (state) *state = resp.raw[0];
+    uint8_t st = resp.raw[0];
+    uart_sensor_response_free(&resp);
+    return make_result(ESP_OK, "AMBIT%u state=%u", ch + 1, (unsigned)st);
+}
+
+/* Cmd 24 — Fetch the retained run result. The ambit streams its buffered arrays
+ * back over the FSM exactly like cmd 21, so `response` is identical to
+ * cmd_ambit_run's output. timeout_ms must cover the stream (scale with size). */
+cmd_result_t cmd_ambit_fetch(uint8_t ch, uart_sensor_response_t *response,
+                             uint32_t timeout_ms)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    uint8_t cmd[8] = { AMBIT_CMD_FETCH, 0, 0, 0, 0, 0, 0, 0 };
+    memset(response, 0, sizeof(*response));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, NULL, 0, 0, response, timeout_ms);
+    if (err != ESP_OK) {
+        return make_result(err, "AMBIT%u fetch failed: %s", ch + 1, esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "AMBIT%u fetch: %u arrays", ch + 1, response->array_count);
 }
 
 /* Cmd 5 — Blink the AS7341 LED for visual identification.

@@ -19,6 +19,12 @@ extern "C" {
 #define AMBIT_CMD_CONFIG_DETECTOR    10
 #define AMBIT_CMD_RUN_MPF            20
 #define AMBIT_CMD_RUN                21
+/* Parallel measurement protocol (trigger → poll → fetch). RUN_START takes the
+ * same payload as RUN (cmd 21) but the ambit acks and runs into retained
+ * buffers; STATUS returns one state byte; FETCH streams the retained arrays. */
+#define AMBIT_CMD_RUN_START          22
+#define AMBIT_CMD_STATUS             23
+#define AMBIT_CMD_FETCH              24
 #define AMBIT_CMD_GET_SPEC           31
 #define AMBIT_CMD_GET_TEMP           32
 #define AMBIT_CMD_GET_INFO           33
@@ -87,6 +93,14 @@ typedef struct {
 #define AMBIT_RESP_SPEC_SIZE      24   /* 12 × uint16_t (last 4 bytes = float PAR) */
 #define AMBIT_RESP_TEMP_SIZE       4   /* 2 × int16_t   (leaf*10, chip*10) */
 #define AMBIT_RESP_TEMP_RAW_SIZE  14   /* 7 × int16_t */
+#define AMBIT_RESP_STATUS_SIZE     1   /* 1 × uint8_t   (async run state)   */
+
+/* Async run state byte returned by AMBIT_CMD_STATUS (must match ambit fw
+ * PAM.h AMBIT_ASYNC_*). A measuring ambit doesn't answer at all, so the host
+ * infers BUSY from a wake/poll timeout — there is no BUSY byte. */
+#define AMBIT_ASYNC_IDLE   0   /* no result buffered (idle, or pre-run race) */
+#define AMBIT_ASYNC_DONE   1   /* result buffered, ready to FETCH            */
+#define AMBIT_ASYNC_ERROR  2   /* last run failed (alloc/partial)           */
 
 #ifdef __cplusplus
 }

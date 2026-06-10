@@ -563,11 +563,16 @@ esp_err_t uart_sensors_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Channel table — pin assignments from hardware schematic */
-    s_ch[0] = (channel_t){ .uart_num = UART_NUM_1, .rx_pin =  3, .tx_pin = 46, .shared = false };
-    s_ch[1] = (channel_t){ .uart_num = UART_NUM_2, .rx_pin = 17, .tx_pin = 18, .shared = false };
-    s_ch[2] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 47, .tx_pin = 48, .shared = true  };
-    s_ch[3] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 40, .tx_pin = 41, .shared = true  };
+    /* Channel table — pin assignments from hardware schematic.
+     * Single shared bus: all four channels are time-multiplexed onto ONE UART
+     * controller (UART_NUM_0), pin-remapped per transaction. The parallel
+     * trigger/poll/fetch protocol keeps every host↔ambit transaction short, so
+     * one controller suffices; the long measurement runs autonomously on each
+     * C3. (Console is USB-Serial-JTAG, so UART0 is free for sensors.) */
+    s_ch[0] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin =  3, .tx_pin = 46, .shared = true };
+    s_ch[1] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 17, .tx_pin = 18, .shared = true };
+    s_ch[2] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 47, .tx_pin = 48, .shared = true };
+    s_ch[3] = (channel_t){ .uart_num = UART_NUM_0, .rx_pin = 40, .tx_pin = 41, .shared = true };
 
     uart_config_t uart_cfg = {
         .baud_rate  = UART_BAUD_RATE,
@@ -578,26 +583,11 @@ esp_err_t uart_sensors_init(void)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    /* ── UART1 — dedicated to CH0 (AMBIT1) ── */
-    ESP_RETURN_ON_ERROR(uart_param_config(UART_NUM_1, &uart_cfg), TAG, "UART1 cfg");
-    ESP_RETURN_ON_ERROR(uart_set_pin(UART_NUM_1, s_ch[0].tx_pin, s_ch[0].rx_pin,
-                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
-                        TAG, "UART1 pins");
-    ESP_RETURN_ON_ERROR(uart_driver_install(UART_NUM_1, UART_RX_BUF_SIZE, 0, 0, NULL, 0),
-                        TAG, "UART1 install");
-
-    /* ── UART2 — dedicated to CH1 (AMBIT2) ── */
-    ESP_RETURN_ON_ERROR(uart_param_config(UART_NUM_2, &uart_cfg), TAG, "UART2 cfg");
-    ESP_RETURN_ON_ERROR(uart_set_pin(UART_NUM_2, s_ch[1].tx_pin, s_ch[1].rx_pin,
-                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
-                        TAG, "UART2 pins");
-    ESP_RETURN_ON_ERROR(uart_driver_install(UART_NUM_2, UART_RX_BUF_SIZE, 0, 0, NULL, 0),
-                        TAG, "UART2 install");
-
-    /* ── UART0 — shared between CH2 (AMBIT3) and CH3 (AMBIT4)
-     *    Default mapping: CH2 pins.  Remapped on-demand. ── */
+    /* ── UART0 — single shared bus for all 4 channels (AMBIT1–4)
+     *    Default mapping: CH0 pins. Remapped on-demand per transaction by
+     *    channel_acquire(). UART1/UART2 are left free. ── */
     ESP_RETURN_ON_ERROR(uart_param_config(UART_NUM_0, &uart_cfg), TAG, "UART0 cfg");
-    ESP_RETURN_ON_ERROR(uart_set_pin(UART_NUM_0, s_ch[2].tx_pin, s_ch[2].rx_pin,
+    ESP_RETURN_ON_ERROR(uart_set_pin(UART_NUM_0, s_ch[0].tx_pin, s_ch[0].rx_pin,
                                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
                         TAG, "UART0 pins");
     ESP_RETURN_ON_ERROR(uart_driver_install(UART_NUM_0, UART_RX_BUF_SIZE, 0, 0, NULL, 0),
@@ -616,7 +606,7 @@ esp_err_t uart_sensors_init(void)
     }
 
     s_inited = true;
-    ESP_LOGI(TAG, "UART sensors initialised (4 channels, Option D)");
+    ESP_LOGI(TAG, "UART sensors initialised (4 channels, single shared UART0 bus)");
     return ESP_OK;
 }
 

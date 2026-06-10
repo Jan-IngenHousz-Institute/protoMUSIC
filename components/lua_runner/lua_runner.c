@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 
 #include "device_commands.h"
+#include "ambit_protocol.h"   /* AMBIT_ASYNC_* run-state constants for ambit.poll */
 #include "time_sync.h"
 #include "lauxlib.h"
 #include "lua.h"
@@ -208,6 +209,25 @@ static int l_device_log(lua_State *L)
     const char *msg = luaL_checkstring(L, 1);
     cmd_log(msg);
     return 0;
+}
+
+/* device.measurement_window(on) — assert/release the measurement-activity gate
+ * around a whole measurement cycle so the sync_runner doesn't publish mid-cycle.
+ * begin/end are reference-counted; pair every on with exactly one off. */
+static int l_device_measurement_window(lua_State *L)
+{
+    if (lua_toboolean(L, 1)) device_commands_measurement_begin();
+    else                     device_commands_measurement_end();
+    return 0;
+}
+
+/* device.uptime_ms() — monotonic milliseconds since boot, for elapsed-time /
+ * deadline math (unaffected by RTC/wall-clock changes). esp_log_timestamp()
+ * needs no extra component dependency and wraps only after ~49 days. */
+static int l_device_uptime_ms(lua_State *L)
+{
+    lua_pushinteger(L, (lua_Integer)esp_log_timestamp());
+    return 1;
 }
 
 /* device.status_report() → table | nil,err. Point-in-time device state (Wi-Fi,
@@ -878,6 +898,8 @@ static void lua_register_device_module(lua_State *L)
         {"sd_ready",               l_device_sd_ready},
         {"sleep_ms",               l_device_sleep_ms},
         {"log",                    l_device_log},
+        {"measurement_window",     l_device_measurement_window},
+        {"uptime_ms",              l_device_uptime_ms},
         {"status_report",          l_device_status_report},
         {"PWM",                    l_device_pwm},
         /* UART raw */
@@ -983,38 +1005,20 @@ static uint8_t ambit_actinic_to_dac(lua_Integer actinic, float par_coef)
     return 0;
 }
 
-static int l_ambit_run(lua_State *L)
+/* Per-channel state stashed by ambit.trigger for the eventual ambit.fetch store:
+ * the run metadata (segments JSON) and the measurement start time. */
+static char    s_ambit_meta[UART_SENSOR_NUM_CHANNELS][768];
+static int64_t s_ambit_start_ms[UART_SENSOR_NUM_CHANNELS];
+
+/* Build a malloc'd run_arr (caller frees) of nseg*8 bytes plus a metadata JSON
+ * string, from the Lua segments table at `seg_idx`, for channel `ch` (its actinic
+ * calibration sets the PAR→DAC coefficient). Shared by ambit.run and ambit.trigger
+ * so both encode the wire identically. luaL_errors (longjmp) on malformed input. */
+static uint8_t *ambit_build_run_arr(lua_State *L, int seg_idx, uint8_t ch, int nseg,
+                                    char *metadata_json, size_t meta_cap)
 {
-    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
-    luaL_checktype(L, 2, LUA_TTABLE);
-
-    int nseg = (int)luaL_len(L, 2);
-    if (nseg <= 0 || nseg > 16) {
-        return luaL_error(L, "segments: 1-16 lines required (got %d)", nseg);
-    }
-
-    /* Defaults when opts is omitted (ambit.run(ch, trace)): store + 30 s. */
-    uint8_t  persist        = 0;
-    bool     store          = true;
-    uint32_t timeout_ms     = 30000;
-    bool     allow_interrupt = false;
-    if (lua_istable(L, 3)) {
-        lua_getfield(L, 3, "persist");
-        if (!lua_isnil(L, -1)) persist = lua_toboolean(L, -1) ? 1 : 0;
-        lua_pop(L, 1);
-        lua_getfield(L, 3, "store");
-        if (!lua_isnil(L, -1)) store = lua_toboolean(L, -1);
-        lua_pop(L, 1);
-        lua_getfield(L, 3, "timeout_ms");
-        if (lua_isnumber(L, -1)) timeout_ms = (uint32_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-        lua_getfield(L, 3, "interrupt");
-        if (!lua_isnil(L, -1)) allow_interrupt = lua_toboolean(L, -1);
-        lua_pop(L, 1);
-    }
-
     uint8_t *run_arr = malloc((size_t)nseg * 8);
-    if (!run_arr) return luaL_error(L, "out of memory");
+    if (!run_arr) { luaL_error(L, "out of memory"); return NULL; }
 
     /* This AMBIT's PAR→DAC actinic coefficient — lazily fetched once + cached
      * (cmd 33). Fallback 0.05 byte/µmol if the calibration can't be read. */
@@ -1022,12 +1026,11 @@ static int l_ambit_run(lua_State *L)
     cmd_ambit_device_info(ch, &info);
     float par_coef = (info.valid && info.actinic_coef > 0.0f) ? info.actinic_coef : 0.05f;
 
-    uint32_t total_pts = 0;
     for (int i = 1; i <= nseg; i++) {
-        lua_rawgeti(L, 2, i);
+        lua_rawgeti(L, seg_idx, i);
         if (!lua_istable(L, -1)) {
             free(run_arr);
-            return luaL_error(L, "segment %d must be a table", i);
+            luaL_error(L, "segment %d must be a table", i);
         }
 
         lua_getfield(L, -1, "pulses");
@@ -1047,8 +1050,8 @@ static int l_ambit_run(lua_State *L)
 
         lua_pop(L, 1); /* segment table */
 
-        if (pulses < 1 || pulses > 65535) { free(run_arr); return luaL_error(L, "segment %d: pulses must be 1-65535", i); }
-        if (freq   < 1 || freq   > 65535) { free(run_arr); return luaL_error(L, "segment %d: freq must be 1-65535", i); }
+        if (pulses < 1 || pulses > 65535) { free(run_arr); luaL_error(L, "segment %d: pulses must be 1-65535", i); }
+        if (freq   < 1 || freq   > 65535) { free(run_arr); luaL_error(L, "segment %d: freq must be 1-65535", i); }
         /* actinic: WRENCH convention — -255..-1 = raw DAC, 1..9999 = PAR (µmol),
          * 0 / out-of-range = off. Converted per the AMBIT's calibration below. */
 
@@ -1061,47 +1064,34 @@ static int l_ambit_run(lua_State *L)
         line[5] = (uint8_t)(freq & 0xFF);
         line[6] = ambit_actinic_to_dac(actinic, par_coef);
         line[7] = 1;                              /* subsampling: every point */
-        total_pts += (uint32_t)pulses;
     }
 
     /* Run metadata (small, bounded), built from the packed segment array. */
-    char metadata_json[768];
     {
-        int off = snprintf(metadata_json, sizeof(metadata_json), "{\"segments\":[");
-        for (int i = 0; i < nseg && off > 0 && off < (int)sizeof(metadata_json); i++) {
+        int off = snprintf(metadata_json, meta_cap, "{\"segments\":[");
+        for (int i = 0; i < nseg && off > 0 && off < (int)meta_cap; i++) {
             const uint8_t *line = run_arr + i * 8;
-            off += snprintf(metadata_json + off, sizeof(metadata_json) - off,
+            off += snprintf(metadata_json + off, meta_cap - off,
                             "%s{\"pulses\":%u,\"freq\":%u,\"actinic\":%u}", (i == 0) ? "" : ",",
                             ((unsigned)line[2] << 8) | line[3],
                             ((unsigned)line[4] << 8) | line[5], (unsigned)line[6]);
         }
-        if (off < 0 || off > (int)sizeof(metadata_json) - 3) off = (int)sizeof(metadata_json) - 3;
-        snprintf(metadata_json + off, sizeof(metadata_json) - off, "]}");
+        if (off < 0 || off > (int)meta_cap - 3) off = (int)meta_cap - 3;
+        snprintf(metadata_json + off, meta_cap - off, "]}");
     }
-    (void)total_pts;   /* AMBIT reports actual array lengths; no host-side cap */
+    return run_arr;
+}
 
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    int64_t start_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-
-    /* Binary AMBYTE run (cmd 21): the ambit streams each result array back over
-     * the FSM handshake as raw uint32 LE — no ASCII text buffer, no cJSON tree.
-     * Arrays land in resp.arrays[] keyed by index (see ambit fw pam_send_results). */
-    uart_sensor_response_t resp;
-    cmd_result_t res = cmd_ambit_run(ch, run_arr, (uint8_t)nseg, persist,
-                                     allow_interrupt, &resp, timeout_ms);
-    free(run_arr);
-
-    gettimeofday(&tv, NULL);
-    int64_t end_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-
-    if (res.status != ESP_OK) {
-        uart_sensor_response_free(&resp);
-        return lua_push_nil_reason(L, res.message);
-    }
-    uint8_t narr = resp.array_count;
+/* Decode an AMBIT FSM response into the reserved JSON payload, optionally store
+ * it as one event, free `resp`, and push the Lua result table (or nil+reason).
+ * Shared by ambit.run and ambit.fetch so both produce identical events. */
+static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
+                                   uint8_t ch, bool store, int64_t start_ms,
+                                   int64_t end_ms, const char *metadata_json)
+{
+    uint8_t narr = resp->array_count;
     if (narr == 0) {
-        uart_sensor_response_free(&resp);
+        uart_sensor_response_free(resp);
         return lua_push_nil_reason(L, "ambit run returned no arrays");
     }
 
@@ -1110,7 +1100,7 @@ static int l_ambit_run(lua_State *L)
     if (s_ambit_payload == NULL) {
         s_ambit_payload = malloc(AMBIT_RUN_PAYLOAD_CAP);
         if (s_ambit_payload == NULL) {
-            uart_sensor_response_free(&resp);
+            uart_sensor_response_free(resp);
             return luaL_error(L, "out of memory reserving %dB payload (free=%d, largest=%d)",
                               (int)AMBIT_RUN_PAYLOAD_CAP,
                               (int)heap_caps_get_free_size(MALLOC_CAP_8BIT),
@@ -1118,10 +1108,6 @@ static int l_ambit_run(lua_State *L)
         }
     }
 
-    /* Stream every received array into the payload as "<tag>":[…]. ENV (index 0)
-     * is leaf temperature, int16 centi-degC in the low 16 bits → emitted as degC.
-     * AMB_APP truncates (logged) rather than overrun the reserved buffer; `off`
-     * stays < cap by construction, so `cap - off` never underflows. */
     char  *pbuf = s_ambit_payload;
     size_t cap  = AMBIT_RUN_PAYLOAD_CAP;
     size_t off  = 0;
@@ -1138,7 +1124,7 @@ static int l_ambit_run(lua_State *L)
 
     AMB_APP("{");
     for (uint8_t a = 0; a < narr && !trunc; a++) {
-        const uart_data_array_t *arr = &resp.arrays[a];
+        const uart_data_array_t *arr = &resp->arrays[a];
         char tagbuf[12];
         const char *tag = ambit_array_tag(arr->index);
         if (tag == NULL) { snprintf(tagbuf, sizeof tagbuf, "arr%u", arr->index); tag = tagbuf; }
@@ -1177,7 +1163,7 @@ static int l_ambit_run(lua_State *L)
         }
     }
 
-    uart_sensor_response_free(&resp);
+    uart_sensor_response_free(resp);
 
     lua_newtable(L);
     lua_pushinteger(L, (lua_Integer)fluor_len);    lua_setfield(L, -2, "points");
@@ -1185,6 +1171,164 @@ static int l_ambit_run(lua_State *L)
     lua_pushnumber(L, leaf_temp_c);                lua_setfield(L, -2, "leaf_temp");
     lua_pushinteger(L, (lua_Integer)narr);         lua_setfield(L, -2, "arrays");
     return 1;
+}
+
+static int l_ambit_run(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    int nseg = (int)luaL_len(L, 2);
+    if (nseg <= 0 || nseg > 16) {
+        return luaL_error(L, "segments: 1-16 lines required (got %d)", nseg);
+    }
+
+    /* Defaults when opts is omitted (ambit.run(ch, trace)): store + 30 s. */
+    uint8_t  persist        = 0;
+    bool     store          = true;
+    uint32_t timeout_ms     = 30000;
+    bool     allow_interrupt = false;
+    if (lua_istable(L, 3)) {
+        lua_getfield(L, 3, "persist");
+        if (!lua_isnil(L, -1)) persist = lua_toboolean(L, -1) ? 1 : 0;
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "store");
+        if (!lua_isnil(L, -1)) store = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "timeout_ms");
+        if (lua_isnumber(L, -1)) timeout_ms = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "interrupt");
+        if (!lua_isnil(L, -1)) allow_interrupt = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+    }
+
+    char metadata_json[768];
+    uint8_t *run_arr = ambit_build_run_arr(L, 2, ch, nseg, metadata_json, sizeof metadata_json);
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t start_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    /* Binary AMBYTE run (cmd 21): the ambit streams each result array back over
+     * the FSM handshake as raw uint32 LE — no ASCII text buffer, no cJSON tree.
+     * Arrays land in resp.arrays[] keyed by index (see ambit fw pam_send_results). */
+    uart_sensor_response_t resp;
+    cmd_result_t res = cmd_ambit_run(ch, run_arr, (uint8_t)nseg, persist,
+                                     allow_interrupt, &resp, timeout_ms);
+    free(run_arr);
+
+    gettimeofday(&tv, NULL);
+    int64_t end_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    if (res.status != ESP_OK) {
+        uart_sensor_response_free(&resp);
+        return lua_push_nil_reason(L, res.message);
+    }
+    return ambit_decode_store_push(L, &resp, ch, store, start_ms, end_ms, metadata_json);
+}
+
+/* ambit.trigger(ch, segments [, opts]) — start a retained (async) run on `ch`
+ * and return true once the ambit acks (cmd 22). The run executes on the ambit
+ * to completion; collect it later with ambit.poll + ambit.fetch. Stashes the
+ * run's metadata + start time per channel for the eventual store.
+ *   opts : { persist=false, interrupt=false, timeout_ms=3000 } */
+static int l_ambit_trigger(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    if (ch >= UART_SENSOR_NUM_CHANNELS)
+        return luaL_error(L, "channel must be 0-%d", UART_SENSOR_NUM_CHANNELS - 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    int nseg = (int)luaL_len(L, 2);
+    if (nseg <= 0 || nseg > 16)
+        return luaL_error(L, "segments: 1-16 lines required (got %d)", nseg);
+
+    uint8_t  persist        = 0;
+    bool     allow_interrupt = false;
+    uint32_t timeout_ms     = 3000;   /* covers wake + ack only */
+    if (lua_istable(L, 3)) {
+        lua_getfield(L, 3, "persist");
+        if (!lua_isnil(L, -1)) persist = lua_toboolean(L, -1) ? 1 : 0;
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "interrupt");
+        if (!lua_isnil(L, -1)) allow_interrupt = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "timeout_ms");
+        if (lua_isnumber(L, -1)) timeout_ms = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+    }
+
+    uint8_t *run_arr = ambit_build_run_arr(L, 2, ch, nseg,
+                                           s_ambit_meta[ch], sizeof s_ambit_meta[ch]);
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    s_ambit_start_ms[ch] = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    cmd_result_t res = cmd_ambit_trigger(ch, run_arr, (uint8_t)nseg, persist,
+                                         allow_interrupt, timeout_ms);
+    free(run_arr);
+    if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* ambit.poll(ch [, timeout_ms]) -> "idle" | "done" | "error" | "busy".
+ * "busy" = the ambit didn't answer (still measuring, or bus contended) — the
+ * caller keeps waiting. Only "done"/"error" are terminal. Default timeout is
+ * short so a measuring sensor fails fast instead of being sprayed with wakes. */
+static int l_ambit_poll(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    if (ch >= UART_SENSOR_NUM_CHANNELS)
+        return luaL_error(L, "channel must be 0-%d", UART_SENSOR_NUM_CHANNELS - 1);
+    uint32_t timeout_ms = (uint32_t)luaL_optinteger(L, 2, 400);
+
+    uint8_t st = 0xFF;
+    cmd_result_t res = cmd_ambit_poll(ch, &st, timeout_ms);
+    const char *s;
+    if (res.status != ESP_OK)         s = "busy";
+    else if (st == AMBIT_ASYNC_DONE)  s = "done";
+    else if (st == AMBIT_ASYNC_ERROR) s = "error";
+    else                              s = "idle";
+    lua_pushstring(L, s);
+    return 1;
+}
+
+/* ambit.fetch(ch [, opts]) -> result table or nil,reason. Streams the retained
+ * arrays (cmd 24) and stores one event (store defaults true), using the metadata
+ * + start time stashed by ambit.trigger so the event matches ambit.run's.
+ *   opts : { store=true, timeout_ms=30000 } */
+static int l_ambit_fetch(lua_State *L)
+{
+    uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    if (ch >= UART_SENSOR_NUM_CHANNELS)
+        return luaL_error(L, "channel must be 0-%d", UART_SENSOR_NUM_CHANNELS - 1);
+
+    bool     store      = true;
+    uint32_t timeout_ms = 30000;   /* must cover the array stream (scale with size) */
+    if (lua_istable(L, 2)) {
+        lua_getfield(L, 2, "store");
+        if (!lua_isnil(L, -1)) store = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "timeout_ms");
+        if (lua_isnumber(L, -1)) timeout_ms = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+    }
+
+    uart_sensor_response_t resp;
+    cmd_result_t res = cmd_ambit_fetch(ch, &resp, timeout_ms);
+    if (res.status != ESP_OK) {
+        uart_sensor_response_free(&resp);
+        return lua_push_nil_reason(L, res.message);
+    }
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t end_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    return ambit_decode_store_push(L, &resp, ch, store,
+                                   s_ambit_start_ms[ch], end_ms, s_ambit_meta[ch]);
 }
 
 /* ── ambit.* bindings ────────────────────────────────────────────────
@@ -1207,6 +1351,9 @@ static void lua_register_ambit_module(lua_State *L)
     static const luaL_Reg ambit_api[] = {
         {"uart_query", l_ambit_uart_query},
         {"run",        l_ambit_run},
+        {"trigger",    l_ambit_trigger},   /* parallel protocol: start retained run */
+        {"poll",       l_ambit_poll},      /*   "    "    "    : query async state  */
+        {"fetch",      l_ambit_fetch},     /*   "    "    "    : collect + store     */
         {NULL, NULL},
     };
 
