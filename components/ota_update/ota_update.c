@@ -26,7 +26,7 @@
 #define OTA_CONNECT_POLL_MS   1000
 
 #define NVS_NS      "ota_upd"
-#define KEY_PENDING "pending_id"      /* id of an applied-but-unconfirmed image (reboot correlation) */
+#define KEY_APPLIED "applied_id"      /* id of the last successfully-applied image (set on success) */
 
 typedef struct {
     char url[OTA_URL_MAX];
@@ -71,22 +71,18 @@ static bool wait_connected(uint32_t timeout_s)
     return s_cfg.is_connected();
 }
 
-/* ── NVS pending-id latch ──────────────────────────────────────────────── */
+/* ── applied-id latch (NVS) ─────────────────────────────────────────────
+ * The id of the last image that was *successfully* written + booted. Set only
+ * on success (right before reboot), so a FAILED download never burns the id —
+ * re-sending the same id after a 404/network error just retries. Doubles as:
+ * the dedupe key (a retained/duplicate trigger for an already-applied id is
+ * ignored) and the correlation id the post-reboot confirm path reports. */
 
 static void latch_set(const char *id)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_str(h, KEY_PENDING, id ? id : "");
-    nvs_commit(h);
-    nvs_close(h);
-}
-
-static void latch_clear(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_erase_key(h, KEY_PENDING);
+    nvs_set_str(h, KEY_APPLIED, id ? id : "");
     nvs_commit(h);
     nvs_close(h);
 }
@@ -96,9 +92,17 @@ static bool latch_get(char *out, size_t cap)
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
     size_t len = cap;
-    esp_err_t err = nvs_get_str(h, KEY_PENDING, out, &len);
+    esp_err_t err = nvs_get_str(h, KEY_APPLIED, out, &len);
     nvs_close(h);
     return err == ESP_OK;
+}
+
+/* True if `id` equals the last successfully-applied id. */
+static bool already_applied(const char *id)
+{
+    if (id == NULL || id[0] == '\0') return false;
+    char prev[OTA_ID_MAX] = "";
+    return latch_get(prev, sizeof prev) && strcmp(prev, id) == 0;
 }
 
 /* ── one OTA download ──────────────────────────────────────────────────── */
@@ -108,9 +112,6 @@ static void ota_do_update(const ota_request_t *r)
     ESP_LOGW(TAG, "OTA requested id=%s url=%s", r->id, r->url);
     ota_report("accepted", r->id, NULL);
     vTaskDelay(pdMS_TO_TICKS(500));   /* let the accepted report flush before comms drop */
-
-    /* Latch the id so the post-reboot confirm path can report it. */
-    latch_set(r->id);
 
     /* Free MQTT's TLS heap — the board can't hold two TLS sessions at once. */
     if (s_cfg.comms_suspend != NULL) s_cfg.comms_suspend();
@@ -133,14 +134,19 @@ static void ota_do_update(const ota_request_t *r)
     esp_err_t err = esp_https_ota(&cfg);
 
     if (err == ESP_OK) {
+        /* Mark applied ONLY now that the image is written + boot is set: a failed
+         * download above never reaches here, so its id stays retryable. This
+         * latch dedupes the retained trigger after reboot and is the id the
+         * confirm path reports. */
+        latch_set(r->id);
         ESP_LOGW(TAG, "OTA image written + boot set — rebooting into the new image");
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();   /* no return */
     }
 
-    /* Failed: not booting the new image — clear the latch, bring comms back, report. */
+    /* Failed: not booting the new image — bring comms back and report. The id is
+     * NOT latched, so the same id can be re-sent to retry. */
     ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
-    latch_clear();
     if (s_cfg.comms_resume != NULL) s_cfg.comms_resume();
     if (wait_connected(60)) {
         ota_report("failed", r->id, esp_err_to_name(err));
@@ -165,12 +171,13 @@ static void confirm_pending_after_boot(void)
     if (wait_connected(OTA_CONFIRM_TIMEOUT_S)) {
         esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
         ESP_LOGW(TAG, "image confirmed valid: %s", esp_err_to_name(err));
-        latch_clear();
+        /* Keep the latch as the applied-id dedupe record. */
         ota_report("success", id, NULL);
     } else {
-        /* Couldn't prove health within the window — revert to the known-good slot. */
+        /* Couldn't prove health within the window — revert to the known-good slot.
+         * The latch stays so the same (bad) id isn't auto-retried; a new id, or a
+         * fixed image under a new id, is the way forward. */
         ESP_LOGE(TAG, "no MQTT within %ds — rolling back", OTA_CONFIRM_TIMEOUT_S);
-        latch_clear();
         esp_ota_mark_app_invalid_rollback_and_reboot();   /* no return on success */
     }
 }
@@ -214,6 +221,12 @@ esp_err_t ota_update_request(const char *url, const char *id)
     if (s_queue == NULL) return ESP_ERR_INVALID_STATE;
     if (url == NULL || url[0] == '\0' || strlen(url) >= OTA_URL_MAX) {
         return ESP_ERR_INVALID_ARG;
+    }
+    /* Dedupe on the last successfully-applied id (idempotent under a retained
+     * trigger). A failed attempt is NOT latched, so the same id retries. */
+    if (already_applied(id)) {
+        ESP_LOGI(TAG, "ota_update id=%s already applied — ignoring", id ? id : "");
+        return ESP_OK;
     }
     ota_request_t r;
     memset(&r, 0, sizeof r);

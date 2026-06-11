@@ -6,52 +6,15 @@
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "nvs.h"
 #include "ota_update.h"
 
 #define TAG "cmd_router"
 
-#define NVS_NS          "cmd_router"
-#define NVS_KEY_LAST_ID "last_id"
-
 static command_router_config_t s_cfg;   /* pointers reference app_main's static buffers */
 
-/* ── idempotency: persisted last-applied command id ─────────────────────────
- * Survives the reboot an OTA causes, so a retained trigger is applied exactly
- * once. ping is NOT deduped (a reply is harmless and wanted every time). */
-
-static bool already_applied(const char *id)
-{
-    if (id == NULL || id[0] == '\0') {
-        return false;
-    }
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
-        return false;
-    }
-    char prev[64] = {0};
-    size_t len = sizeof(prev);
-    esp_err_t err = nvs_get_str(h, NVS_KEY_LAST_ID, prev, &len);
-    nvs_close(h);
-    return (err == ESP_OK && strcmp(prev, id) == 0);
-}
-
-/* Recorded when an ota_update is dispatched, so a retained/duplicate trigger
- * can't re-apply it (at-least-once idempotency). */
-static void mark_applied(const char *id)
-{
-    if (id == NULL || id[0] == '\0') {
-        return;
-    }
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
-        return;
-    }
-    if (nvs_set_str(h, NVS_KEY_LAST_ID, id) == ESP_OK) {
-        nvs_commit(h);
-    }
-    nvs_close(h);
-}
+/* Idempotency lives in ota_update now: it latches an id only on a *successful*
+ * update (set-boot done), so a retained/duplicate trigger is ignored while a
+ * failed attempt stays retryable under the same id. The router just forwards. */
 
 static void publish_reply(const char *json)
 {
@@ -107,16 +70,10 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
     } else if (strcmp(type, "ota_update") == 0) {
         const cJSON *jurl = cJSON_GetObjectItemCaseSensitive(root, "url");
         const char *url = cJSON_IsString(jurl) ? jurl->valuestring : NULL;
-        if (already_applied(id)) {
-            ESP_LOGI(TAG, "ota_update id=%s already applied — ignoring", id ? id : "");
-        } else if (url == NULL) {
+        if (url == NULL) {
             ESP_LOGW(TAG, "ota_update id=%s missing 'url' — ignoring", id ? id : "");
         } else {
-            /* Mark applied up front so a retained/duplicate trigger can't re-OTA
-             * (at-least-once). The OTA worker downloads with comms suspended and
-             * reboots; status is reported on the status topic. A failed update
-             * needs a fresh id to retry. */
-            mark_applied(id);
+            /* ota_update owns dedupe (on success) + the download/reboot. */
             esp_err_t err = ota_update_request(url, id);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "ota_update id=%s dispatch failed: %s",
