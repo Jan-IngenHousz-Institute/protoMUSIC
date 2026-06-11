@@ -208,6 +208,45 @@ back and the job shows FAILED with the rollback detail.
 
 ---
 
+## Stage 3b — image authenticity via AWS Signer  *(hardening; layers on Stage 3)*
+
+This is the part of "the dedicated AWS IoT OTA feature" worth adopting without
+the full OTA-agent stack migration. Stage 3 gives integrity (`sha256`/`size`)
+but not **authenticity** — the trust boundary is only "who can create jobs in
+the AWS account" (IAM). AWS Signer closes that with a real signature over the
+image, and it grafts onto the **existing Jobs flow** rather than requiring
+coreMQTT/coreHTTP or a second TLS session (the reason the full managed OTA
+service is deferred — see the "Why NOT" note above).
+
+**Why it fits the Jobs flow:** `CreateOTAUpdate` already produces a code-signed
+artifact + a signature, and the job document can carry the signature (or a URL
+to it) alongside the image URL. The device just adds one verify step; the
+transport stays esp_https_ota over the existing connection.
+
+**Scope:**
+- Sign the firmware with **AWS Signer** (or an offline ECDSA key) at release
+  time; publish the signature next to the `firmware.bin`.
+- Provision the **public key** on the device (NVS or embedded in the app) —
+  one-time, like the cert bundle.
+- Job document gains `sig` (+ `sig_alg`). The Stage-3 handler verifies the
+  downloaded image against the public key **before** `esp_ota_set_boot_partition`
+  — using `esp_https_ota`'s post-download hook or a streaming hash + an mbedTLS
+  ECDSA verify (mbedTLS is already linked for TLS, so no new heap stack).
+- A bad/unsigned/altered image is rejected and the job reports FAILED
+  `{"reason":"signature"}` — never boots.
+
+**Relation to Secure Boot v2:** Signer verifies *who built it* (app-level,
+software trust). Secure Boot v2 verifies *what the ROM will boot* (hardware
+root of trust, efuse-burned). They're complementary; Signer is the cheaper
+first step and needs no efuse changes. Full hardware authenticity = Secure
+Boot v2, still a separate, irreversible (efuse) decision.
+
+**Deliverable:** an image signed by the release pipeline updates normally; a
+tampered or unsigned image is refused before boot and the job shows FAILED with
+a signature reason. No coreMQTT migration, no second TLS session.
+
+---
+
 ## Stage 4 — Lua `script_update` as a job  *(parallel to Stage 3)*
 
 `type: "script_update"` per
