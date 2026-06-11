@@ -20,8 +20,10 @@ extern "C" {
  * docs/append-log-persistence-plan.md).
  *
  * Storage model: /sdcard/events/ holds rotating files ev-000001.log, … (monotonic
- * seq). One newline-terminated, tab-delimited record per event:
- *   <measure_id>\t<device>\t<sensor>\t<start_ms>\t<end_ms>\t<metadata>\t<payload>\n
+ * seq). One newline-terminated, tab-delimited record per event (format v2,
+ * 9 fields; v1 7-field records are skipped as malformed — planned wipe/drain
+ * at the v2 deploy, see docs/payload-v2-plan.md):
+ *   <measure_id>\t<channel>\t<device>\t<tag>\t<cmd_raw>\t<start_ms>\t<end_ms>\t<metadata>\t<payload>\n
  * The tail file is appended to (store) with PERIODIC flush; a fresh read handle
  * after fsync serves claims (the read+append handshake the per-file-cache FATFS
  * build needs). The read cursor and a next_id high-water mark live in NVS
@@ -38,11 +40,7 @@ esp_err_t event_log_on_sd_restored(void);
 
 /* Event store / claim / mark (see persistence_port.h for semantics). */
 esp_err_t event_log_next_id(int64_t *out_id);
-esp_err_t event_log_store_event(int64_t measure_id,
-                                const char *device, const char *sensor,
-                                int64_t start_ms, int64_t end_ms,
-                                const char *metadata_json,
-                                const char *payload_json);
+esp_err_t event_log_store_event(const measurement_event_desc_t *desc);
 esp_err_t event_log_claim_next_event(measurement_event_t *out);
 esp_err_t event_log_mark_event_synced(int64_t measure_id);
 esp_err_t event_log_mark_event_pending(int64_t measure_id);

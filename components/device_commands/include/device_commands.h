@@ -52,12 +52,12 @@ typedef struct {
     const char                         *topic_root;
     const char                         *device_id;
 
-    /* Payload metadata (provisioned via BLE) */
+    /* Payload metadata (provisioned via BLE / NVS pre-pop) */
     const char                         *protocol_id;
     const char                         *device_name;
     const char                         *device_version;
     const char                         *device_firmware;
-    const char                         *firmware_version;
+    const char                         *timezone;      /* IANA name, "" = unset */
 
     /* UART sensor ports (Phase 7) */
     uart_sensor_query_fn                uart_query;        /* AMBIT binary */
@@ -140,12 +140,10 @@ typedef struct {
 
 cmd_result_t cmd_status_report(device_status_snapshot_t *out);
 
-/* Store one measurement event. payload_json is a JSON object of quantities
- * (required); metadata_json may be NULL; device "" / NULL = onboard. Writes
- * straight to SQLite — requires the SD-backed DB. */
-cmd_result_t cmd_store_event(int64_t measure_id, const char *device, const char *sensor,
-                             int64_t start_ms, int64_t end_ms,
-                             const char *metadata_json, const char *payload_json);
+/* Store one measurement event from a v2 descriptor (see persistence_port.h).
+ * desc->payload_json and desc->tag are required; channel/device/cmd_raw/
+ * metadata_json may be NULL/"". Requires the SD-backed event log. */
+cmd_result_t cmd_store_event(const measurement_event_desc_t *desc);
 
 /* Send an ASCII command and read multiple response lines until one contains
  * `sentinel` (or timeout). Pre-wakes the port. Used for the AMBIT PLOTTING run.
@@ -184,9 +182,8 @@ cmd_result_t cmd_uart_status(void);
  * discarded and the next line is returned.
  *
  * When `save` is true, the response (or an empty string on timeout) is
- * stored as a single measurement event tagged
- *   sensor  = "uart_ch<N>"
- *   device  = NULL (onboard)
+ * stored as a single measurement event with
+ *   channel = "uart_<N>", tag = MEASUREMENT, cmd_raw = the literal command,
  *   payload = {"response":"<text>"}
  * via cmd_store_event. `out_resp` is always set (NUL-terminated, possibly
  * empty) on return.

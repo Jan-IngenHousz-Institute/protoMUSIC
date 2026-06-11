@@ -1,14 +1,14 @@
-# MQTT payload reference
+# MQTT payload reference (schema v2)
 
 What the firmware actually publishes, as implemented. The single envelope
 builder is `cmd_mqtt_publish_next_event()` in
 [components/device_commands/device_commands.c](../components/device_commands/device_commands.c)
 — if this document and the code disagree, the code wins.
 
-> **This is the v1 schema.** A redesign (schema v2: firmware-filled
-> provenance, `tag`/`channel`/`cmd_raw`, measurement-time envelope timestamp)
-> is planned in [payload-v2-plan.md](payload-v2-plan.md); this document gets
-> rewritten when it lands.
+> Schema v2 wire format (Phase 1 of [payload-v2-plan.md](payload-v2-plan.md))
+> landed 2026-06-11. The Lua API, device discovery, and the firmware heartbeat
+> are later phases — the **Transitional notes** below mark what still carries
+> v1 shims.
 
 ## Model: store, then publish
 
@@ -34,10 +34,8 @@ Events publish in store order (FIFO).
 - `topic_root` comes from NVS (`AMBYTE_TOPIC_ROOT`, e.g.
   `experiment/data_ingest/v1/<experiment-uuid>/multispeq/v1.0/AMBYTE{MAC}`;
   the `{MAC}` token is expanded at boot to the board's STA MAC).
-- The `/1234` suffix is a hardcoded literal (`device_commands.c`,
-  `cmd_mqtt_publish_next_event`).
-- The AWS IoT policy must permit publishing to the resulting topic; policies
-  typically pin topics to strings containing the thing name.
+- The cloud pipeline extracts `experiment_id` from the 4th topic segment;
+  the `/1234` suffix is a hardcoded literal it ignores.
 
 ## Envelope
 
@@ -48,20 +46,25 @@ example:
 ```jsonc
 {
   "sample": [{                          // always exactly ONE element
+    "v": 2,                             // schema version
     "measure_id": 1000042,              // int64, unique per device (see below)
     "startTicks": 1765459200123,        // epoch ms, measurement start
     "endTicks":   1765459210456,        // epoch ms, measurement end
-    "device":  "ambit",                 // string, or null when stored without one
-    "sensor":  "AMBIT_1",               // required at store time
+    "published": "2026-06-11T09:30:00Z",// UTC ISO-8601 at PUBLISH time
+    "channel": "uart_1",                // physical port, null = onboard
+    "device":  "ambit",                 // discovered sensor name, null = unknown
+    "cmd_raw": "ambit.run",             // logical/literal command, null = none
+    "tag": "MEASUREMENT",               // origin enum (firmware-assigned)
     "metadata": { "segments": [ ... ] },// object, or null when absent
     "data":     { ... }                 // object — the measurement quantities
   }],
-  "device_firmware":  "1",              // AMBYTE_DEVICE_FIRMWARE (NVS)
+  "timestamp": "2026-06-11T07:02:11Z",  // = startTicks as ISO-8601 (MEASUREMENT time)
+  "device_battery": 3.912,              // volts, last charger read; omitted if never read
+  "timezone": "Europe/Amsterdam",       // AMBYTE_TIMEZONE (NVS); omitted if unset
   "device_id":        "10:00:3B:72:22:44", // STA MAC — NOT AMBYTE_DEVICE_ID
   "device_name":      "AmbyteOnAir",    // AMBYTE_DEVICE_NAME (NVS)
   "device_version":   "1",              // AMBYTE_DEVICE_VERSION (NVS)
-  "firmware_version": "1",              // AMBYTE_FIRMWARE_VERSION (NVS)
-  "timestamp": "2026-06-11T09:30:00Z"   // UTC ISO-8601 at PUBLISH time
+  "device_firmware":  "1"               // AMBYTE_DEVICE_FIRMWARE (NVS)
 }
 ```
 
@@ -69,28 +72,44 @@ Field notes:
 
 - `sample` is an array purely for compatibility with the cloud's
   `sample:[…]` ingestion contract; the firmware always sends one element.
-- `startTicks`/`endTicks` are captured at **measurement** time
-  (`db.store_event` defaults them to "now" when the event is stored);
-  the top-level `timestamp` is stamped at **publish** time. On battery
-  these can differ by hours or days — use the ticks for measurement time.
+- **Envelope `timestamp` is the measurement time** (`startTicks` rendered as
+  ISO-8601): the openJII pipeline aliases it to `measurement_time_utc`, so
+  battery-queued events carry their capture time. Publish time lives in
+  `sample[0].published`.
+- `tag` is firmware-assigned, never user input: `MEASUREMENT` for anything a
+  script originated; `STATUS` arrives with the Phase-4 firmware heartbeat.
+- `channel` is `"uart_<n>"` (0-based) for the UART sensor ports, `"usb_<n>"`
+  reserved for the USB hub; JSON `null` = onboard source.
+- `device` is best-effort sensor self-identification — `null` until Phase 3
+  discovery lands (the AMBIT store path hardcodes `"ambit"` already).
 - `measure_id` is a plain monotonic `int64` from the event log (starts at 1,
-  reseeded above the highest id found on the SD card at boot). It is unique
-  **per device only** — combine with `device_id` for a global key.
+  reseeded above the highest id found on the SD card at boot). Unique **per
+  device only** — and note the cloud does NOT dedupe: QoS-1 redeliveries land
+  as duplicate rows, so consumers dedupe on (`device_id`, `measure_id`).
+- `firmware_version` is gone from the envelope: the pipeline's schema never
+  read it; `device_firmware` is the platform's firmware-tracking key.
 - The identity strings are provisioned via `.env` → NVS (see
   [.env.example](../.env.example)); empty strings appear when unprovisioned.
 
-## Event types (what fills `sensor` / `device` / `metadata` / `data`)
+## Event types (what fills the provenance + `data`)
 
-`data` is whatever the Lua script stores; the shapes below are what the
+`data` is whatever the producer serialises; the shapes below are what the
 current firmware paths and the shipped schedule script produce.
 
-| Event | `sensor` | `device` | `metadata` | `data` |
+| Event | `channel` | `device` | `cmd_raw` | `data` |
 |---|---|---|---|---|
-| AMBIT fluorescence run (`ambit.run`, `ambit.trigger`+`fetch`) | `AMBIT_<ch+1>` | `ambit` | `{"segments":[{"pulses":N,"freq":N,"actinic":N},…]}` | `{"env":[…],"s_fluo":[…],"r_fluo":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` |
-| Spectrum + PAR (`device.ambit_get_spec`) | `AMBIT` | `AMBIT<ch+1>` | `null` | `{"spec":[…],"par":N}` |
-| Status heartbeat (`device.status_report`) | `status` | `null` | `null` | `{"wifi":bool,"provisioned":bool,"db_online":bool,"publish_gate":bool,"battery_v":num,"input_v":num,"system_v":num,"input_ma":int,"charge_ma":int,"input_present":bool,"charge_status":int}` |
-| BME280 (`device.bme280` stored via Lua) | script-defined | `null` | `null` | `{"temperature_c":num,"humidity_pct":num,"pressure_pa":num}` |
-| UART text query (`save=true`) | `uart_ch<N>` | `null` | `null` | `{"response":"…"}` — empty string means "queried, no reply" |
+| AMBIT fluorescence run (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `ambit.run` / `ambit.fetch` | `{"env":[…],"s_fluo":[…],"r_fluo":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` |
+| BME280 via CLI/`device.record_env` | `null` | `null` | `device.bme280` | `{"temperature":f,"humidity":f,"pressure":f}` |
+| UART text query (`save=true`) | `uart_<n>` | `null` | the literal command | `{"response":"…"}` (empty string on timeout) |
+| Lua `db.store_event{}` (spectra, heartbeat, custom) | `null` | script `device` field | *transitional:* the legacy `sensor` string | script-defined |
+
+**Transitional notes (until Phase 2/4 of the plan):**
+- `db.store_event`'s legacy `sensor` string (e.g. `"status"`, `"AMBIT"`)
+  rides in `cmd_raw` so its discriminator survives; the Lua API slims to
+  `{ data, metadata, channel }` in Phase 2.
+- The status heartbeat is still a script job storing via `db.store_event`
+  (so it appears with `tag:"MEASUREMENT"`, `cmd_raw:"status"`); it becomes a
+  firmware task with `tag:"STATUS"` in Phase 4.
 
 ### AMBIT `data` keys
 
@@ -110,25 +129,40 @@ matching the AMBIT firmware's send order:
 | 7 | `timing` | `[tick_begin, tick_end]` µs |
 
 Unknown indices fall back to `"arr<idx>"`. All values except `env` are raw
-uint32 counts.
+uint32 counts. `metadata.segments` carries the wire-encoded stimulus
+(`actinic` is the DAC byte after PAR→current conversion, not the requested
+PAR value).
 
 ## Delivery semantics
 
 - **QoS 1, retain 0**, one message in flight at a time.
 - PUBACK marks the event `SYNCED`; a publish failure or MQTT disconnect
-  re-marks it `PENDING` for retry. Delivery is therefore **at-least-once**
-  — the cloud must dedupe on (`device_id`, `measure_id`).
+  re-marks it `PENDING` for retry. Delivery is therefore **at-least-once**,
+  and the platform keeps duplicates (no cloud-side dedupe) — dedupe on
+  (`device_id`, `measure_id`) when analysing.
 - Payloads larger than 128 KiB (the AWS IoT maximum) are still attempted
   but logged as likely to be rejected. The AMBIT run payload buffer is
   capped at 8 KiB (`AMBIT_RUN_PAYLOAD_CAP`); larger runs truncate with a
   warning and are not stored.
 
+## On-disk record (event_log format v2)
+
+One tab-separated line per event in `/sdcard/events/ev-*.log`:
+
+```
+<measure_id>\t<channel>\t<device>\t<tag>\t<cmd_raw>\t<start_ms>\t<end_ms>\t<metadata>\t<payload>\n
+```
+
+v1 (7-field) records are skipped as malformed. **Deploying v2 firmware over
+a device with pending v1 records loses them** — drain the device first
+(external power, watch pending hit 0) or delete `/sdcard/events/` at flash
+time. This is a planned wipe, distinct from the corruption-only `.corrupt`
+archive policy.
+
 ## Inbound messages
 
-The device subscribes to `AMBYTE_COMMAND_TOPIC` and replies on
-`AMBYTE_STATUS_TOPIC` (see [.env.example](../.env.example)). The command
-payload format (inline Lua script + SHA-256 checksum, optional gzip+base64)
-is documented in [device-script-delivery.md](../device-script-delivery.md).
+Moving to AWS IoT Jobs — see [ota-update-plan.md](ota-update-plan.md)
+(Stage 2) and [device-script-delivery.md](../device-script-delivery.md).
 
 ## Caveat: host test client
 

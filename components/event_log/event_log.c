@@ -107,8 +107,8 @@ static bool parse_ev_name(const char *name, uint32_t *seq)
     return true;
 }
 
-/* device/sensor are the only raw fields → strip tab/newline/control so they
- * can't break the line framing; they're short controlled strings anyway. */
+/* channel/device/tag/cmd_raw are the only raw fields → strip tab/newline/control
+ * so they can't break the line framing; they're short controlled strings anyway. */
 static void sanitize_field(char *dst, size_t cap, const char *src)
 {
     size_t j = 0;
@@ -185,27 +185,29 @@ static esp_err_t parse_record(char *line, size_t len, measurement_event_t *out)
 {
     while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
 
-    char *f[7];
+    char *f[9];
     f[0] = line;
     int nf = 1;
-    for (char *p = line; *p != '\0' && nf < 7; p++) {
+    for (char *p = line; *p != '\0' && nf < 9; p++) {
         if (*p == '\t') { *p = '\0'; f[nf++] = p + 1; }
     }
-    if (nf < 7) return ESP_ERR_INVALID_RESPONSE;        /* need exactly 7 fields */
+    if (nf < 9) return ESP_ERR_INVALID_RESPONSE;        /* need exactly 9 fields (v2) */
 
-    const char *payload = f[6];
+    const char *payload = f[8];
     if (payload[0] != '{' && payload[0] != '[') return ESP_ERR_INVALID_RESPONSE;
 
     memset(out, 0, sizeof *out);
     out->measure_id     = (int64_t)strtoll(f[0], NULL, 10);
-    strncpy(out->device, f[1], sizeof(out->device) - 1);
-    strncpy(out->sensor, f[2], sizeof(out->sensor) - 1);
-    out->start_ticks_ms = (int64_t)strtoll(f[3], NULL, 10);
-    out->end_ticks_ms   = (int64_t)strtoll(f[4], NULL, 10);
+    strncpy(out->channel, f[1], sizeof(out->channel) - 1);
+    strncpy(out->device,  f[2], sizeof(out->device)  - 1);
+    strncpy(out->tag,     f[3], sizeof(out->tag)     - 1);
+    strncpy(out->cmd_raw, f[4], sizeof(out->cmd_raw) - 1);
+    out->start_ticks_ms = (int64_t)strtoll(f[5], NULL, 10);
+    out->end_ticks_ms   = (int64_t)strtoll(f[6], NULL, 10);
     out->sync_state     = MEASUREMENT_SYNC_INFLIGHT;
 
-    if (f[5][0] != '\0') {
-        out->metadata_json = strdup(f[5]);
+    if (f[7][0] != '\0') {
+        out->metadata_json = strdup(f[7]);
         if (out->metadata_json == NULL) return ESP_ERR_NO_MEM;
     }
     out->payload_json = strdup(payload);
@@ -368,11 +370,12 @@ esp_err_t event_log_next_id(int64_t *out_id)
     return ESP_OK;
 }
 
-esp_err_t event_log_store_event(int64_t measure_id, const char *device, const char *sensor,
-                                int64_t start_ms, int64_t end_ms,
-                                const char *metadata_json, const char *payload_json)
+esp_err_t event_log_store_event(const measurement_event_desc_t *desc)
 {
-    if (sensor == NULL || payload_json == NULL) return ESP_ERR_INVALID_ARG;
+    if (desc == NULL || desc->payload_json == NULL ||
+        desc->tag == NULL || desc->tag[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (s_mtx == NULL) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
     if (!s_available || s_wf == NULL) {
@@ -380,14 +383,20 @@ esp_err_t event_log_store_event(int64_t measure_id, const char *device, const ch
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    char dev[24], sen[24];
-    sanitize_field(dev, sizeof dev, device);
-    sanitize_field(sen, sizeof sen, sensor);
-    const char *meta = (metadata_json != NULL && metadata_json[0] != '\0') ? metadata_json : "";
+    const int64_t measure_id = desc->measure_id;
+    char chan[12], dev[24], tag[16], cmd[40];
+    sanitize_field(chan, sizeof chan, desc->channel);
+    sanitize_field(dev,  sizeof dev,  desc->device);
+    sanitize_field(tag,  sizeof tag,  desc->tag);
+    sanitize_field(cmd,  sizeof cmd,  desc->cmd_raw);
+    const char *meta = (desc->metadata_json != NULL && desc->metadata_json[0] != '\0')
+                       ? desc->metadata_json : "";
+    const char *payload_json = desc->payload_json;
 
-    char hdr[128];
-    int hlen = snprintf(hdr, sizeof hdr, "%lld\t%s\t%s\t%lld\t%lld\t",
-                        (long long)measure_id, dev, sen, (long long)start_ms, (long long)end_ms);
+    char hdr[192];
+    int hlen = snprintf(hdr, sizeof hdr, "%lld\t%s\t%s\t%s\t%s\t%lld\t%lld\t",
+                        (long long)measure_id, chan, dev, tag, cmd,
+                        (long long)desc->start_ms, (long long)desc->end_ms);
     if (hlen < 0 || hlen >= (int)sizeof hdr) {
         xSemaphoreGive(s_mtx);
         return ESP_FAIL;

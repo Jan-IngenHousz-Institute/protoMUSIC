@@ -25,6 +25,7 @@ NVS layout (mirrors the firmware's nvs_open() namespaces):
                firmware_ver      AMBYTE_FIRMWARE_VERSION
                cmd_topic         AMBYTE_COMMAND_TOPIC    (optional; Stage-2 cmd in)
                status_topic      AMBYTE_STATUS_TOPIC     (optional; Stage-2 reply out)
+               timezone          AMBYTE_TIMEZONE         (optional; IANA name)
   certs        ca_cert           file at AMBYTE_CA_CERT
                dev_cert          file at AMBYTE_DEV_CERT
                dev_key           file at AMBYTE_DEV_KEY
@@ -77,6 +78,8 @@ FIELDS = [
 OPTIONAL_FIELDS = [
     ("AMBYTE_COMMAND_TOPIC",    "device_cfg", "cmd_topic",       "string"),
     ("AMBYTE_STATUS_TOPIC",     "device_cfg", "status_topic",    "string"),
+    # IANA timezone name echoed in the MQTT envelope (cloud derives local time).
+    ("AMBYTE_TIMEZONE",         "device_cfg", "timezone",        "string"),
 ]
 
 

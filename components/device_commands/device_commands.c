@@ -130,7 +130,7 @@ esp_err_t device_commands_init(const device_commands_config_t *cfg)
     ESP_LOGI(TAG, "  device_name:    %s", s_cfg.device_name     ? s_cfg.device_name     : "(null)");
     ESP_LOGI(TAG, "  device_version: %s", s_cfg.device_version  ? s_cfg.device_version  : "(null)");
     ESP_LOGI(TAG, "  device_firm:    %s", s_cfg.device_firmware ? s_cfg.device_firmware : "(null)");
-    ESP_LOGI(TAG, "  firmware_ver:   %s", s_cfg.firmware_version? s_cfg.firmware_version: "(null)");
+    ESP_LOGI(TAG, "  timezone:       %s", (s_cfg.timezone && s_cfg.timezone[0]) ? s_cfg.timezone : "(unset)");
     return ESP_OK;
 }
 
@@ -347,6 +347,11 @@ static bool    s_pub_gate_cand    = false;  /* last instantaneous reading vs. ga
 static int64_t s_pub_gate_cand_ms = 0;      /* when cand first differed from the gate */
 static int64_t s_pub_gate_eval_ms = 0;      /* last charger evaluation (0 = never) */
 
+/* Last known battery voltage, latched on every successful charger read (the
+ * power gate and status report both feed it). 0 = never read; the envelope's
+ * `device_battery` field is omitted in that case. */
+static uint32_t s_last_batt_mv = 0;
+
 bool device_commands_publish_power_ok(void)
 {
     /* No power monitor wired in (dev board / absent charger): never gate, so
@@ -367,6 +372,7 @@ bool device_commands_publish_power_ok(void)
         /* Transient I2C/ADC failure: hold the last decision rather than flap. */
         return s_pub_gate_open;
     }
+    s_last_batt_mv = p.battery_mv;
     const bool present = p.input_present;
 
     if (present == s_pub_gate_open) {
@@ -406,13 +412,21 @@ cmd_result_t cmd_record_env(int64_t *out_measure_id)
         return make_result(err, "next_id failed: %s", esp_err_to_name(err));
     }
 
-    /* One event: T/H/P together in the payload. device "" = onboard sensor. */
+    /* One event: T/H/P together in the payload. channel "" = onboard sensor. */
     char payload[160];
     snprintf(payload, sizeof(payload),
              "{\"temperature\":%.2f,\"humidity\":%.2f,\"pressure\":%.1f}",
              m.temperature_c, m.humidity_percent, m.pressure_pa);
 
-    err = s_cfg.store_event(mid, "", "BME280", start_ms, end_ms, NULL, payload);
+    measurement_event_desc_t d = {
+        .measure_id   = mid,
+        .tag          = MEASUREMENT_TAG_MEASUREMENT,
+        .cmd_raw      = "device.bme280",
+        .start_ms     = start_ms,
+        .end_ms       = end_ms,
+        .payload_json = payload,
+    };
+    err = s_cfg.store_event(&d);
     if (err != ESP_OK) {
         return make_result(err, "store failed: %s", esp_err_to_name(err));
     }
@@ -497,23 +511,23 @@ cmd_result_t cmd_db_status(bool *available, int64_t *total,
 
 /* ── Event store + publish (one row/event; one message per measure_id) ── */
 
-cmd_result_t cmd_store_event(int64_t measure_id, const char *device, const char *sensor,
-                             int64_t start_ms, int64_t end_ms,
-                             const char *metadata_json, const char *payload_json)
+cmd_result_t cmd_store_event(const measurement_event_desc_t *desc)
 {
     if (!s_initialized || s_cfg.store_event == NULL) {
         return make_result(ESP_ERR_NOT_SUPPORTED, "event storage not available (no SD?)");
     }
-    if (sensor == NULL || payload_json == NULL) {
+    if (desc == NULL || desc->payload_json == NULL ||
+        desc->tag == NULL || desc->tag[0] == '\0') {
         return make_result(ESP_ERR_INVALID_ARG, "store_event: null arg");
     }
-    esp_err_t err = s_cfg.store_event(measure_id, device, sensor, start_ms, end_ms,
-                                      metadata_json, payload_json);
+    esp_err_t err = s_cfg.store_event(desc);
     if (err != ESP_OK) {
-        return make_result(err, "store_event(%s) failed: %s", sensor, esp_err_to_name(err));
+        return make_result(err, "store_event(%s) failed: %s",
+                           desc->cmd_raw ? desc->cmd_raw : "", esp_err_to_name(err));
     }
     notify_sync();   /* wake the publisher */
-    return make_result(ESP_OK, "stored event id=%lld (%s)", (long long)measure_id, sensor);
+    return make_result(ESP_OK, "stored event id=%lld (%s)",
+                       (long long)desc->measure_id, desc->cmd_raw ? desc->cmd_raw : "");
 }
 
 /* Publish the next pending event as one MQTT message (one measure_id = one
@@ -558,37 +572,61 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
         return make_result(err, "claim_next_event failed: %s", esp_err_to_name(err));
     }
 
-    /* Build the MQTT envelope as a string, splicing the already-valid payload
-     * (and metadata) JSON in verbatim — no cJSON_Parse round-trip. The old
+    /* Build the MQTT envelope (schema v2) as a string, splicing the already-valid
+     * payload (and metadata) JSON in verbatim — no cJSON_Parse round-trip. The old
      * parse→tree→print path needed ~4× the payload in heap (a node per number),
      * which OOMs on this tight heap for multi-array runs, and scaled with point
      * count. This needs one buffer ≈ payload size + a fixed envelope. The
-     * device/sensor/config strings are controlled (provisioned, no JSON
-     * metacharacters) so they are quoted directly; payload_json/metadata_json
-     * are already valid JSON. Structure/field-order matches the old output. */
-    char ts_str[32];
+     * channel/device/tag/cmd_raw/config strings are controlled (firmware-built or
+     * provisioned, sanitized by the event log) so they are quoted directly;
+     * payload_json/metadata_json are already valid JSON.
+     *
+     * Envelope `timestamp` = the MEASUREMENT time (startTicks): the cloud
+     * pipeline aliases it to measurement_time_utc, so battery-queued events must
+     * carry their capture time, not the publish time. Publish time goes into the
+     * sample as `published`. */
+    char meas_ts[32], pub_ts[32];
     {
-        time_t ts = time(NULL);
         struct tm tm_info;
+        time_t ts = (time_t)(e.start_ticks_ms / 1000);
         gmtime_r(&ts, &tm_info);
-        strftime(ts_str, sizeof(ts_str), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
+        strftime(meas_ts, sizeof(meas_ts), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
+        ts = time(NULL);
+        gmtime_r(&ts, &tm_info);
+        strftime(pub_ts, sizeof(pub_ts), "%Y-%m-%dT%H:%M:%SZ", &tm_info);
     }
 
-    char devbuf[32];
-    if (e.device[0] != '\0') snprintf(devbuf, sizeof(devbuf), "\"%s\"", e.device);
-    else                     strcpy(devbuf, "null");
+    /* "" → JSON null for the optional provenance strings. */
+    char chanbuf[16], devbuf[32], cmdbuf[48];
+    if (e.channel[0] != '\0') snprintf(chanbuf, sizeof(chanbuf), "\"%s\"", e.channel);
+    else                      strcpy(chanbuf, "null");
+    if (e.device[0] != '\0')  snprintf(devbuf, sizeof(devbuf), "\"%s\"", e.device);
+    else                      strcpy(devbuf, "null");
+    if (e.cmd_raw[0] != '\0') snprintf(cmdbuf, sizeof(cmdbuf), "\"%s\"", e.cmd_raw);
+    else                      strcpy(cmdbuf, "null");
+
+    /* Optional envelope fields — empty string when absent. */
+    char battpart[48] = "";
+    if (s_last_batt_mv != 0) {
+        snprintf(battpart, sizeof(battpart), "\"device_battery\":%.3f,",
+                 (double)s_last_batt_mv / 1000.0);
+    }
+    char tzpart[96] = "";
+    if (s_cfg.timezone != NULL && s_cfg.timezone[0] != '\0') {
+        snprintf(tzpart, sizeof(tzpart), "\"timezone\":\"%s\",", s_cfg.timezone);
+    }
 
     const char *meta = e.metadata_json;          /* already a JSON object, or NULL */
     const char *fw   = s_cfg.device_firmware  ? s_cfg.device_firmware  : "";
     const char *dn   = s_cfg.device_name      ? s_cfg.device_name      : "";
     const char *dv   = s_cfg.device_version   ? s_cfg.device_version   : "";
-    const char *fv   = s_cfg.firmware_version ? s_cfg.firmware_version : "";
 
     size_t cap = strlen(e.payload_json) + (meta ? strlen(meta) : 4)
-               + strlen(e.sensor) + strlen(devbuf)
-               + strlen(fw) + strlen(dn) + strlen(dv) + strlen(fv)
-               + strlen(s_mac_str) + strlen(ts_str)
-               + 256;                            /* fixed keys + numbers + punctuation */
+               + strlen(chanbuf) + strlen(devbuf) + strlen(cmdbuf) + strlen(e.tag)
+               + strlen(battpart) + strlen(tzpart)
+               + strlen(fw) + strlen(dn) + strlen(dv)
+               + strlen(s_mac_str) + sizeof(meas_ts) + sizeof(pub_ts)
+               + 320;                            /* fixed keys + numbers + punctuation */
     char *payload = malloc(cap);
     if (payload == NULL) {
         s_cfg.mark_event_pending(e.measure_id);
@@ -598,14 +636,18 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
 
     int n = snprintf(payload, cap,
         "{\"sample\":[{"
-            "\"measure_id\":%lld,\"startTicks\":%lld,\"endTicks\":%lld,"
-            "\"device\":%s,\"sensor\":\"%s\",\"metadata\":%s,\"data\":%s"
+            "\"v\":2,\"measure_id\":%lld,\"startTicks\":%lld,\"endTicks\":%lld,"
+            "\"published\":\"%s\",\"channel\":%s,\"device\":%s,"
+            "\"cmd_raw\":%s,\"tag\":\"%s\",\"metadata\":%s,\"data\":%s"
         "}],"
-        "\"device_firmware\":\"%s\",\"device_id\":\"%s\",\"device_name\":\"%s\","
-        "\"device_version\":\"%s\",\"firmware_version\":\"%s\",\"timestamp\":\"%s\"}",
+        "\"timestamp\":\"%s\",%s%s"
+        "\"device_id\":\"%s\",\"device_name\":\"%s\","
+        "\"device_version\":\"%s\",\"device_firmware\":\"%s\"}",
         (long long)e.measure_id, (long long)e.start_ticks_ms, (long long)e.end_ticks_ms,
-        devbuf, e.sensor, meta ? meta : "null", e.payload_json,
-        fw, s_mac_str, dn, dv, fv, ts_str);
+        pub_ts, chanbuf, devbuf, cmdbuf, e.tag,
+        meta ? meta : "null", e.payload_json,
+        meas_ts, battpart, tzpart,
+        s_mac_str, dn, dv, fw);
 
     if (n < 0 || (size_t)n >= cap) {
         free(payload);
@@ -623,8 +665,9 @@ cmd_result_t cmd_mqtt_publish_next_event(void)
     char topic[MQTT_TOPIC_MAX];
     snprintf(topic, sizeof(topic), "%s/1234", s_cfg.topic_root ? s_cfg.topic_root : "");
 
-    ESP_LOGI(TAG, "publish event -> %s (id=%lld, sensor=%s, %u bytes)",
-             topic, (long long)e.measure_id, e.sensor, (unsigned)payload_len);
+    ESP_LOGI(TAG, "publish event -> %s (id=%lld, tag=%s, ch=%s, %u bytes)",
+             topic, (long long)e.measure_id, e.tag,
+             e.channel[0] ? e.channel : "-", (unsigned)payload_len);
 
     int msg_id = 0;
     err = s_cfg.publish(topic, payload, payload_len, &msg_id);
@@ -665,6 +708,7 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
 
     if (s_cfg.read_power != NULL && s_cfg.read_power(&out->power) == ESP_OK) {
         out->power_valid = true;
+        s_last_batt_mv = out->power.battery_mv;
     }
     out->publish_gate_open = device_commands_publish_power_ok();
 
@@ -873,26 +917,33 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
                            channel, esp_err_to_name(err));
     }
 
-    /* save=true: write one row tagged sensor=uart_chN, quantity=response.
-     * On timeout the row carries value_text="" (empty string) to indicate
-     * "queried but nothing came back". */
+    /* save=true: store one event with channel="uart_<N>" and cmd_raw = the
+     * literal command. On timeout the payload carries response="" (empty
+     * string) to indicate "queried but nothing came back". */
     if (save && s_cfg.store_event != NULL && s_cfg.next_id != NULL) {
         int64_t mid = 0;
         if (s_cfg.next_id(&mid) == ESP_OK) {
             gettimeofday(&tv, NULL);
             int64_t end_ms_val = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-            char sensor[16];
-            snprintf(sensor, sizeof(sensor), "uart_ch%u", channel);
-            /* One event, payload {"response":"..."}; cJSON escapes the string.
-             * On timeout out_resp is "" (queried but nothing came back). */
+            char chan[12];
+            snprintf(chan, sizeof(chan), "uart_%u", channel);
+            /* One event, payload {"response":"..."}; cJSON escapes the string. */
             cJSON *p = cJSON_CreateObject();
             if (p != NULL) {
                 cJSON_AddStringToObject(p, "response", out_resp);
                 char *pj = cJSON_PrintUnformatted(p);
                 cJSON_Delete(p);
                 if (pj != NULL) {
-                    esp_err_t store_err = s_cfg.store_event(mid, "", sensor,
-                                                            start_ms_val, end_ms_val, NULL, pj);
+                    measurement_event_desc_t d = {
+                        .measure_id   = mid,
+                        .channel      = chan,
+                        .tag          = MEASUREMENT_TAG_MEASUREMENT,
+                        .cmd_raw      = cmd,
+                        .start_ms     = start_ms_val,
+                        .end_ms       = end_ms_val,
+                        .payload_json = pj,
+                    };
+                    esp_err_t store_err = s_cfg.store_event(&d);
                     free(pj);
                     if (store_err != ESP_OK) {
                         ESP_LOGW(TAG, "uart_text_query: save failed: %s", esp_err_to_name(store_err));

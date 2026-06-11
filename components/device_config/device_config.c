@@ -19,6 +19,7 @@
 #define KEY_DEVICE_VERSION  "device_ver"
 #define KEY_DEVICE_FIRMWARE "device_firm"
 #define KEY_FIRMWARE_VER    "firmware_ver"
+#define KEY_TIMEZONE        "timezone"
 
 static nvs_handle_t s_handle    = 0;
 static bool         s_initialized = false;
@@ -98,6 +99,16 @@ esp_err_t device_config_get_status_topic(char *buf, size_t len)
 esp_err_t device_config_set_status_topic(const char *val)
 {
     return cfg_set(KEY_STATUS_TOPIC, val);
+}
+
+esp_err_t device_config_get_timezone(char *buf, size_t len)
+{
+    return cfg_get(KEY_TIMEZONE, buf, len);
+}
+
+esp_err_t device_config_set_timezone(const char *val)
+{
+    return cfg_set(KEY_TIMEZONE, val);
 }
 
 esp_err_t device_config_get_device_id(char *buf, size_t len)

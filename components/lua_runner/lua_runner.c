@@ -856,8 +856,20 @@ static int l_db_store_event(lua_State *L)
     }
     lua_pop(L, 1);
 
-    cmd_result_t res = cmd_store_event(measure_id, device, sensor,
-                                       start_ms, end_ms, metadata_json, payload_json);
+    /* Schema-v2 shim (Phase 1): the legacy Lua 'sensor' string rides in cmd_raw
+     * so its discriminator survives the transition; tag is firmware-fixed.
+     * Phase 2 slims the Lua API to { data, metadata, channel }. */
+    measurement_event_desc_t d = {
+        .measure_id    = measure_id,
+        .device        = device,
+        .tag           = MEASUREMENT_TAG_MEASUREMENT,
+        .cmd_raw       = sensor,
+        .start_ms      = start_ms,
+        .end_ms        = end_ms,
+        .metadata_json = metadata_json,
+        .payload_json  = payload_json,
+    };
+    cmd_result_t res = cmd_store_event(&d);
     cJSON_free(payload_json);
     if (metadata_json) cJSON_free(metadata_json);
 
@@ -1084,10 +1096,12 @@ static uint8_t *ambit_build_run_arr(lua_State *L, int seg_idx, uint8_t ch, int n
 
 /* Decode an AMBIT FSM response into the reserved JSON payload, optionally store
  * it as one event, free `resp`, and push the Lua result table (or nil+reason).
- * Shared by ambit.run and ambit.fetch so both produce identical events. */
+ * Shared by ambit.run and ambit.fetch so both produce identical events;
+ * `cmd_name` is the logical command recorded as the event's cmd_raw. */
 static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
                                    uint8_t ch, bool store, int64_t start_ms,
-                                   int64_t end_ms, const char *metadata_json)
+                                   int64_t end_ms, const char *metadata_json,
+                                   const char *cmd_name)
 {
     uint8_t narr = resp->array_count;
     if (narr == 0) {
@@ -1153,13 +1167,24 @@ static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
 
     int stored = 0;
     if (store && !trunc) {
-        char sensor_name[16];
-        snprintf(sensor_name, sizeof sensor_name, "AMBIT_%u", (unsigned)(ch + 1));
+        char chan[12];
+        snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
         int64_t mid = 0;
-        if (cmd_next_measure_id(&mid).status == ESP_OK &&
-            cmd_store_event(mid, "ambit", sensor_name, start_ms, end_ms,
-                            metadata_json, s_ambit_payload).status == ESP_OK) {
-            stored = 1;
+        if (cmd_next_measure_id(&mid).status == ESP_OK) {
+            measurement_event_desc_t d = {
+                .measure_id    = mid,
+                .channel       = chan,
+                .device        = "ambit",
+                .tag           = MEASUREMENT_TAG_MEASUREMENT,
+                .cmd_raw       = cmd_name,
+                .start_ms      = start_ms,
+                .end_ms        = end_ms,
+                .metadata_json = metadata_json,
+                .payload_json  = s_ambit_payload,
+            };
+            if (cmd_store_event(&d).status == ESP_OK) {
+                stored = 1;
+            }
         }
     }
 
@@ -1225,7 +1250,8 @@ static int l_ambit_run(lua_State *L)
         uart_sensor_response_free(&resp);
         return lua_push_nil_reason(L, res.message);
     }
-    return ambit_decode_store_push(L, &resp, ch, store, start_ms, end_ms, metadata_json);
+    return ambit_decode_store_push(L, &resp, ch, store, start_ms, end_ms,
+                                   metadata_json, "ambit.run");
 }
 
 /* ambit.trigger(ch, segments [, opts]) — start a retained (async) run on `ch`
@@ -1328,7 +1354,8 @@ static int l_ambit_fetch(lua_State *L)
     int64_t end_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 
     return ambit_decode_store_push(L, &resp, ch, store,
-                                   s_ambit_start_ms[ch], end_ms, s_ambit_meta[ch]);
+                                   s_ambit_start_ms[ch], end_ms, s_ambit_meta[ch],
+                                   "ambit.fetch");
 }
 
 /* ── ambit.* bindings ────────────────────────────────────────────────

@@ -351,7 +351,7 @@ void app_main(void)
         device_id[sizeof(device_id) - 1] = '\0';
     }
     static char protocol_id[32], device_name[64], device_version[16],
-                device_firmware[16], firmware_version[16];
+                device_firmware[16], firmware_version[16], timezone[48];
     if (device_config_get_protocol_id(protocol_id, sizeof(protocol_id)) != ESP_OK) {
         protocol_id[0] = '\0';
     }
@@ -366,6 +366,9 @@ void app_main(void)
     }
     if (device_config_get_firmware_version(firmware_version, sizeof(firmware_version)) != ESP_OK) {
         firmware_version[0] = '\0';
+    }
+    if (device_config_get_timezone(timezone, sizeof(timezone)) != ESP_OK) {
+        timezone[0] = '\0';
     }
 
     /* Inbound command channel (Stage 2): full authorized topics from NVS config
@@ -588,7 +591,7 @@ void app_main(void)
         .device_name            = device_name,
         .device_version         = device_version,
         .device_firmware        = device_firmware,
-        .firmware_version       = firmware_version,
+        .timezone               = timezone,
         .uart_query             = uart_available ? uart_sensors_get_query_fn()       : NULL,
         .uart_ping              = uart_available ? uart_sensors_get_ping_fn()        : NULL,
         .uart_status            = uart_available ? uart_sensors_get_status_fn()      : NULL,
