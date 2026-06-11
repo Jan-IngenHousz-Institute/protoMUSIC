@@ -118,20 +118,50 @@ cert-bundle config in `sdkconfig.defaults`, `-DSPIKE_OTA` build flags in
 
 ---
 
-## Stage 1 — Partition migration + rollback  *(prerequisite, forces one hand-reflash)*
+## Stage 1 — Partition migration + rollback  ⟵ *IMPLEMENTED 2026-06-11 on branch
+`feature/ota-stage1-partitions` (build passes; NOT yet flashed)*
 
-Today's `partitions.csv` has `factory + ota_0` with **no `otadata` / `ota_1`** —
-not an OTA-capable layout. Rework to `ota_0 + ota_1 + otadata` (drop `factory`).
+The v1 `partitions.csv` had `factory + ota_0` with **no `otadata` / `ota_1`** —
+not OTA-capable. Reworked to the dual-OTA layout:
 
-- Keep `littlefs` and `storage` at their current offsets so a reflash that writes
-  only bootloader + table + app (no `erase_flash`) **preserves field data**.
-- Enable `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` (+ `…ROLLBACK_REASON` optional).
-- **Bootstrap caveat:** you cannot OTA into a new layout — every already-fielded
-  ambyte needs this one-time physical reflash. OTA only helps units flashed after
-  the migration. (Also re-seeds NVS per the known PlatformIO reflash behaviour.)
+```
+nvs       0x9000   0x6000     (unchanged — provisioning image flashes here)
+otadata   0xf000   0x2000     (NEW — bootloader slot selector)
+phy_init  0x11000  0x1000     (moved; RF cal self-heals)
+ota_0     0x20000  0x2F0000   (2.94 MB; app boots here; ~44% used)
+ota_1     0x310000 0x2F0000   (2.94 MB; OTA target slot)
+coredump  0x610000 0x10000    (unchanged)
+littlefs  0x620000 0x80000    (unchanged — field data preserved)
+storage   0x6A0000 0x960000   (unchanged — field data preserved)
+```
 
-**Deliverable:** new partition table + rollback config, validated by a manual
-`esp_ota` round-trip (write the other slot, switch, mark valid).
+- `littlefs`/`storage`/`coredump` keep their v1 offsets, so a migration reflash
+  that does **not** `erase_flash` preserves internal-flash field data. (Physical
+  SD-card data — the event log — is on a separate medium and always survives.)
+- `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` added. Harmless for esptool-flashed
+  apps (they boot VALID); only OTA images boot PENDING_VERIFY and need
+  `esp_ota_mark_app_valid_cancel_rollback()` (wired in Stage 3, gated on MQTT
+  reconnect). 56 KiB gap before `ota_0` is 64 KiB app-partition alignment.
+- The build emits **`ota_data_initial.bin`** (empty/0xFF) → the flasher writes
+  it to `otadata`, so the bootloader cleanly boots `ota_0` after migration; no
+  stale-otadata hazard.
+
+**Migration procedure (the one-time hand-reflash per fielded unit):**
+- A normal `pio run -t upload` writes bootloader + partition table +
+  `ota_data_initial` (→ `otadata`) + app (→ `ota_0`) + the NVS image (@0x9000),
+  and does **not** `erase_flash` — so `littlefs`/`storage` survive. NVS runtime
+  keys (cursor/next_id) are re-seeded as usual; the event log reseeds `next_id`
+  from the SD card.
+- Do **NOT** `erase_flash` (it would wipe internal field data). If a unit fails
+  to boot the new slot, erase only the `otadata` region (`0xf000 0x2000`) and
+  re-upload — don't whole-chip erase.
+- You cannot OTA *into* this layout — every already-fielded ambyte needs this
+  physical reflash once. OTA only helps units flashed after the migration.
+
+**Remaining for Stage 1 closure:** flash the branch to a bench unit and do the
+manual `esp_ota` round-trip (write `ota_1`, `esp_ota_set_boot_partition`,
+reboot, confirm it boots `ota_1`, mark valid) to prove the dual-slot + rollback
+config end-to-end before Stage 2/3 build on it.
 
 ---
 

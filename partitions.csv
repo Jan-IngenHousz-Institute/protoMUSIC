@@ -1,8 +1,14 @@
 # Name,    Type,  SubType,  Offset,    Size
+# Dual-OTA layout (OTA Stage 1). otadata selects ota_0/ota_1; `factory` dropped
+# (you cannot OTA into a factory image). coredump/littlefs/storage keep their
+# v1 offsets so a migration reflash that does NOT erase_flash preserves field
+# data; nvs stays at 0x9000 (the provisioning image is flashed there). The
+# 56 KiB gap before ota_0 is 64 KiB app-partition alignment, harmless on 16 MB.
 nvs,       data,  nvs,      0x9000,    0x6000,
-phy_init,  data,  phy,      0xf000,    0x1000,
-factory,   app,   factory,  0x10000,   0x300000,
-ota_0,     app,   ota_0,    0x310000,  0x300000,
+otadata,   data,  ota,      0xf000,    0x2000,
+phy_init,  data,  phy,      0x11000,   0x1000,
+ota_0,     app,   ota_0,    0x20000,   0x2F0000,
+ota_1,     app,   ota_1,    0x310000,  0x2F0000,
 coredump,  data,  coredump, 0x610000,  0x10000,
 littlefs,  data,  littlefs, 0x620000,  0x80000,
 storage,   data,  fat,      0x6A0000,  0x960000,
