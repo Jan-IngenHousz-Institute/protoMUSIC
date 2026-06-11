@@ -14,6 +14,7 @@
 #include "device_config.h"
 #include "bme280.h"
 #include "command_router.h"
+#include "ota_update.h"
 #include "device_commands.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -458,6 +459,22 @@ void app_main(void)
     if (command_router_init(&cr_cfg) == ESP_OK) {
         mqtt_client_get_set_received_handler_fn()(command_router_get_received_fn(), NULL);
         ESP_LOGI(APP_TAG, "command router wired (cmd topic: %s)", command_topic);
+    }
+
+    /* MQTT-triggered self-OTA (docs/ota-update-plan.md Stage 3). The worker
+     * suspends MQTT during the download (the board can't hold two TLS sessions),
+     * and confirms a just-applied image on the next MQTT reconnect (else rolls
+     * back). Triggered by command_router's ota_update dispatch. */
+    ota_update_config_t ota_cfg = {
+        .publish       = mqtt_client_get_publish_fn(),
+        .is_connected  = mqtt_client_get_is_connected_fn(),
+        .comms_suspend = mqtt_client_stop,
+        .comms_resume  = mqtt_client_start,
+        .status_topic  = status_topic,
+        .device_id     = device_id,
+    };
+    if (ota_update_init(&ota_cfg) != ESP_OK) {
+        ESP_LOGW(APP_TAG, "OTA worker not started");
     }
 
     /* ── Wi-Fi init + start ───────────────────────────────────────── */

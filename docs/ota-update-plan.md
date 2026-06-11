@@ -5,13 +5,23 @@ Host-triggered OTA for the **ambyte** (ESP32-S3 gateway), and later the
 [device-script-delivery.md](../device-script-delivery.md), which describes the
 Lua-script push that shares the same inbound channel.
 
-> **Revised 2026-06-11:** the trigger/orchestration layer moves from a custom
-> MQTT command topic to **AWS IoT Jobs** (the mechanism underneath AWS's OTA
-> update tasks). The download path is unchanged (Stage-0-proven
-> `esp_https_ota`). Stages 2–4 are rewritten; Stage 0 (passed) and Stage 1
-> are untouched. The custom-channel code already built for Stage 2
-> (subscribe + reassembly in `mqtt_client.c`, JSON router + NVS dedupe in
-> `command_router/`) is repointed, not discarded.
+> **Revised 2026-06-11 (a):** the trigger/orchestration layer was going to move
+> to **AWS IoT Jobs**. The download path is unchanged either way (Stage-0-proven
+> `esp_https_ota`).
+>
+> **Revised 2026-06-11 (b) — SHIP NOW via the custom topic; Jobs later.** The
+> partner fixed the subscribe policy, so the **custom command topic works today**
+> (`device/scripts/v1/…`, SUBACK rc=1). AWS Jobs, by contrast, still needs partner
+> work the device can't self-serve: `$aws/things/<thing>/jobs/*` requires
+> `client_id == thing name` (currently `client_id=AMBYTE{MAC}` ≠ thing
+> `dom_ludo_…`) **and** a separate jobs-topic policy grant. Since OTA is needed
+> now, **Stage 3 ships triggered by the working custom topic** carrying a GitHub
+> URL (the original idea); **Stage 2 (Jobs) is deferred** to a later swap of just
+> the trigger transport. Everything else — Stage-1 dual-OTA partitions + rollback,
+> `esp_https_ota` download, the Stage-3b Signer option — is unchanged and reused.
+> The Jobs migration becomes: align `client_id` to thing name, get the jobs
+> policy, repoint `mqtt_client` subscribe + the router from the custom topic to
+> the `$aws/.../jobs/*` topics. The handler/download/rollback don't change.
 
 ## Decisions already taken
 

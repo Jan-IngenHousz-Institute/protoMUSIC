@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
+#include "ota_update.h"
 
 #define TAG "cmd_router"
 
@@ -35,9 +36,8 @@ static bool already_applied(const char *id)
     return (err == ESP_OK && strcmp(prev, id) == 0);
 }
 
-/* Recorded by the Stage-3/4 handlers AFTER a command is successfully applied.
- * Unused until those land; kept here so the dedupe store has one owner. */
-__attribute__((unused))
+/* Recorded when an ota_update is dispatched, so a retained/duplicate trigger
+ * can't re-apply it (at-least-once idempotency). */
 static void mark_applied(const char *id)
 {
     if (id == NULL || id[0] == '\0') {
@@ -105,15 +105,25 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
     if (strcmp(type, "ping") == 0) {
         handle_ping(id);
     } else if (strcmp(type, "ota_update") == 0) {
+        const cJSON *jurl = cJSON_GetObjectItemCaseSensitive(root, "url");
+        const char *url = cJSON_IsString(jurl) ? jurl->valuestring : NULL;
         if (already_applied(id)) {
             ESP_LOGI(TAG, "ota_update id=%s already applied — ignoring", id ? id : "");
+        } else if (url == NULL) {
+            ESP_LOGW(TAG, "ota_update id=%s missing 'url' — ignoring", id ? id : "");
         } else {
-            const cJSON *jurl = cJSON_GetObjectItemCaseSensitive(root, "url");
-            const char *url = cJSON_IsString(jurl) ? jurl->valuestring : "(none)";
-            ESP_LOGW(TAG, "ota_update received (id=%s url=%s) — Stage-3 handler not wired yet",
-                     id ? id : "", url);
-            /* Stage 3: dispatch to an OTA task -> quiesce -> esp_https_ota(url) ->
-             * verify sha256/size -> set boot -> mark_applied(id) -> reboot. */
+            /* Mark applied up front so a retained/duplicate trigger can't re-OTA
+             * (at-least-once). The OTA worker downloads with comms suspended and
+             * reboots; status is reported on the status topic. A failed update
+             * needs a fresh id to retry. */
+            mark_applied(id);
+            esp_err_t err = ota_update_request(url, id);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "ota_update id=%s dispatch failed: %s",
+                         id ? id : "", esp_err_to_name(err));
+            } else {
+                ESP_LOGW(TAG, "ota_update id=%s dispatched (url=%s)", id ? id : "", url);
+            }
         }
     } else if (strcmp(type, "script_update") == 0) {
         ESP_LOGW(TAG, "script_update received (id=%s) — Stage-4 handler not wired yet",
