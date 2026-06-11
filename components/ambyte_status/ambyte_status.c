@@ -143,7 +143,9 @@ status_set_fn ambyte_status_get_set_fn(void)
 #define BLINK_GAP_MS            120U   /* double-flash dark gap                 */
 #define BLINK_DIM_SHIFT            3   /* battery brightness = colour >> 3      */
 #define BLINK_LOW_BATT_MV      3500U
-#define BLINK_TASK_STACK        2560   /* bytes (StackType_t on Xtensa)         */
+#define BLINK_TASK_STACK        4096   /* bytes; the legacy RMT driver path
+                                        * (rmt_write_items + wait_tx_done) needs
+                                        * more than a bare-loop task would       */
 #define BLINK_TASK_PRIO            2
 
 static ambyte_blinker_config_t s_blink;
