@@ -44,7 +44,7 @@
  * unmistakable in the boot log vs. the one flashed over USB. Overridable from
  * platformio.ini build_flags as -DAMBYTE_FW_TAG=... if you prefer. */
 #ifndef AMBYTE_FW_TAG
-#define AMBYTE_FW_TAG "dev"
+#define AMBYTE_FW_TAG "ota-B"
 #endif
 
 /* Re-sync the ESP system clock from the RTC at this cadence (drift correction +
