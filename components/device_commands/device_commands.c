@@ -715,6 +715,85 @@ cmd_result_t cmd_status_report(device_status_snapshot_t *out)
     return make_result(ESP_OK, "status report");
 }
 
+/* Build + store one STATUS heartbeat event from the live status snapshot
+ * (tag STATUS, onboard provenance — channel/cmd_raw null). Owned by the
+ * sync_runner heartbeat (payload-v2 Phase 4): status reporting must survive a
+ * missing/crashed main.lua, so it does NOT live in the script. Payload keys
+ * match the old Lua status_report table for analysis continuity; power fields
+ * are omitted when the charger read fails. Does NOT notify the sync runner —
+ * the caller IS the sync runner. */
+cmd_result_t cmd_store_status_event(void)
+{
+    if (!s_initialized || s_cfg.store_event == NULL || s_cfg.next_id == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "persistence not available");
+    }
+
+    device_status_snapshot_t s;
+    cmd_result_t r = cmd_status_report(&s);
+    if (r.status != ESP_OK) {
+        return r;
+    }
+
+    char payload[288];
+    int n;
+    if (s.power_valid) {
+        n = snprintf(payload, sizeof(payload),
+            "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s,"
+            "\"battery_v\":%.3f,\"input_v\":%.3f,\"system_v\":%.3f,"
+            "\"input_ma\":%u,\"charge_ma\":%u,\"input_present\":%s,\"charge_status\":%u}",
+            s.wifi_connected ? "true" : "false",
+            s.provisioned ? "true" : "false",
+            s.db_online ? "true" : "false",
+            s.publish_gate_open ? "true" : "false",
+            (double)s.power.battery_mv / 1000.0,
+            (double)s.power.input_mv / 1000.0,
+            (double)s.power.system_mv / 1000.0,
+            (unsigned)s.power.input_ma,
+            (unsigned)s.power.charge_ma,
+            s.power.input_present ? "true" : "false",
+            (unsigned)s.power.charge_status);
+    } else {
+        n = snprintf(payload, sizeof(payload),
+            "{\"wifi\":%s,\"provisioned\":%s,\"db_online\":%s,\"publish_gate\":%s}",
+            s.wifi_connected ? "true" : "false",
+            s.provisioned ? "true" : "false",
+            s.db_online ? "true" : "false",
+            s.publish_gate_open ? "true" : "false");
+    }
+    if (n < 0 || (size_t)n >= sizeof(payload)) {
+        return make_result(ESP_FAIL, "status payload build failed");
+    }
+
+    int64_t mid = 0;
+    esp_err_t err = s_cfg.next_id(&mid);
+    if (err != ESP_OK) {
+        return make_result(err, "next_id failed: %s", esp_err_to_name(err));
+    }
+
+    int64_t now = now_ms();
+    measurement_event_desc_t d = {
+        .measure_id   = mid,
+        .tag          = MEASUREMENT_TAG_STATUS,
+        .start_ms     = now,
+        .end_ms       = now,
+        .payload_json = payload,
+    };
+    err = s_cfg.store_event(&d);
+    if (err != ESP_OK) {
+        return make_result(err, "status store failed: %s", esp_err_to_name(err));
+    }
+    return make_result(ESP_OK, "STATUS id=%lld gate=%s Vbat=%umV",
+                       (long long)mid, s.publish_gate_open ? "OPEN" : "CLOSED",
+                       (unsigned)(s.power_valid ? s.power.battery_mv : 0));
+}
+
+/* Last battery voltage latched from any successful charger read (power gate /
+ * status report). 0 = never read. Probe for the status-LED blinker. */
+uint32_t device_commands_last_battery_mv(void)
+{
+    return s_last_batt_mv;
+}
+
 cmd_result_t cmd_uart_stream_query(uint8_t channel, const char *cmd,
                                    const char *sentinel, uint32_t timeout_ms,
                                    char *out, size_t out_cap, size_t *out_len)

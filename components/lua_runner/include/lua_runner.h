@@ -1,5 +1,6 @@
 #include "esp_err.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Spawn the Lua runner task. Loads /sdcard/main.lua, runs it once. The task
@@ -14,3 +15,7 @@ esp_err_t lua_runner_start(void);
  * (e.g. a long UART read); the task will continue and exit on its own once
  * that call returns. Safe to call when no task is running (no-op). */
 esp_err_t lua_runner_stop(uint32_t wait_ms);
+
+/* True while the script task exists (main.lua loaded and not yet finished/
+ * stopped). Probe for the status-LED blinker's "measuring" state. */
+bool lua_runner_is_running(void);

@@ -103,6 +103,15 @@ static esp_err_t app_start_wifi(void)
     return ESP_OK;
 }
 
+/* bool(void) adapter over wifi_manager_is_provisioned(bool*) for the
+ * status-LED blinker probe table. */
+static bool app_wifi_provisioned(void)
+{
+    bool provisioned = false;
+    (void)wifi_manager_is_provisioned(&provisioned);
+    return provisioned;
+}
+
 static esp_err_t app_init_i2c_and_sensors(void)
 {
     esp_err_t err = i2c_bus_init(&s_i2c_bus_cfg);
@@ -635,11 +644,29 @@ void app_main(void)
     };
     device_commands_init(&cmd_cfg);
 
-    /* ── Background MQTT sync (publishes PENDING measurements every 10s) ── */
+    /* ── Background MQTT sync + STATUS heartbeat ─────────────────────── */
     if (persistence_available) {
-        esp_err_t sr_err = sync_runner_start();
+        uint32_t heartbeat_s = 300;                       /* default 5 min */
+        (void)device_config_get_heartbeat_s(&heartbeat_s); /* NVS override */
+        esp_err_t sr_err = sync_runner_start(heartbeat_s);
         if (sr_err != ESP_OK) {
             ESP_LOGW(APP_TAG, "sync_runner_start failed: %s", esp_err_to_name(sr_err));
+        }
+    }
+
+    /* ── Field-status LED blinker (firmware-owned; Lua no longer drives the
+     * LED). Probes are cheap reads of already-cached state. ─────────────── */
+    {
+        static const ambyte_blinker_config_t blink_cfg = {
+            .sd_mounted        = sdcard_is_mounted,
+            .wifi_connected    = wifi_manager_is_connected,
+            .provisioned       = app_wifi_provisioned,
+            .script_running    = lua_runner_is_running,
+            .on_external_power = device_commands_publish_power_ok,
+            .battery_mv        = device_commands_last_battery_mv,
+        };
+        if (ambyte_status_blinker_start(&blink_cfg) != ESP_OK) {
+            ESP_LOGW(APP_TAG, "status-LED blinker not started");
         }
     }
 

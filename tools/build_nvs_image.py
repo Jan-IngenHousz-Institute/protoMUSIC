@@ -26,6 +26,7 @@ NVS layout (mirrors the firmware's nvs_open() namespaces):
                cmd_topic         AMBYTE_COMMAND_TOPIC    (optional; Stage-2 cmd in)
                status_topic      AMBYTE_STATUS_TOPIC     (optional; Stage-2 reply out)
                timezone          AMBYTE_TIMEZONE         (optional; IANA name)
+               heartbeat_s       AMBYTE_HEARTBEAT_S      (optional; u32 seconds)
                flash_time        <image build time>      (u32 epoch; RTC fallback)
   certs        ca_cert           file at AMBYTE_CA_CERT
                dev_cert          file at AMBYTE_DEV_CERT
@@ -82,6 +83,8 @@ OPTIONAL_FIELDS = [
     ("AMBYTE_STATUS_TOPIC",     "device_cfg", "status_topic",    "string"),
     # IANA timezone name echoed in the MQTT envelope (cloud derives local time).
     ("AMBYTE_TIMEZONE",         "device_cfg", "timezone",        "string"),
+    # STATUS heartbeat period in seconds (firmware default 300; 0 disables).
+    ("AMBYTE_HEARTBEAT_S",      "device_cfg", "heartbeat_s",     "u32"),
 ]
 
 

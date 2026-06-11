@@ -1,5 +1,7 @@
 #include "sync_runner.h"
 
+#include <time.h>
+
 #include "device_commands.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -7,6 +9,13 @@
 #include "freertos/task.h"
 
 #define TAG "sync_runner"
+
+/* Clock-validity floor (2024-01-01 UTC). Below this the system clock was never
+ * set (RTC invalid and no NVS flash_time) — publishing would land events in
+ * 1970 date partitions in the cloud, so the drain is gated until the clock is
+ * plausible. Stores are NOT gated (payload-v2 decision: gate publish only);
+ * events queue with whatever ticks they have. */
+#define SYNC_CLOCK_FLOOR_S 1704067200LL
 
 /* Stagger the first drain past boot-time noise (Wi-Fi join, TLS, DB boot scan). */
 #define SYNC_RUNNER_START_DELAY_MS  10000U
@@ -28,6 +37,8 @@
 #define SYNC_RUNNER_MAX_ACK_POLLS 50
 
 static TaskHandle_t s_task_handle = NULL;
+/* STATUS heartbeat period (s); 0 = disabled. Set once at start. */
+static uint32_t     s_heartbeat_s = 0;
 
 /* Wake the drain task. Registered as the device_commands store/measurement-end
  * notifier; also safe to call directly. No-op until the task exists. */
@@ -88,12 +99,49 @@ static void sync_runner_task(void *arg)
      * (Wi-Fi join, MQTT TLS handshake, event_log boot scan). */
     vTaskDelay(pdMS_TO_TICKS(SYNC_RUNNER_START_DELAY_MS));
 
+    /* Heartbeat bookkeeping: backdated so the first pass stores immediately
+     * (a boot marker in the STATUS stream). Tick math is wrap-safe. */
+    const TickType_t hb_ticks = pdMS_TO_TICKS(s_heartbeat_s * 1000U);
+    TickType_t last_hb        = xTaskGetTickCount() - hb_ticks;
+    bool clock_warned         = false;
+
     while (1) {
         /* Sleep until something stores an event / a measurement burst ends
          * (sync_runner_notify), or the fallback timer fires. pdTRUE clears the
          * notification count on take, so a burst of N stores collapses into one
          * drain pass. The CPU can idle in between — no fixed-rate polling. */
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(SYNC_RUNNER_FALLBACK_MS));
+
+        /* STATUS heartbeat (payload-v2 Phase 4): firmware-owned so a broken or
+         * missing main.lua can't silence status reporting. Resolution is the
+         * fallback period (±30 s on the 5 min default) — fine for telemetry. */
+        if (s_heartbeat_s > 0) {
+            TickType_t now_tick = xTaskGetTickCount();
+            if ((now_tick - last_hb) >= hb_ticks) {
+                cmd_result_t hr = cmd_store_status_event();
+                if (hr.status == ESP_OK) {
+                    ESP_LOGI(TAG, "%s", hr.message);
+                } else if (hr.status != ESP_ERR_NOT_SUPPORTED) {
+                    ESP_LOGW(TAG, "heartbeat: %s", hr.message);
+                }
+                last_hb = now_tick;
+            }
+        }
+
+        /* Clock gate: never publish 1970-stamped events (see SYNC_CLOCK_FLOOR_S).
+         * Logged on state change only. */
+        if (time(NULL) < (time_t)SYNC_CLOCK_FLOOR_S) {
+            if (!clock_warned) {
+                ESP_LOGW(TAG, "system clock unset (pre-2024) — publishing gated "
+                              "until the RTC/flash-time sets it");
+                clock_warned = true;
+            }
+            continue;
+        }
+        if (clock_warned) {
+            ESP_LOGI(TAG, "system clock now valid — publishing resumes");
+            clock_warned = false;
+        }
 
         if (sync_runner_is_allowed()) {
             /* Burst-drain all pending events (one msg per id). */
@@ -104,11 +152,12 @@ static void sync_runner_task(void *arg)
     }
 }
 
-esp_err_t sync_runner_start(void)
+esp_err_t sync_runner_start(uint32_t heartbeat_s)
 {
     if (s_task_handle != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    s_heartbeat_s = heartbeat_s;
 
     BaseType_t ok = xTaskCreate(
         sync_runner_task,
@@ -124,7 +173,7 @@ esp_err_t sync_runner_start(void)
     }
     /* Become the wake target for every stored event + measurement-end. */
     device_commands_set_sync_notifier(sync_runner_notify);
-    ESP_LOGI(TAG, "background sync started (wake-on-store, fallback=%u ms)",
-             (unsigned)SYNC_RUNNER_FALLBACK_MS);
+    ESP_LOGI(TAG, "background sync started (wake-on-store, fallback=%u ms, heartbeat=%u s)",
+             (unsigned)SYNC_RUNNER_FALLBACK_MS, (unsigned)heartbeat_s);
     return ESP_OK;
 }

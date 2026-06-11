@@ -19,8 +19,14 @@ extern "C" {
  * Power gating: the drain only runs while sync_runner_is_allowed() is true
  * (no measurement in progress AND device on external power). Events otherwise
  * stay PENDING and drain when the gate reopens (caught by the fallback timer).
+ * Additionally, publishing is gated while the system clock is implausible
+ * (pre-2024) so 1970-stamped events never reach the cloud.
+ *
+ * @param heartbeat_s STATUS heartbeat period in seconds (stores one tag=STATUS
+ *        event per period via cmd_store_status_event, first one immediately);
+ *        0 disables the heartbeat. Resolution = the 30 s fallback wake.
  */
-esp_err_t sync_runner_start(void);
+esp_err_t sync_runner_start(uint32_t heartbeat_s);
 
 /**
  * @brief Wake the sync task to (re)evaluate the drain. Safe before start

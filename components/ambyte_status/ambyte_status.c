@@ -1,11 +1,13 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "ambyte_status.h"
 #include "driver/rmt.h"
 #include "esp_rom_gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #define NEOPIXEL_GPIO GPIO_NUM_45
 #define STATUS_RMT_CHANNEL RMT_CHANNEL_0
@@ -127,4 +129,112 @@ esp_err_t ambyte_status_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 status_set_fn ambyte_status_get_set_fn(void)
 {
     return ambyte_status_set_rgb;
+}
+
+/* ── Field-status blinker ─────────────────────────────────────────────
+ * See ambyte_status.h for the colour/priority contract. Battery economics:
+ * the flash itself is ~3% duty, but this WS2812 draws ~1 mA even showing
+ * black — slowing/dimming on battery trims the margin; a hardware LED rail
+ * gate is the real saver. Faults stay loud regardless of power source. */
+
+#define BLINK_PERIOD_EXT_MS    3000U   /* external power: commissioning cadence */
+#define BLINK_PERIOD_BATT_MS  15000U   /* battery: field cadence                */
+#define BLINK_FLASH_MS          100U
+#define BLINK_GAP_MS            120U   /* double-flash dark gap                 */
+#define BLINK_DIM_SHIFT            3   /* battery brightness = colour >> 3      */
+#define BLINK_LOW_BATT_MV      3500U
+#define BLINK_TASK_STACK        2560   /* bytes (StackType_t on Xtensa)         */
+#define BLINK_TASK_PRIO            2
+
+static ambyte_blinker_config_t s_blink;
+static StaticTask_t s_blink_tcb;
+static StackType_t  s_blink_stack[BLINK_TASK_STACK];
+static bool         s_blink_started = false;
+
+static bool blink_probe(bool (*fn)(void), bool dflt)
+{
+    return (fn != NULL) ? fn() : dflt;
+}
+
+static void blink_flash(uint8_t r, uint8_t g, uint8_t b, bool dbl)
+{
+    (void)ambyte_status_set_rgb(r, g, b);
+    vTaskDelay(pdMS_TO_TICKS(BLINK_FLASH_MS));
+    (void)ambyte_status_set_rgb(0, 0, 0);
+    if (dbl) {
+        vTaskDelay(pdMS_TO_TICKS(BLINK_GAP_MS));
+        (void)ambyte_status_set_rgb(r, g, b);
+        vTaskDelay(pdMS_TO_TICKS(BLINK_FLASH_MS));
+        (void)ambyte_status_set_rgb(0, 0, 0);
+    }
+}
+
+static void blink_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        const bool sd   = blink_probe(s_blink.sd_mounted,        true);
+        const bool prov = blink_probe(s_blink.provisioned,       false);
+        const bool wifi = blink_probe(s_blink.wifi_connected,    false);
+        const bool run  = blink_probe(s_blink.script_running,    false);
+        const bool ext  = blink_probe(s_blink.on_external_power, true);
+        const uint32_t mv = (s_blink.battery_mv != NULL) ? s_blink.battery_mv() : 0;
+
+        uint8_t  r = 0, g = 0, b = 0;
+        bool     dbl    = false;
+        bool     dim    = !ext;
+        uint32_t period = ext ? BLINK_PERIOD_EXT_MS : BLINK_PERIOD_BATT_MS;
+
+        if (!sd) {                                  /* fault: loud always */
+            r = 100;
+            dim = false;
+            period = BLINK_PERIOD_EXT_MS;
+        } else if (!ext && mv > 0 && mv < BLINK_LOW_BATT_MV) {
+            r = 100;                                /* low battery: red ×2 */
+            dbl = true;
+        } else if (!prov) {
+            r = 100; b = 100;                       /* purple */
+        } else if (run) {
+            if (wifi) g = 100; else b = 100;        /* green / blue */
+        } else {
+            if (wifi) { r = 100; g = 100; b = 100; }/* white */
+            else      { r = 100; g = 100; }         /* yellow */
+        }
+        if (dim) {
+            r >>= BLINK_DIM_SHIFT;
+            g >>= BLINK_DIM_SHIFT;
+            b >>= BLINK_DIM_SHIFT;
+        }
+
+        blink_flash(r, g, b, dbl);
+
+        /* Chunked sleep so a fresh SD fault shows within ~1 s even on the
+         * slow battery cadence. */
+        uint32_t slept = BLINK_FLASH_MS + (dbl ? BLINK_GAP_MS + BLINK_FLASH_MS : 0U);
+        while (slept < period) {
+            uint32_t step = (period - slept > 1000U) ? 1000U : (period - slept);
+            vTaskDelay(pdMS_TO_TICKS(step));
+            slept += step;
+            if (sd && !blink_probe(s_blink.sd_mounted, true)) {
+                break;                              /* new fault — show it now */
+            }
+        }
+    }
+}
+
+esp_err_t ambyte_status_blinker_start(const ambyte_blinker_config_t *cfg)
+{
+    if (cfg == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_status_initialized || s_blink_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    memcpy(&s_blink, cfg, sizeof(s_blink));
+    if (xTaskCreateStatic(blink_task, "led_blink", BLINK_TASK_STACK, NULL,
+                          BLINK_TASK_PRIO, s_blink_stack, &s_blink_tcb) == NULL) {
+        return ESP_FAIL;
+    }
+    s_blink_started = true;
+    return ESP_OK;
 }

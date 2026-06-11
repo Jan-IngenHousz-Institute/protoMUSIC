@@ -93,7 +93,7 @@ shims.
 
 ---
 
-## Phase 1 — storage record + envelope v2 (plumbing)
+## Phase 1 — storage record + envelope v2 (plumbing)  ⟵ *DONE 2026-06-11*
 
 Everything schema-shaped, end-to-end, while the producer call sites are only
 minimally shimmed. After this phase the wire format IS v2.
@@ -126,7 +126,7 @@ contract by eye + `python -m json.tool`. Confirm on a battery-queued event
 (power gate closed → reopen) that envelope `timestamp` equals the measurement
 time, not the publish time.
 
-## Phase 2 — Lua API surface (the user-facing change)
+## Phase 2 — Lua API surface (the user-facing change)  ⟵ *DONE 2026-06-11*
 
 - **`ambit.*` consolidation**: move `device.ambit_get_spec` → `ambit.spec`,
   `ambit_get_leaf_temp` → `ambit.leaf_temp`, `ambit_set_metadata` →
@@ -174,7 +174,10 @@ alone stores nothing.
 carry `"device":"ambit"`, others would carry `null`; unplug/replug mid-run and
 confirm re-identification after a ping failure.
 
-## Phase 4 — background heartbeat + clock-validity gate
+## Phase 4 — background heartbeat + clock-validity gate  ⟵ *DONE 2026-06-11
+(+ field-status LED blinker: firmware-owned colour-coded blink, slow+dim on
+battery, double-red low-battery, red SD fault; `device.set_rgb` removed from
+Lua)*
 
 - Heartbeat moves into firmware: sync_runner's loop stores a `STATUS` event
   (`channel=null`, `cmd_raw=null`, `data` = the status snapshot incl. power)

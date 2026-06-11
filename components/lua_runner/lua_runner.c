@@ -62,23 +62,9 @@ static int lua_push_nil_reason(lua_State *L, const char *reason)
 }
 
 /* ── device.* bindings ───────────────────────────────────────────────── */
-
-static int l_device_set_rgb(lua_State *L)
-{
-    lua_Integer r = luaL_checkinteger(L, 1);
-    lua_Integer g = luaL_checkinteger(L, 2);
-    lua_Integer b = luaL_checkinteger(L, 3);
-
-    if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) {
-        return luaL_error(L, "RGB values must be in [0, 255]");
-    }
-
-    cmd_result_t res = cmd_set_rgb((uint8_t)r, (uint8_t)g, (uint8_t)b);
-    if (res.status != ESP_OK) {
-        return luaL_error(L, "%s", res.message);
-    }
-    return 0;
-}
+/* NOTE: there is deliberately no device.set_rgb. The status LED is owned by
+ * the firmware blinker (ambyte_status), which encodes device state; a script
+ * driving the LED would fight it. Bench debugging keeps the CLI `set_rgb`. */
 
 static int l_device_read_rtc(lua_State *L)
 {
@@ -958,7 +944,6 @@ static int l_db_next_id(lua_State *L)
 static void lua_register_device_module(lua_State *L)
 {
     static const luaL_Reg device_api[] = {
-        {"set_rgb",                l_device_set_rgb},
         {"read_rtc",               l_device_read_rtc},
         {"status",                 l_device_status},
         {"bme280",                 l_device_bme280},
@@ -1759,6 +1744,11 @@ esp_err_t lua_runner_start(void)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+bool lua_runner_is_running(void)
+{
+    return s_lua_task_handle != NULL;
 }
 
 esp_err_t lua_runner_stop(uint32_t wait_ms)

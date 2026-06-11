@@ -38,6 +38,9 @@ esp_err_t device_config_get_timezone(char *buf, size_t len);
  * on every build). Boot-time RTC bootstrap: applied only when the RTC is invalid
  * or behind it, so a correct clock is never moved. */
 esp_err_t device_config_get_flash_time(uint32_t *out);
+/* STATUS heartbeat period in seconds (sync_runner). Optional; caller defaults
+ * (300 s) when unset. 0 disables the heartbeat. */
+esp_err_t device_config_get_heartbeat_s(uint32_t *out);
 
 /* Setters — persist immediately via nvs_commit */
 esp_err_t device_config_set_mqtt_uri(const char *val);

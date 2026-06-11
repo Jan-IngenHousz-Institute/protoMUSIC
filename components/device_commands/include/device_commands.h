@@ -141,6 +141,16 @@ typedef struct {
 
 cmd_result_t cmd_status_report(device_status_snapshot_t *out);
 
+/* Store one STATUS heartbeat event (tag STATUS, onboard provenance) built from
+ * cmd_status_report. Called by sync_runner on its heartbeat period — status
+ * reporting is firmware-owned so a broken/missing main.lua can't silence it.
+ * Does not wake the sync runner (the caller is the sync runner). */
+cmd_result_t cmd_store_status_event(void);
+
+/* Last battery voltage (mV) latched from any successful charger read;
+ * 0 = never read. Cheap probe (no I2C) for the status-LED blinker. */
+uint32_t device_commands_last_battery_mv(void);
+
 /* Store one measurement event from a v2 descriptor (see persistence_port.h).
  * desc->payload_json and desc->tag are required; channel/device/cmd_raw/
  * metadata_json may be NULL/"". Requires the SD-backed event log. */

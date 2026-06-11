@@ -2,7 +2,7 @@
 --
 -- EXECUTION MODEL
 --   The firmware bundles a scheduler (`sched`) and exposes five globals:
---     device.*  on-board I/O      (LED, BME280, RTC, MP2731 power)
+--     device.*  on-board I/O      (BME280, RTC, MP2731 power; LED is firmware-owned)
 --     ambit.*   everything AMBIT  (ping/spec/leaf_temp/run/trigger/poll/fetch
 --                                  + config/diagnostics; channel is always arg 1)
 --     uart.*    raw serial        (uart.query for not-yet-drivered sensors)
@@ -23,6 +23,13 @@
 --   gate" — VIN present). On battery, events stay in the log and drain the next
 --   time the panel/USB brings power back. Nothing is lost, only delayed; the
 --   measurement time is preserved in each event's startTicks.
+--
+--   FIRMWARE-OWNED, NOT IN THIS SCRIPT: the STATUS heartbeat (one tag=STATUS
+--   event every AMBYTE_HEARTBEAT_S, default 5 min, stored by sync_runner) and
+--   the status LED (colour-coded blink: green/blue measuring with/without
+--   Wi-Fi, white/yellow idle, red = no SD, red x2 = low battery, purple =
+--   unprovisioned; slow+dim on battery). Both keep working when this script
+--   crashes or the SD is missing — that's the point.
 --
 --   GC is handled by sched.run() between cycles — jobs may build large transient
 --   tables (AMBIT arrays) freely.
@@ -47,11 +54,6 @@ local MPF = {                                       -- multi-phase saturating fl
 }
 
 -- ── Helpers ───────────────────────────────────────────────────────────────
-
--- Brief green blink: visible "still alive" sign.
-local function blink()
-    device.set_rgb(0, 100, 0); device.sleep_ms(100); device.set_rgb(0, 0, 0)
-end
 
 -- One spectrum + PAR per connected AMBIT. ambit.spec stores its own event
 -- (channel/device/cmd_raw="get_par" stamped by the firmware).
@@ -153,22 +155,6 @@ local function run_trace(tag, trace)
     device.measurement_window(false)
 end
 
--- Periodic device status, stored as a custom event (identified downstream by
--- its data keys until the Phase-4 firmware heartbeat takes over with
--- tag=STATUS). db.store_event stamps the capture time in startTicks;
--- sync_runner publishes it under the same power gate as measurements (so on
--- battery these queue and flush once external power returns).
-local function status_heartbeat()
-    local s = device.status_report()
-    if s then
-        db.store_event{ data = s }
-        device.log(string.format("status: src=%s gate=%s Vbat=%.2fV Iin=%dmA",
-                   s.input_present and "external" or "battery",
-                   s.publish_gate and "OPEN" or "CLOSED",
-                   s.battery_v or 0, s.input_ma or 0))
-    end
-end
-
 -- ── Job bodies ────────────────────────────────────────────────────────────
 local function ss_round()   run_trace("SS",   SS)  end
 local function mpf_round()  run_trace("MPF",  MPF) end
@@ -189,7 +175,6 @@ sched.every("1m", record_spectra, { when = "day" })  -- spectrum + PAR, daytime
 sched.every("5m", mpf_round,      { when = "day" })  -- saturating flash, daytime
 sched.sun("sunset",   30 * 60, edge_round)           -- dark-edge trace, 30 min after sunset
 sched.sun("sunrise", -30 * 60, edge_round)           -- dark-edge trace, 30 min before sunrise
-sched.every("5m", status_heartbeat)                  -- status event (day & night)
-sched.every(3,    blink)                             -- liveness blink
+-- (status heartbeat + liveness LED are firmware-owned — see header)
 
 sched.run()                                          -- blocking merge loop

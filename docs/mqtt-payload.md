@@ -5,11 +5,11 @@ builder is `cmd_mqtt_publish_next_event()` in
 [components/device_commands/device_commands.c](../components/device_commands/device_commands.c)
 — if this document and the code disagree, the code wins.
 
-> Schema v2 wire format (Phase 1) and the Lua API surface (Phase 2:
-> `ambit.*` consolidation, fused stores, slimmed `db.store_event`) of
-> [payload-v2-plan.md](payload-v2-plan.md) landed 2026-06-11. Device
-> discovery (Phase 3) and the firmware heartbeat (Phase 4) are pending —
-> the **Transitional note** below marks the remaining shim.
+> Phases 1 (v2 wire format), 2 (`ambit.*` consolidation, fused stores,
+> slimmed `db.store_event`) and 4 (firmware STATUS heartbeat + clock gate +
+> status-LED blinker) of [payload-v2-plan.md](payload-v2-plan.md) landed
+> 2026-06-11. Device discovery (Phase 3) is the remaining gap: `device` is
+> hardcoded `"ambit"` on AMBIT store paths and `null` elsewhere.
 
 ## Model: store, then publish
 
@@ -78,7 +78,9 @@ Field notes:
   battery-queued events carry their capture time. Publish time lives in
   `sample[0].published`.
 - `tag` is firmware-assigned, never user input: `MEASUREMENT` for anything a
-  script originated; `STATUS` arrives with the Phase-4 firmware heartbeat.
+  script originated; `STATUS` for the firmware heartbeat (one event per
+  `AMBYTE_HEARTBEAT_S`, default 300 s, stored by sync_runner — survives a
+  missing/crashed main.lua).
 - `channel` is `"uart_<n>"` (0-based) for the UART sensor ports, `"usb_<n>"`
   reserved for the USB hub; JSON `null` = onboard source.
 - `device` is best-effort sensor self-identification — `null` until Phase 3
@@ -108,7 +110,8 @@ data=, metadata=, channel= }` remains for derived/custom script events.
 | Spectrum + PAR (`ambit.spec`) | `uart_<ch>` | `ambit` | `get_par` | `{"spec":[10 ints],"par":f}` |
 | Leaf temperature (`ambit.leaf_temp`) | `uart_<ch>` | `ambit` | `get_temp` | `{"leaf":f,"chip":f}` |
 | BME280 (`device.bme280` / CLI `record_env`) | `null` | `null` | `device.bme280` | `{"temperature":f,"humidity":f,"pressure":f}` |
-| Lua `db.store_event{}` (heartbeat, custom/derived) | `uart_<n>` if `channel=` given, else `null` | `null` (Phase 3 attaches the cache) | `null` | script-defined |
+| **STATUS heartbeat** (firmware, tag `STATUS`) | `null` | `null` | `null` | `{"wifi":b,"provisioned":b,"db_online":b,"publish_gate":b,"battery_v":f,"input_v":f,"system_v":f,"input_ma":n,"charge_ma":n,"input_present":b,"charge_status":n}` (power keys omitted if charger read fails) |
+| Lua `db.store_event{}` (custom/derived) | `uart_<n>` if `channel=` given, else `null` | `null` (Phase 3 attaches the cache) | `null` | script-defined |
 
 `cmd_raw` uses the **target device's own command vocabulary** — for the AMBIT,
 the ASCII command names from its firmware (`do_command.h`): `arrun` for any
@@ -118,10 +121,6 @@ cmds 22/24, are the same stimulus — sync vs async is transport), `get_par`,
 The AMBIT run/trigger `opts.metadata` table is merged into the event's
 `{"segments":[…]}` metadata object.
 
-**Transitional note (until Phase 4):** the status heartbeat is still a script
-job storing via `db.store_event` — it appears with `tag:"MEASUREMENT"` and
-null provenance, identifiable by its data keys (`battery_v`, `publish_gate`,
-…). It becomes a firmware task with `tag:"STATUS"` in Phase 4.
 
 ### AMBIT `data` keys
 
@@ -148,6 +147,10 @@ PAR value).
 ## Delivery semantics
 
 - **QoS 1, retain 0**, one message in flight at a time.
+- **Clock gate**: nothing publishes while the system clock reads pre-2024
+  (RTC never set and no NVS flash-time) — prevents 1970-stamped events from
+  landing in wrong cloud partitions. Stores proceed; the queue drains once
+  the clock is set.
 - PUBACK marks the event `SYNCED`; a publish failure or MQTT disconnect
   re-marks it `PENDING` for retry. Delivery is therefore **at-least-once**,
   and the platform keeps duplicates (no cloud-side dedupe) — dedupe on
