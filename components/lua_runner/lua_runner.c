@@ -32,6 +32,13 @@
  * network stack — LwIP TCP/IP (18) and Wi-Fi (~23) must stay higher or the
  * radio link breaks; those tasks are bursty/idle so they don't slow us. */
 #define LUA_RUNNER_TASK_PRIORITY 10
+/* Pin to APP_CPU (core 1). Wi-Fi (pinned core 0) and LwIP (prio 18) outrank the
+ * measurement (prio 10), so an unpinned Lua task that lands on core 0 gets
+ * preempted mid-UART-transaction → FSM/timing jitter. Pinning the timing-
+ * sensitive measurement to core 1 keeps it off the radio's core; the slack
+ * when it blocks is still reused by other tasks allowed on core 1. (ESP32-S3 is
+ * dual-core; see docs/measurement-flow-plan.md.) */
+#define LUA_RUNNER_TASK_CORE 1
 #define LUA_QUERY_MAX_RECORDS 64
 #define LUA_SCRIPT_PATH "/sdcard/main.lua"
 
@@ -1807,13 +1814,14 @@ esp_err_t lua_runner_start(void)
     }
     s_should_stop = false;
 
-    BaseType_t created = xTaskCreate(
+    BaseType_t created = xTaskCreatePinnedToCore(
         lua_runner_task,
         LUA_RUNNER_TASK_NAME,
         LUA_RUNNER_TASK_STACK,
         NULL,
         LUA_RUNNER_TASK_PRIORITY,
-        &s_lua_task_handle
+        &s_lua_task_handle,
+        LUA_RUNNER_TASK_CORE
     );
     if (created != pdPASS) {
         s_lua_task_handle = NULL;
