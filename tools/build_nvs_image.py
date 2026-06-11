@@ -23,6 +23,8 @@ NVS layout (mirrors the firmware's nvs_open() namespaces):
                device_ver        AMBYTE_DEVICE_VERSION   (NVS key max 15 ch)
                device_firm       AMBYTE_DEVICE_FIRMWARE
                firmware_ver      AMBYTE_FIRMWARE_VERSION
+               cmd_topic         AMBYTE_COMMAND_TOPIC    (optional; Stage-2 cmd in)
+               status_topic      AMBYTE_STATUS_TOPIC     (optional; Stage-2 reply out)
   certs        ca_cert           file at AMBYTE_CA_CERT
                dev_cert          file at AMBYTE_DEV_CERT
                dev_key           file at AMBYTE_DEV_KEY
@@ -67,6 +69,14 @@ FIELDS = [
     ("AMBYTE_DEV_KEY",          "certs",      "dev_key",         "file"),
     ("AMBYTE_SSID",             "wifi_creds", "ssid",            "string"),
     ("AMBYTE_PASSWORD",         "wifi_creds", "pass",            "string"),
+]
+
+# Optional fields — included only when set in .env; absence is not an error.
+# The inbound command topic (device subscribes) + reply topic (device publishes)
+# for the Stage-2 command channel. Full authorized topics, deployment-specific.
+OPTIONAL_FIELDS = [
+    ("AMBYTE_COMMAND_TOPIC",    "device_cfg", "cmd_topic",       "string"),
+    ("AMBYTE_STATUS_TOPIC",     "device_cfg", "status_topic",    "string"),
 ]
 
 
@@ -155,23 +165,40 @@ def _collect_values() -> dict[tuple[str, str], tuple[str, str]]:
             "missing required value(s):\n  - " + "\n  - ".join(missing)
             + "\nSet them in .env (or AMBYTE_NVS_SKIP=1 to flash stock firmware).")
 
+    # Optional fields: include only when present, never error on absence.
+    for env_var, ns, key, kind in OPTIONAL_FIELDS:
+        raw = os.environ.get(env_var)
+        if raw:
+            out[(ns, key)] = (kind, raw)
+
     # provisioned=1 is constant; not driven by env.
     out[("wifi_prov", "provisioned")] = ("u8", "1")
     return out
 
 
 def _write_csv(values: dict[tuple[str, str], tuple[str, str]], csv_path: Path) -> None:
-    """Write the NVS-partition-generator CSV in namespace order, with PEMs inlined."""
-    lines: list[str] = ["key,type,encoding,value"]
-    last_ns: str | None = None
+    """Write the NVS-partition-generator CSV, with PEMs inlined.
+
+    Groups keys by namespace so each namespace is declared exactly once — the NVS
+    generator treats a repeated `namespace` line as a *separate* namespace, so
+    re-declaring (e.g. appending optional device_cfg keys after certs/wifi_creds)
+    would hide those keys from nvs_open(<name>)."""
+    by_ns: dict[str, list[tuple[str, str, str]]] = {}
+    ns_order: list[str] = []
     for (ns, key), (enc, value) in values.items():
-        if ns != last_ns:
-            lines.append(f"{ns},namespace,,")
-            last_ns = ns
-        if enc == "u8":
-            lines.append(f"{key},data,u8,{value}")
-        else:
-            lines.append(f"{key},data,string,{_quote_csv(value)}")
+        if ns not in by_ns:
+            by_ns[ns] = []
+            ns_order.append(ns)
+        by_ns[ns].append((key, enc, value))
+
+    lines: list[str] = ["key,type,encoding,value"]
+    for ns in ns_order:
+        lines.append(f"{ns},namespace,,")
+        for key, enc, value in by_ns[ns]:
+            if enc == "u8":
+                lines.append(f"{key},data,u8,{value}")
+            else:
+                lines.append(f"{key},data,string,{_quote_csv(value)}")
     csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

@@ -368,12 +368,23 @@ void app_main(void)
         firmware_version[0] = '\0';
     }
 
-    /* Inbound command channel (Stage 2): subscribe to "<topic_root>/cmd", reply on
-     * "<topic_root>/status". The AWS IoT policy must grant Subscribe/Receive on the
-     * cmd topic. */
+    /* Inbound command channel (Stage 2): full authorized topics from NVS config
+     * (the AWS IoT policy grants Subscribe on cmd_topic, Publish on status_topic).
+     * These are deployment-specific and independent of the telemetry topic_root —
+     * they use the Thing name, not the MAC client-id. Fall back to a topic_root
+     * derivation only if unprovisioned (older NVS). */
     static char command_topic[288], status_topic[288];
-    snprintf(command_topic, sizeof(command_topic), "%s/cmd",    topic_root);
-    snprintf(status_topic,  sizeof(status_topic),  "%s/status", topic_root);
+    if (device_config_get_command_topic(command_topic, sizeof(command_topic)) != ESP_OK) {
+        snprintf(command_topic, sizeof(command_topic), "%s/cmd", topic_root);
+    }
+    if (device_config_get_status_topic(status_topic, sizeof(status_topic)) != ESP_OK) {
+        snprintf(status_topic, sizeof(status_topic), "%s/status", topic_root);
+    }
+    /* Expand {MAC} here too — same placeholder support as client-id/topic-root,
+     * so a shared .env can scope per-board command/status topics. No-op when the
+     * provisioned topics use a fixed name (e.g. the Thing name). */
+    subst_token(command_topic, sizeof(command_topic), "{MAC}", mac_str);
+    subst_token(status_topic,  sizeof(status_topic),  "{MAC}", mac_str);
 
     /* ── MQTT Client ─────────────────────────────────────────────── */
     bool certs_ok = certs_are_provisioned();

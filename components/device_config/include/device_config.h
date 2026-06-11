@@ -20,6 +20,10 @@ esp_err_t device_config_init(void);
 esp_err_t device_config_get_mqtt_uri(char *buf, size_t len);
 esp_err_t device_config_get_mqtt_client_id(char *buf, size_t len);
 esp_err_t device_config_get_mqtt_topic_root(char *buf, size_t len);
+/* Inbound command topic (device subscribes) + reply topic (device publishes).
+ * Full, deployment-specific topics independent of mqtt_topic_root. */
+esp_err_t device_config_get_command_topic(char *buf, size_t len);
+esp_err_t device_config_get_status_topic(char *buf, size_t len);
 esp_err_t device_config_get_device_id(char *buf, size_t len);
 esp_err_t device_config_get_protocol_id(char *buf, size_t len);
 esp_err_t device_config_get_device_name(char *buf, size_t len);
@@ -31,6 +35,8 @@ esp_err_t device_config_get_firmware_version(char *buf, size_t len);
 esp_err_t device_config_set_mqtt_uri(const char *val);
 esp_err_t device_config_set_mqtt_client_id(const char *val);
 esp_err_t device_config_set_mqtt_topic_root(const char *val);
+esp_err_t device_config_set_command_topic(const char *val);
+esp_err_t device_config_set_status_topic(const char *val);
 esp_err_t device_config_set_device_id(const char *val);
 esp_err_t device_config_set_protocol_id(const char *val);
 esp_err_t device_config_set_device_name(const char *val);

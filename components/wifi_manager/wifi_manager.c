@@ -330,6 +330,29 @@ static void wifi_event_handler(
         xEventGroupSetBits(s_wifi.event_group, WIFI_MANAGER_CONNECTED_BIT);
         xEventGroupClearBits(s_wifi.event_group, WIFI_MANAGER_FAILED_BIT);
         ESP_LOGI(TAG, "Got IP from AP");
+
+        /* This gateway advertises a DNS server that does not actually resolve, so
+         * every getaddrinfo fails with EAI_FAIL and TLS/MQTT can never connect.
+         * Force a public resolver as MAIN, and keep the DHCP-provided one as BACKUP
+         * so we still work on networks where public DNS is blocked but local DNS
+         * resolves. Logs what DHCP gave, for diagnosis. */
+        if (s_wifi.sta_netif != NULL) {
+            esp_netif_dns_info_t dhcp_dns = {0};
+            esp_err_t ge = esp_netif_get_dns_info(s_wifi.sta_netif, ESP_NETIF_DNS_MAIN, &dhcp_dns);
+            uint32_t dhcp_addr = (ge == ESP_OK) ? dhcp_dns.ip.u_addr.ip4.addr : 0;
+
+            esp_netif_dns_info_t main_dns = { .ip = { .type = ESP_IPADDR_TYPE_V4 } };
+            main_dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("8.8.8.8");
+            esp_netif_set_dns_info(s_wifi.sta_netif, ESP_NETIF_DNS_MAIN, &main_dns);
+
+            esp_netif_dns_info_t bkp_dns = { .ip = { .type = ESP_IPADDR_TYPE_V4 } };
+            bkp_dns.ip.u_addr.ip4.addr = (dhcp_addr != 0) ? dhcp_addr : esp_ip4addr_aton("1.1.1.1");
+            esp_netif_set_dns_info(s_wifi.sta_netif, ESP_NETIF_DNS_BACKUP, &bkp_dns);
+
+            ESP_LOGW(TAG, "DNS: DHCP gave %u.%u.%u.%u — forced 8.8.8.8 as main resolver",
+                     (unsigned)(dhcp_addr & 0xff), (unsigned)((dhcp_addr >> 8) & 0xff),
+                     (unsigned)((dhcp_addr >> 16) & 0xff), (unsigned)((dhcp_addr >> 24) & 0xff));
+        }
     }
 }
 

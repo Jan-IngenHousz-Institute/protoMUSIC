@@ -11,6 +11,8 @@
 #define KEY_MQTT_URI        "mqtt_uri"
 #define KEY_MQTT_CLIENT_ID  "mqtt_client_id"
 #define KEY_MQTT_TOPIC_ROOT "mqtt_topic_root"
+#define KEY_COMMAND_TOPIC   "cmd_topic"
+#define KEY_STATUS_TOPIC    "status_topic"
 #define KEY_DEVICE_ID       "device_id"
 #define KEY_PROTOCOL_ID     "protocol_id"
 #define KEY_DEVICE_NAME     "device_name"
@@ -76,6 +78,26 @@ esp_err_t device_config_set_mqtt_client_id(const char *val)
 esp_err_t device_config_set_mqtt_topic_root(const char *val)
 {
     return cfg_set(KEY_MQTT_TOPIC_ROOT, val);
+}
+
+esp_err_t device_config_get_command_topic(char *buf, size_t len)
+{
+    return cfg_get(KEY_COMMAND_TOPIC, buf, len);
+}
+
+esp_err_t device_config_set_command_topic(const char *val)
+{
+    return cfg_set(KEY_COMMAND_TOPIC, val);
+}
+
+esp_err_t device_config_get_status_topic(char *buf, size_t len)
+{
+    return cfg_get(KEY_STATUS_TOPIC, buf, len);
+}
+
+esp_err_t device_config_set_status_topic(const char *val)
+{
+    return cfg_set(KEY_STATUS_TOPIC, val);
 }
 
 esp_err_t device_config_get_device_id(char *buf, size_t len)
