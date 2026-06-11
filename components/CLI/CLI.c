@@ -8,6 +8,8 @@
 #include "driver/i2c.h"
 #include "esp_console.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -738,6 +740,100 @@ static int cli_cmd_heaptrace(int argc, char **argv)
 }
 #endif /* CONFIG_HEAP_TRACING_STANDALONE */
 
+/* ── OTA dual-slot / rollback validation (OTA Stage 1 HW test) ────────────
+ * Temporary bench tooling to prove the dual-OTA partition table + rollback
+ * end-to-end with no server: clone the running image into the other slot,
+ * switch boot, and exercise the PENDING_VERIFY → commit/rollback transitions.
+ * Reusable as Stage-3 confidence; remove or keep as a diagnostic. */
+
+static const char *cli_ota_state_str(esp_ota_img_states_t st)
+{
+    switch (st) {
+        case ESP_OTA_IMG_NEW:            return "NEW";
+        case ESP_OTA_IMG_PENDING_VERIFY: return "PENDING_VERIFY";
+        case ESP_OTA_IMG_VALID:          return "VALID";
+        case ESP_OTA_IMG_INVALID:        return "INVALID";
+        case ESP_OTA_IMG_ABORTED:        return "ABORTED";
+        default:                         return "UNDEFINED";
+    }
+}
+
+static int cli_cmd_ota_status(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    const esp_partition_t *run  = esp_ota_get_running_partition();
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
+    if (run) esp_ota_get_state_partition(run, &st);
+
+    printf("running: %-7s @ 0x%06lx (%lu KB)  state=%s\r\n",
+           run ? run->label : "?", run ? (unsigned long)run->address : 0UL,
+           run ? (unsigned long)(run->size / 1024) : 0UL, cli_ota_state_str(st));
+    if (boot) printf("boot:    %-7s @ 0x%06lx\r\n", boot->label, (unsigned long)boot->address);
+    if (next) printf("next:    %-7s @ 0x%06lx  (ota_selftest clone target)\r\n",
+                     next->label, (unsigned long)next->address);
+    return 0;
+}
+
+static int cli_cmd_ota_selftest(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    const esp_partition_t *run  = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    if (run == NULL || next == NULL || run == next) {
+        printf("ota_selftest: need two OTA slots (run=%s next=%s) — single-OTA layout?\r\n",
+               run ? run->label : "?", next ? next->label : "?");
+        return 1;
+    }
+    printf("cloning %s (0x%06lx) -> %s (0x%06lx), %lu KB ...\r\n",
+           run->label, (unsigned long)run->address, next->label,
+           (unsigned long)next->address, (unsigned long)(run->size / 1024));
+
+    esp_ota_handle_t h = 0;
+    esp_err_t err = esp_ota_begin(next, run->size, &h);
+    if (err != ESP_OK) { printf("ota_begin: %s\r\n", esp_err_to_name(err)); return 1; }
+
+    const size_t CHUNK = 4096;
+    uint8_t *buf = malloc(CHUNK);
+    if (buf == NULL) { esp_ota_abort(h); printf("oom\r\n"); return 1; }
+    size_t off = 0;
+    while (off < run->size) {
+        size_t n = (run->size - off < CHUNK) ? (run->size - off) : CHUNK;
+        err = esp_partition_read(run, off, buf, n);
+        if (err != ESP_OK) break;
+        err = esp_ota_write(h, buf, n);
+        if (err != ESP_OK) break;
+        off += n;
+    }
+    free(buf);
+    if (err != ESP_OK) {
+        esp_ota_abort(h);
+        printf("clone failed @ %u B: %s\r\n", (unsigned)off, esp_err_to_name(err));
+        return 1;
+    }
+    if ((err = esp_ota_end(h)) != ESP_OK) {
+        printf("ota_end (image validate): %s\r\n", esp_err_to_name(err));
+        return 1;
+    }
+    if ((err = esp_ota_set_boot_partition(next)) != ESP_OK) {
+        printf("set_boot: %s\r\n", esp_err_to_name(err));
+        return 1;
+    }
+    printf("OK: %s set as boot. `reboot` -> boots it in PENDING_VERIFY.\r\n", next->label);
+    printf("  commit: `ota_mark_valid` (then it stays).\r\n");
+    printf("  rollback: `reboot` again WITHOUT mark_valid -> reverts to %s.\r\n", run->label);
+    return 0;
+}
+
+static int cli_cmd_ota_mark_valid(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    printf("mark_app_valid_cancel_rollback: %s\r\n", esp_err_to_name(err));
+    return (err == ESP_OK) ? 0 : 1;
+}
+
 static esp_err_t cli_register_commands(void)
 {
     if (s_cli_commands_registered) {
@@ -834,6 +930,21 @@ static esp_err_t cli_register_commands(void)
         .help    = "restart the device",
         .func    = cli_cmd_reboot,
     };
+    static const esp_console_cmd_t ota_status_cmd = {
+        .command = "ota_status",
+        .help    = "show running/boot/next OTA partition + rollback state",
+        .func    = cli_cmd_ota_status,
+    };
+    static const esp_console_cmd_t ota_selftest_cmd = {
+        .command = "ota_selftest",
+        .help    = "clone running image to the other slot + set boot (OTA Stage-1 test)",
+        .func    = cli_cmd_ota_selftest,
+    };
+    static const esp_console_cmd_t ota_mark_valid_cmd = {
+        .command = "ota_mark_valid",
+        .help    = "esp_ota_mark_app_valid_cancel_rollback() — commit a PENDING_VERIFY image",
+        .func    = cli_cmd_ota_mark_valid,
+    };
 #ifdef CONFIG_HEAP_TRACING_STANDALONE
     static const esp_console_cmd_t heaptrace_cmd = {
         .command = "heaptrace",
@@ -928,6 +1039,21 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&reboot_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ota_status_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ota_selftest_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ota_mark_valid_cmd);
     if (err != ESP_OK) {
         return err;
     }
