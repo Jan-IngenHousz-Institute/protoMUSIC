@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
@@ -43,10 +44,13 @@ static void ota_report(const char *state, const char *id, const char *detail)
     if (s_cfg.publish == NULL || s_cfg.status_topic == NULL || s_cfg.status_topic[0] == '\0') {
         return;
     }
-    char msg[256];
+    const esp_app_desc_t *d = esp_app_get_description();
+    char msg[320];
     int n = snprintf(msg, sizeof msg,
-        "{\"type\":\"ota_status\",\"device_id\":\"%s\",\"id\":\"%s\",\"state\":\"%s\"%s%s%s}",
+        "{\"type\":\"ota_status\",\"device_id\":\"%s\",\"id\":\"%s\",\"state\":\"%s\","
+        "\"fw\":\"%.32s\"%s%s%s}",
         s_cfg.device_id ? s_cfg.device_id : "", id ? id : "", state,
+        d ? d->version : "",
         detail ? ",\"detail\":\"" : "", detail ? detail : "", detail ? "\"" : "");
     if (n > 0 && (size_t)n < sizeof msg) {
         int msg_id = 0;

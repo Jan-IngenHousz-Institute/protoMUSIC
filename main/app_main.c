@@ -39,6 +39,14 @@
 
 #define APP_TAG "APP_MAIN"
 
+/* Human-visible build marker, logged loudly at boot. For an OTA HW test, bump
+ * this in the image you publish (e.g. "ota-test-1") so the new image is
+ * unmistakable in the boot log vs. the one flashed over USB. Overridable from
+ * platformio.ini build_flags as -DAMBYTE_FW_TAG=... if you prefer. */
+#ifndef AMBYTE_FW_TAG
+#define AMBYTE_FW_TAG "dev"
+#endif
+
 /* Re-sync the ESP system clock from the RTC at this cadence (drift correction +
  * recovery if the RTC is set/validated after boot). */
 #define APP_RTC_SYNC_INTERVAL_S 3600U
@@ -327,6 +335,7 @@ void app_main(void)
 
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(APP_TAG, "app_main entered");
+    ESP_LOGW(APP_TAG, "firmware build tag: %s", AMBYTE_FW_TAG);
 
     /* ── NVS ──────────────────────────────────────────────────────── */
     esp_err_t err = app_init_nvs();
