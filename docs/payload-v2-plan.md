@@ -198,19 +198,34 @@ with RTC cleared — events queue, nothing publishes, log shows the clock gate;
 set RTC, confirm drain resumes (already-stored bogus startTicks are accepted
 loss pre-beta unless open decision 3 says otherwise).
 
-## Phase 5 — docs, tooling, cloud asks  ⟵ *host/cloud side DONE 2026-06-11
-(notebook filters sensor→channel/tag, test-client dummy → v2 envelope, docs
-current. Remaining = the two openJII partner asks below + on-HW confirmation.)*
+## Phase 5 — docs, tooling, cloud asks  ⟵ *DONE 2026-06-11
+(notebook filters sensor→channel/tag + consumer-side dedup, test-client dummy →
+v2 envelope, docs current. Both platform asks resolved against the open-jii
+source — see below. Remaining = on-HW confirmation that v2 rows reach silver.)*
 
 - Rewrite [mqtt-payload.md](mqtt-payload.md) for v2 (it currently documents
   v1); update the test client's dummy payload to the v2 shape; update
   `test/read_export.ipynb` filters (`sensor=="AMBIT_1"` → channel/tag).
 - README pointer stays valid (already links mqtt-payload.md).
-- **Platform team asks** (openJII): (a) silver-layer
-  `dropDuplicates` on `(device_id, sample[0].measure_id)` — the pipeline
-  currently keeps QoS-1 redeliveries as distinct rows; (b) confirm
-  `timestamp` ISO format with `Z` suffix parses in their from_json config
-  (Spark default accepts it).
+- **Platform asks — resolved against the open-jii source 2026-06-11**
+  (`apps/data/src/pipelines/centrum_pipeline.py`, `infrastructure/modules/iot-core`):
+  - (b) **timestamp parsing — OK, no change.** The IoT rule is
+    `SELECT topic() as topic, * FROM '<topic>'`, so the envelope `timestamp`
+    reaches the pipeline verbatim; `from_json` parses it as `TimestampType`
+    with no format/`timeParserPolicy` override, i.e. Spark 3's default ISO
+    parser (`yyyy-MM-dd'T'HH:mm:ss[.SSS][XXX]`) — accepts `…:11Z` (offset `Z`,
+    fraction optional). v1 `.000Z` and v2 `Z` both parse. Caveat: silver has
+    `@dlt.expect_or_drop("valid_timestamp", …)`, so a *non*-parsing timestamp
+    would silently drop the row — confirm v2 rows land in silver once.
+  - (a) **dedup — consumer-side, NOT in the shared pipeline.** Reading the
+    source: `measure_id` is ambyte-specific (other devices have no such field),
+    silver is a *streaming* table (a `dropDuplicates` needs a watermark + state
+    + a bounded window for all tenants), and the silver `id` deliberately
+    hashes the Kinesis sequence number (raw at-least-once fidelity by design).
+    So dedup belongs downstream: done in `test/read_export.ipynb` on
+    `(device_id, measure_id)`. A server-side option would be a gold,
+    ambyte-scoped view — deferred as a platform decision, not a unilateral
+    change to the multi-tenant pipeline.
 
 ## Migration / deploy notes
 
