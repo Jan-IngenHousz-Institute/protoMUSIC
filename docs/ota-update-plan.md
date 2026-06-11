@@ -259,8 +259,13 @@ is "who can publish to the command topic."
    { "type":"ota_update", "id":"ota-2026-06-11-1",
      "url":"https://github.com/<owner>/<repo>/releases/download/<tag>/firmware.bin" }
    ```
-   - `url`: a **public** HTTPS app-image (GitHub release asset or `raw.githubusercontent.com/…`).
-   - `id`: **new every time** — a failed update needs a fresh id to retry.
+   - `url`: a **public** HTTPS app-image (GitHub **release asset** — upload the
+     branch-built `firmware.bin` to a release; the URL points at that asset, not
+     at the git branch). A missing asset is the `File not found(404)` you'll see
+     in the log.
+   - `id`: latched only on a **successful** update (to stop a retained trigger
+     re-OTAing). A failed attempt is *not* latched, so you can re-send the same
+     `id` to retry; only a completed update locks its id (use a new one next time).
 3. Watch the status topic for `accepted` → (download, ~1 min) → after reboot,
    `success` with the new `fw`. Serial shows `firmware build tag:` + the new
    boot offset.
@@ -276,9 +281,10 @@ Two images from the same branch, distinguished by `AMBYTE_FW_TAG` (main/app_main
 2. **Build + publish image B (the OTA target):** set `AMBYTE_FW_TAG "ota-B"`,
    `pio run` (no upload). Create a **public** GitHub release and attach
    `.pio/build/esp32-s3-devkitm-1/firmware.bin`. Copy the asset download URL.
-3. **Trigger:** publish the `ota_update` command (above) with that URL and a
-   fresh `id`. Expect `ota_status state=accepted` on the status topic, then the
-   serial log: MQTT disconnect → `esp_https_ota` download progress → reboot.
+3. **Trigger:** publish the `ota_update` command (above) with that URL. Expect
+   `ota_status state=accepted` on the status topic, then the serial log: MQTT
+   disconnect → `esp_https_ota` download progress → reboot. (Re-sending the same
+   `id` after a failed attempt is fine — only a *successful* update locks the id.)
 4. **Confirm the swap:** new boot log shows `Loaded app from partition at offset
    0x310000` (= `ota_1`) and `firmware build tag: ota-B`. After MQTT reconnects,
    `ota_status state=success fw=<B version>`. → OTA downloaded + ran the new bits.
