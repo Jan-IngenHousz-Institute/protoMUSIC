@@ -198,7 +198,9 @@ with RTC cleared — events queue, nothing publishes, log shows the clock gate;
 set RTC, confirm drain resumes (already-stored bogus startTicks are accepted
 loss pre-beta unless open decision 3 says otherwise).
 
-## Phase 5 — docs, tooling, cloud asks
+## Phase 5 — docs, tooling, cloud asks  ⟵ *host/cloud side DONE 2026-06-11
+(notebook filters sensor→channel/tag, test-client dummy → v2 envelope, docs
+current. Remaining = the two openJII partner asks below + on-HW confirmation.)*
 
 - Rewrite [mqtt-payload.md](mqtt-payload.md) for v2 (it currently documents
   v1); update the test client's dummy payload to the v2 shape; update

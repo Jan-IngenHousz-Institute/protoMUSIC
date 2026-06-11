@@ -38,11 +38,26 @@ change below.
 ## Firmware levers (axis 1), highest-leverage first
 
 1. **Pin `lua_runner` to core 1 (APP_CPU); keep comms on core 0.**
-   `xTaskCreatePinnedToCore(..., 1)` for the Lua task, and pin `sync_runner`
-   (MQTT drain + heartbeat) to core 0 so TLS/Wi-Fi/lwIP all share core 0 and
-   core 1 is the measurement's. Single change, directly targets the preemption.
-   *Caveat:* verify the UART driver/ISR and SD access behave (different buses
-   from the radio, so no direct contention; the win is CPU isolation).
+   `xTaskCreatePinnedToCore(..., 1)` for the Lua task. Single change, directly
+   targets the preemption. *Caveat:* verify the UART driver/ISR and SD access
+   behave (different buses from the radio, so no direct contention; the win is
+   CPU isolation).
+
+   **Affinity ≠ core reservation.** Pinning the task to core 1 doesn't idle
+   core 1 when the measurement blocks (which is most of the time — UART waits,
+   poll sleeps): the scheduler runs any *other task allowed on core 1* in those
+   gaps. So core 1 slack is NOT wasted — but *who* may use it decides whether
+   isolation holds:
+   - Low-prio tasks (blinker/sd_logger/sd-monitor, ≤ prio 3) using the slack is
+     harmless — the measurement (prio 10) preempts them instantly when it
+     unblocks, negligible jitter.
+   - High-prio comms (lwIP prio 18, MQTT/TLS) using the slack REINTRODUCES the
+     problem: when the measurement unblocks it waits behind them. So the airtight
+     form is to **confine lwIP/MQTT to core 0** (Wi-Fi already is), e.g. via
+     `CONFIG_LWIP_TCPIP_TASK_AFFINITY=CPU0` + the esp-mqtt task core selection.
+   - Pinning `lua_runner` to core 1 alone is the high-leverage first cut (it
+     stops the scheduler from ever placing the measurement on core 0 with the
+     radio); add the lwIP/MQTT core-0 pin only if jitter persists.
 2. **Defer the STATUS heartbeat store while `measurement_window` is held.**
    sync_runner already defers *publishing* during a measurement; the heartbeat
    *store* currently runs regardless. With core-pinning it's on core 0 so it

@@ -99,17 +99,32 @@ def build_client(args) -> mqtt.Client:
 
 
 def _default_payload(args) -> str:
-    """Dummy measurement payload; overridden by --message if provided."""
+    """Dummy measurement payload (schema v2); overridden by --message if provided.
+    A connectivity smoke test — it mirrors the firmware envelope shape
+    (docs/mqtt-payload.md) so a subscriber sees a representative v2 message."""
     if args.message is not None:
         return args.message
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return json.dumps({
-        "sample": [{"protocol_id": os.environ.get("AMBYTE_PROTOCOL_ID", "3517"), "set": []}],
-        "device_firmware":  os.environ.get("AMBYTE_DEVICE_FIRMWARE",  "1"),
+        "sample": [{
+            "v": 2,
+            "measure_id": 1,
+            "startTicks": int(time.time() * 1000),
+            "endTicks":   int(time.time() * 1000),
+            "published":  now,
+            "channel":    "uart_0",
+            "device":     "ambit",
+            "cmd_raw":    "get_par",
+            "tag":        "MEASUREMENT",
+            "metadata":   None,
+            "data":       {"spec": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "par": 0.0},
+        }],
+        "timestamp":        now,                # = startTicks (measurement time)
+        "device_battery":   4.0,
         "device_id":        os.environ.get("AMBYTE_DEVICE_ID",        "00:00:00:00"),
         "device_name":      os.environ.get("AMBYTE_DEVICE_NAME",      "AmbyteOnAir"),
         "device_version":   os.environ.get("AMBYTE_DEVICE_VERSION",   "1"),
-        "firmware_version": os.environ.get("AMBYTE_FIRMWARE_VERSION", "1"),
-        "timestamp":        time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "device_firmware":  os.environ.get("AMBYTE_DEVICE_FIRMWARE",  "1"),
     })
 
 
