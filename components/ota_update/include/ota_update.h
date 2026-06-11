@@ -31,8 +31,11 @@ extern "C" {
 typedef struct {
     message_publish_fn      publish;        /* mqtt_client_get_publish_fn() — status reports */
     message_is_connected_fn is_connected;   /* mqtt_client_get_is_connected_fn() — health gate */
-    void                  (*comms_suspend)(void); /* mqtt_client_stop — free TLS heap for the DL */
-    void                  (*comms_resume)(void);  /* mqtt_client_start — after a failed DL */
+    void                  (*comms_suspend)(void);    /* mqtt_client_stop — free TLS heap for the DL */
+    void                  (*comms_resume)(void);     /* mqtt_client_start — after a failed DL */
+    void                  (*workload_suspend)(void); /* stop the Lua measurement task during the DL
+                                                      * (frees heap, avoids fragmentation); NULL = skip */
+    void                  (*workload_resume)(void);  /* restart it after a failed DL; NULL = skip */
     const char             *status_topic;   /* where status JSON is published */
     const char             *device_id;      /* included in status payloads */
 } ota_update_config_t;

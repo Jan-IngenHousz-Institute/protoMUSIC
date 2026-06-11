@@ -44,7 +44,7 @@
  * unmistakable in the boot log vs. the one flashed over USB. Overridable from
  * platformio.ini build_flags as -DAMBYTE_FW_TAG=... if you prefer. */
 #ifndef AMBYTE_FW_TAG
-#define AMBYTE_FW_TAG "ota-B"
+#define AMBYTE_FW_TAG "ota-A"
 #endif
 
 /* Re-sync the ESP system clock from the RTC at this cadence (drift correction +
@@ -119,6 +119,21 @@ static bool app_wifi_provisioned(void)
     bool provisioned = false;
     (void)wifi_manager_is_provisioned(&provisioned);
     return provisioned;
+}
+
+/* Pause/resume the Lua measurement task for the OTA worker — stopping it during
+ * the download frees its heap (8 KB AMBIT buffer + transient tables) so the
+ * download's TLS doesn't fragment against concurrent measurement allocations. */
+static void app_workload_suspend(void)
+{
+    if (lua_runner_stop(5000) != ESP_OK) {
+        ESP_LOGW(APP_TAG, "Lua task did not stop before OTA — heap may fragment");
+    }
+}
+
+static void app_workload_resume(void)
+{
+    (void)lua_runner_start();   /* reloads /sdcard/main.lua after a failed OTA */
 }
 
 static esp_err_t app_init_i2c_and_sensors(void)
@@ -475,12 +490,14 @@ void app_main(void)
      * and confirms a just-applied image on the next MQTT reconnect (else rolls
      * back). Triggered by command_router's ota_update dispatch. */
     ota_update_config_t ota_cfg = {
-        .publish       = mqtt_client_get_publish_fn(),
-        .is_connected  = mqtt_client_get_is_connected_fn(),
-        .comms_suspend = mqtt_client_stop,
-        .comms_resume  = mqtt_client_start,
-        .status_topic  = status_topic,
-        .device_id     = device_id,
+        .publish          = mqtt_client_get_publish_fn(),
+        .is_connected     = mqtt_client_get_is_connected_fn(),
+        .comms_suspend    = mqtt_client_stop,
+        .comms_resume     = mqtt_client_start,
+        .workload_suspend = app_workload_suspend,
+        .workload_resume  = app_workload_resume,
+        .status_topic     = status_topic,
+        .device_id        = device_id,
     };
     if (ota_update_init(&ota_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "OTA worker not started");

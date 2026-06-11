@@ -39,34 +39,64 @@ static TaskHandle_t        s_task;
 
 /* ── status reporting ──────────────────────────────────────────────────── */
 
+/* Minimal JSON string escape — `id`/`detail` originate from the inbound command
+ * (attacker-influenced via the command topic), so a stray quote/backslash/
+ * control char would otherwise corrupt the status JSON. Truncates at cap. */
+static void json_escape(char *out, size_t cap, const char *in)
+{
+    size_t o = 0;
+    if (in == NULL) { if (cap) out[0] = '\0'; return; }
+    for (const char *p = in; *p != '\0' && o + 2 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c == '\n')        { out[o++] = '\\'; out[o++] = 'n'; }
+        else if (c == '\r')        { out[o++] = '\\'; out[o++] = 'r'; }
+        else if (c == '\t')        { out[o++] = '\\'; out[o++] = 't'; }
+        else if (c < 0x20)         { /* drop other control chars */ }
+        else                        { out[o++] = (char)c; }
+    }
+    out[o] = '\0';
+}
+
 static void ota_report(const char *state, const char *id, const char *detail)
 {
     if (s_cfg.publish == NULL || s_cfg.status_topic == NULL || s_cfg.status_topic[0] == '\0') {
         return;
     }
     const esp_app_desc_t *d = esp_app_get_description();
-    char msg[320];
+    char esc_id[OTA_ID_MAX * 2 + 1] = "";
+    char esc_detail[160] = "";
+    json_escape(esc_id, sizeof esc_id, id);
+    if (detail) json_escape(esc_detail, sizeof esc_detail, detail);
+
+    char msg[384];
     int n = snprintf(msg, sizeof msg,
         "{\"type\":\"ota_status\",\"device_id\":\"%s\",\"id\":\"%s\",\"state\":\"%s\","
         "\"fw\":\"%.32s\"%s%s%s}",
-        s_cfg.device_id ? s_cfg.device_id : "", id ? id : "", state,
+        s_cfg.device_id ? s_cfg.device_id : "", esc_id, state,
         d ? d->version : "",
-        detail ? ",\"detail\":\"" : "", detail ? detail : "", detail ? "\"" : "");
-    if (n > 0 && (size_t)n < sizeof msg) {
+        detail ? ",\"detail\":\"" : "", esc_detail, detail ? "\"" : "");
+    if (n <= 0 || (size_t)n >= sizeof msg) return;
+
+    /* Retry briefly — a report just after reconnect can race a transient drop;
+     * the publish no-ops while disconnected. Best-effort (status, not data). */
+    for (int attempt = 0; attempt < 3; attempt++) {
         int msg_id = 0;
-        s_cfg.publish(s_cfg.status_topic, msg, (size_t)n, &msg_id);
+        if (s_cfg.publish(s_cfg.status_topic, msg, (size_t)n, &msg_id) == ESP_OK) return;
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-/* Poll until MQTT is connected or the timeout elapses. */
+/* Poll until MQTT is connected or the timeout elapses (does not overshoot). */
 static bool wait_connected(uint32_t timeout_s)
 {
     if (s_cfg.is_connected == NULL) return false;
-    uint32_t waited = 0;
-    while (waited < timeout_s * 1000U) {
+    uint32_t budget = timeout_s * 1000U;
+    while (budget > 0) {
         if (s_cfg.is_connected()) return true;
-        vTaskDelay(pdMS_TO_TICKS(OTA_CONNECT_POLL_MS));
-        waited += OTA_CONNECT_POLL_MS;
+        uint32_t step = (budget < OTA_CONNECT_POLL_MS) ? budget : OTA_CONNECT_POLL_MS;
+        vTaskDelay(pdMS_TO_TICKS(step));
+        budget -= step;
     }
     return s_cfg.is_connected();
 }
@@ -129,7 +159,10 @@ static void ota_do_update(const ota_request_t *r)
     ota_report("accepted", r->id, NULL);
     vTaskDelay(pdMS_TO_TICKS(500));   /* let the accepted report flush before comms drop */
 
-    /* Free MQTT's TLS heap — the board can't hold two TLS sessions at once. */
+    /* Quiesce the heap for the download (the board can't hold two TLS sessions):
+     * stop the Lua measurement task (its 8 KB AMBIT buffer + transient tables
+     * would fragment the heap mid-download), then free MQTT's TLS. */
+    if (s_cfg.workload_suspend != NULL) s_cfg.workload_suspend();
     if (s_cfg.comms_suspend != NULL) s_cfg.comms_suspend();
     vTaskDelay(pdMS_TO_TICKS(500));
 
@@ -145,9 +178,26 @@ static void ota_do_update(const ota_request_t *r)
     };
     esp_https_ota_config_t cfg = { .http_config = &http };
 
-    /* Simple API: begin → perform → end → set_boot_partition (all-in-one). With
-     * rollback enabled the new image boots PENDING_VERIFY. */
-    esp_err_t err = esp_https_ota(&cfg);
+    /* Advanced begin→perform→end API (not the one-shot esp_https_ota) so we can
+     * yield once per chunk: on a fast link the one-shot loop runs CPU-bound and
+     * starves a core's idle task past the 5 s task-WDT → panic. vTaskDelay(1)
+     * lets idle run and feed the WDT; cost is negligible vs the download. */
+    esp_https_ota_handle_t h = NULL;
+    esp_err_t err = esp_https_ota_begin(&cfg, &h);
+    if (err == ESP_OK) {
+        do {
+            err = esp_https_ota_perform(h);
+            vTaskDelay(1);   /* yield so the idle task feeds the task-WDT */
+        } while (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
+
+        bool complete = (err == ESP_OK) && esp_https_ota_is_complete_data_received(h);
+        if (err == ESP_OK && complete) {
+            err = esp_https_ota_finish(h);   /* validates image + sets boot partition */
+        } else {
+            if (err == ESP_OK) err = ESP_FAIL;   /* incomplete download */
+            esp_https_ota_abort(h);
+        }
+    }
 
     if (err == ESP_OK) {
         /* Mark applied ONLY now that the image is written + boot is set: a failed
@@ -164,15 +214,18 @@ static void ota_do_update(const ota_request_t *r)
      * NOT latched, so the same id can be re-sent to retry. */
     ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
     const char *detail = esp_err_to_name(err);
-    if (err == ESP_ERR_INVALID_VERSION) {
-        /* esp_https_ota got bytes but the image header was invalid — almost
-         * always an HTML page (wrong URL) rather than a firmware.bin. */
+    if (err == ESP_ERR_INVALID_VERSION || err == ESP_ERR_OTA_VALIDATE_FAILED) {
+        /* Got bytes but the image header was invalid — almost always an HTML
+         * page (wrong URL) rather than a firmware.bin. */
         ESP_LOGE(TAG, "downloaded content is not a valid ESP32-S3 image — did the URL "
                       "serve HTML? point at a release-asset firmware.bin");
         detail = "not_an_image: URL served non-firmware (HTML?) — use a release-asset .bin";
     }
+    if (s_cfg.workload_resume != NULL) s_cfg.workload_resume();
     if (s_cfg.comms_resume != NULL) s_cfg.comms_resume();
-    if (wait_connected(60)) {
+    /* Match the confirm-path budget (300 s): a degraded link can take far longer
+     * than 60 s to reconnect, and we'd otherwise drop the failure report. */
+    if (wait_connected(OTA_CONFIRM_TIMEOUT_S)) {
         ota_report("failed", r->id, detail);
     }
 }
@@ -194,7 +247,15 @@ static void confirm_pending_after_boot(void)
 
     if (wait_connected(OTA_CONFIRM_TIMEOUT_S)) {
         esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-        ESP_LOGW(TAG, "image confirmed valid: %s", esp_err_to_name(err));
+        if (err != ESP_OK) {
+            /* Could not commit the image as valid (flash/otadata error). Do NOT
+             * report success — reboot so the bootloader cleanly handles the still-
+             * PENDING_VERIFY image (it will roll back) rather than running on in an
+             * unconfirmed state that a later reboot would silently revert. */
+            ESP_LOGE(TAG, "mark_app_valid failed: %s — rebooting", esp_err_to_name(err));
+            esp_restart();
+        }
+        ESP_LOGW(TAG, "image confirmed valid");
         /* Keep the latch as the applied-id dedupe record. */
         ota_report("success", id, NULL);
     } else {
@@ -202,7 +263,9 @@ static void confirm_pending_after_boot(void)
          * The latch stays so the same (bad) id isn't auto-retried; a new id, or a
          * fixed image under a new id, is the way forward. */
         ESP_LOGE(TAG, "no MQTT within %ds — rolling back", OTA_CONFIRM_TIMEOUT_S);
-        esp_ota_mark_app_invalid_rollback_and_reboot();   /* no return on success */
+        esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();   /* normally no return */
+        ESP_LOGE(TAG, "rollback call returned (%s) — forcing reboot", esp_err_to_name(err));
+        esp_restart();   /* never continue into the request loop while PENDING_VERIFY */
     }
 }
 
@@ -230,8 +293,11 @@ esp_err_t ota_update_init(const ota_update_config_t *cfg)
     s_queue = xQueueCreate(2, sizeof(ota_request_t));
     if (s_queue == NULL) return ESP_ERR_NO_MEM;
 
-    if (xTaskCreate(ota_task, "ota_update", OTA_TASK_STACK, NULL,
-                    OTA_TASK_PRIO, &s_task) != pdPASS) {
+    /* Pin to core 0 (PRO_CPU, with Wi-Fi/lwIP). lua_runner is pinned to core 1;
+     * keeping OTA off core 1 avoids the measurement task preempting the download
+     * if it were ever running, and the download yields on I/O anyway. */
+    if (xTaskCreatePinnedToCore(ota_task, "ota_update", OTA_TASK_STACK, NULL,
+                                OTA_TASK_PRIO, &s_task, 0) != pdPASS) {
         vQueueDelete(s_queue);
         s_queue = NULL;
         return ESP_ERR_NO_MEM;
@@ -256,5 +322,8 @@ esp_err_t ota_update_request(const char *url, const char *id)
     memset(&r, 0, sizeof r);
     strncpy(r.url, url, sizeof r.url - 1);
     if (id != NULL) strncpy(r.id, id, sizeof r.id - 1);
-    return (xQueueSend(s_queue, &r, 0) == pdTRUE) ? ESP_OK : ESP_ERR_NO_MEM;
+    if (xQueueSend(s_queue, &r, 0) == pdTRUE) return ESP_OK;
+    /* Queue full (an OTA is already in flight) — tell the operator, don't drop silently. */
+    ota_report("dropped", id, "an OTA is already in progress");
+    return ESP_ERR_NO_MEM;
 }
