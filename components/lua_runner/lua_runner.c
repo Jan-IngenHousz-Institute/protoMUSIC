@@ -112,21 +112,61 @@ static int l_device_status(lua_State *L)
     return 1;
 }
 
-static int l_device_read_env(lua_State *L)
+/* Wall-clock epoch milliseconds (RTC-backed system clock). */
+static int64_t lua_now_ms(void)
 {
-    float temp = 0, hum = 0, pres = 0;
-    cmd_result_t res = cmd_read_env(&temp, &hum, &pres);
-    if (res.status != ESP_OK) {
-        return lua_push_nil_reason(L, res.message);
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* opts.store at stack index `idx` — default true (fused-store convention:
+ * measurement commands store unless the script opts out). */
+static bool lua_opt_store(lua_State *L, int idx)
+{
+    bool store = true;
+    if (lua_istable(L, idx)) {
+        lua_getfield(L, idx, "store");
+        if (!lua_isnil(L, -1)) store = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+    }
+    return store;
+}
+
+/* device.bme280([opts]) — read the on-board BME280 and (by default) store the
+ * reading as one MEASUREMENT event (channel null/onboard, cmd_raw
+ * "device.bme280", payload {"temperature":..,"humidity":..,"pressure":..}).
+ *   opts: { store = true }   -- pass store=false for a read-only probe
+ * Returns { temperature_c, humidity_pct, pressure_pa [, id] } or nil,err;
+ * `id` is the stored measure_id (absent when store=false or store failed). */
+static int l_device_bme280(lua_State *L)
+{
+    bool store = lua_opt_store(L, 1);
+
+    float t = 0, h = 0, p = 0;
+    int64_t mid = -1;
+    if (store) {
+        int64_t id = 0;
+        measurement_t m;
+        cmd_result_t res = cmd_record_env(&id, &m);
+        if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+        t = m.temperature_c;
+        h = m.humidity_percent;
+        p = m.pressure_pa;
+        mid = id;
+    } else {
+        cmd_result_t res = cmd_read_env(&t, &h, &p);
+        if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
     }
 
     lua_newtable(L);
-    lua_pushnumber(L, (lua_Number)temp);
-    lua_setfield(L, -2, "temperature_c");
-    lua_pushnumber(L, (lua_Number)hum);
-    lua_setfield(L, -2, "humidity_pct");
-    lua_pushnumber(L, (lua_Number)pres);
-    lua_setfield(L, -2, "pressure_pa");
+    lua_pushnumber(L, (lua_Number)t); lua_setfield(L, -2, "temperature_c");
+    lua_pushnumber(L, (lua_Number)h); lua_setfield(L, -2, "humidity_pct");
+    lua_pushnumber(L, (lua_Number)p); lua_setfield(L, -2, "pressure_pa");
+    if (mid >= 0) {
+        lua_pushinteger(L, (lua_Integer)mid);
+        lua_setfield(L, -2, "id");
+    }
     return 1;
 }
 
@@ -156,19 +196,6 @@ static int l_device_power(lua_State *L)
     lua_setfield(L, -2, "input_present");
     lua_pushboolean(L, p.charge_status != 0);
     lua_setfield(L, -2, "charging");
-    return 1;
-}
-
-/* device.record_env() — read BME280 + persist T/H/P as three rows sharing one
- * measure_id. Returns that measure_id (int) or nil,err. */
-static int l_device_record_env(lua_State *L)
-{
-    int64_t mid = 0;
-    cmd_result_t res = cmd_record_env(&mid);
-    if (res.status != ESP_OK) {
-        return lua_push_nil_reason(L, res.message);
-    }
-    lua_pushinteger(L, (lua_Integer)mid);
     return 1;
 }
 
@@ -232,8 +259,9 @@ static int l_device_uptime_ms(lua_State *L)
 
 /* device.status_report() → table | nil,err. Point-in-time device state (Wi-Fi,
  * provisioning, event DB, MP2731 power + source/charge/publish-gate). Intended
- * to be stored via db.store_event{ sensor="status", data=... } so the sole
- * publisher (sync_runner) forwards it under the power gate. */
+ * to be stored via db.store_event{ data = ... } so the sole publisher
+ * (sync_runner) forwards it under the power gate. (Becomes a firmware
+ * background task with tag=STATUS in payload-v2 Phase 4.) */
 static int l_device_status_report(lua_State *L)
 {
     device_status_snapshot_t s;
@@ -292,9 +320,9 @@ static int l_device_pwm(lua_State *L)
     return 1;
 }
 
-/* ── device.uart_* bindings ──────────────────────────────────────────── */
+/* ── uart transport + ambit presence bindings ───────────────────────── */
 
-/* device.uart_ping(channel) → boolean */
+/* ambit.ping(ch) → boolean — AMBIT wake (0xAA) / ack (0x80) probe */
 static int l_device_uart_ping(lua_State *L)
 {
     lua_Integer ch = luaL_checkinteger(L, 1);
@@ -310,7 +338,7 @@ static int l_device_uart_ping(lua_State *L)
     return 1;
 }
 
-/* device.uart_status() → { [0]="connected", [1]="disconnected", ... } */
+/* uart.status() → string summary of each channel's connection state */
 static int l_device_uart_status(lua_State *L)
 {
     cmd_result_t res = cmd_uart_status();
@@ -321,19 +349,19 @@ static int l_device_uart_status(lua_State *L)
     return 1;
 }
 
-/* device.uart_query(ch, cmd, timeout_ms, opts) — ASCII line-oriented query.
+/* uart.query(ch, cmd, timeout_ms [, opts]) — ASCII line-oriented query.
+ * Raw transport for not-yet-drivered sensors; NEVER stores (schema-v2 rule:
+ * measurement commands store, transport commands don't).
  *
  *   ch          : channel index 0..3
  *   cmd         : ASCII command string (terminator appended by the runtime)
  *   timeout_ms  : total budget for send + read in ms
- *   opts        : optional table:
- *                   lineterminator = "\n"           -- default
- *                   save           = true           -- default; persist row
+ *   opts        : optional table: lineterminator = "\n" (default)
  *
  * Returns the response string (terminator stripped) or "" on timeout. On a
  * hard error returns nil, err. Echo handling: if the first line read back
  * equals `cmd` verbatim, it is dropped and the next line is returned. */
-static int l_device_uart_query(lua_State *L)
+static int l_uart_query(lua_State *L)
 {
     lua_Integer ch = luaL_checkinteger(L, 1);
     if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
@@ -343,16 +371,10 @@ static int l_device_uart_query(lua_State *L)
     lua_Integer timeout_ms = luaL_checkinteger(L, 3);
 
     const char *terminator = "\n";
-    bool save = true;
     if (lua_istable(L, 4)) {
         lua_getfield(L, 4, "lineterminator");
         if (lua_isstring(L, -1)) {
             terminator = lua_tostring(L, -1);
-        }
-        lua_pop(L, 1);
-        lua_getfield(L, 4, "save");
-        if (lua_isboolean(L, -1)) {
-            save = lua_toboolean(L, -1);
         }
         lua_pop(L, 1);
     }
@@ -360,7 +382,7 @@ static int l_device_uart_query(lua_State *L)
     char   response[256];
     size_t resp_len = 0;
     cmd_result_t res = cmd_uart_text_query((uint8_t)ch, cmd, terminator,
-                                           (uint32_t)timeout_ms, save,
+                                           (uint32_t)timeout_ms,
                                            response, sizeof(response), &resp_len);
 
     /* Hard error (anything other than success or pure timeout). */
@@ -373,7 +395,7 @@ static int l_device_uart_query(lua_State *L)
     return 1;
 }
 
-/* ambit.uart_query(channel, cmd_bytes, extra_bytes_or_nil, expect_raw, timeout_ms)
+/* ambit.query(channel, cmd_bytes, extra_bytes_or_nil, expect_raw, timeout_ms)
  *
  * AMBIT binary protocol — sends the 8-byte ESP command with optional `extra`
  * payload, waits for CMD_DONE + either a fixed-size raw response or the FSM
@@ -465,9 +487,9 @@ static int l_ambit_uart_query(lua_State *L)
     return 1;
 }
 
-/* ── device.ambit_* bindings ─────────────────────────────────────────── */
+/* ── ambit.* typed bindings ──────────────────────────────────────────── */
 
-/* device.ambit_set_gains(ch, fluo, fluoref, ir, irref, sun, leaf) → true or nil,err */
+/* ambit.set_gains(ch, fluo, fluoref, ir, irref, sun, leaf) → true or nil,err */
 static int l_device_ambit_set_gains(lua_State *L)
 {
     uint8_t ch  = (uint8_t)luaL_checkinteger(L, 1);
@@ -479,7 +501,7 @@ static int l_device_ambit_set_gains(lua_State *L)
     return 1;
 }
 
-/* device.ambit_set_currents(ch, i620, i720, ir) → true or nil,err */
+/* ambit.set_currents(ch, i620, i720, ir) → true or nil,err */
 static int l_device_ambit_set_currents(lua_State *L)
 {
     uint8_t ch   = (uint8_t)luaL_checkinteger(L, 1);
@@ -492,7 +514,7 @@ static int l_device_ambit_set_currents(lua_State *L)
     return 1;
 }
 
-/* device.ambit_config_detector(ch) → true or nil,err */
+/* ambit.config_detector(ch) → true or nil,err */
 static int l_device_ambit_config_detector(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
@@ -502,27 +524,91 @@ static int l_device_ambit_config_detector(lua_State *L)
     return 1;
 }
 
-/* device.ambit_get_temp(ch) → {leaf=float, chip=float} or nil,err */
-static int l_device_ambit_get_temp(lua_State *L)
+/* Fused store for small typed AMBIT queries: one event with channel
+ * "uart_<ch>", device "ambit", tag MEASUREMENT, cmd_raw in the AMBIT's own
+ * ASCII vocabulary. Returns the measure_id, or -1 on store failure. */
+static int64_t ambit_store_small(uint8_t ch, const char *cmd_ascii,
+                                 int64_t start_ms, int64_t end_ms,
+                                 const char *payload_json)
+{
+    char chan[12];
+    snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
+    int64_t mid = 0;
+    if (cmd_next_measure_id(&mid).status != ESP_OK) return -1;
+    measurement_event_desc_t d = {
+        .measure_id   = mid,
+        .channel      = chan,
+        .device       = "ambit",
+        .tag          = MEASUREMENT_TAG_MEASUREMENT,
+        .cmd_raw      = cmd_ascii,
+        .start_ms     = start_ms,
+        .end_ms       = end_ms,
+        .payload_json = payload_json,
+    };
+    return (cmd_store_event(&d).status == ESP_OK) ? mid : -1;
+}
+
+/* ambit.leaf_temp(ch [, opts]) — leaf + chip temperature (binary GET_TEMP,
+ * AMBIT ASCII "get_temp"). Stores by default ({store=false} to probe);
+ * payload {"leaf":..,"chip":..}.
+ * Returns { leaf=float, chip=float [, id] } or nil,err. */
+static int l_ambit_leaf_temp(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    bool store = lua_opt_store(L, 2);
+
+    int64_t start_ms = lua_now_ms();
     float leaf = 0, chip = 0;
     cmd_result_t res = cmd_ambit_get_temp(ch, &leaf, &chip);
+    int64_t end_ms = lua_now_ms();
     if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+
+    int64_t mid = -1;
+    if (store) {
+        char payload[64];
+        snprintf(payload, sizeof payload, "{\"leaf\":%.2f,\"chip\":%.2f}",
+                 (double)leaf, (double)chip);
+        mid = ambit_store_small(ch, "get_temp", start_ms, end_ms, payload);
+        if (mid < 0) ESP_LOGW(LUA_RUNNER_TAG, "ambit.leaf_temp ch%u: store failed", ch);
+    }
+
     lua_newtable(L);
     lua_pushnumber(L, (lua_Number)leaf);  lua_setfield(L, -2, "leaf");
     lua_pushnumber(L, (lua_Number)chip);  lua_setfield(L, -2, "chip");
+    if (mid >= 0) { lua_pushinteger(L, (lua_Integer)mid); lua_setfield(L, -2, "id"); }
     return 1;
 }
 
-/* device.ambit_get_spec(ch) → {spec={10 ints}, par=float} or nil,err */
-static int l_device_ambit_get_spec(lua_State *L)
+/* ambit.spec(ch [, opts]) — spectrum + PAR (binary GET_SPEC, AMBIT ASCII
+ * "get_par"). Stores by default ({store=false} to probe); payload
+ * {"spec":[10 ints],"par":N}.
+ * Returns { spec={10 ints}, par=float [, id] } or nil,err. */
+static int l_ambit_spec(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
+    bool store = lua_opt_store(L, 2);
+
+    int64_t start_ms = lua_now_ms();
     uint16_t spec[10] = {0};
     float par = 0;
     cmd_result_t res = cmd_ambit_get_spec(ch, spec, &par);
+    int64_t end_ms = lua_now_ms();
     if (res.status != ESP_OK) return lua_push_nil_reason(L, res.message);
+
+    int64_t mid = -1;
+    if (store) {
+        char payload[160];
+        int n = snprintf(payload, sizeof payload,
+                         "{\"spec\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],\"par\":%.2f}",
+                         spec[0], spec[1], spec[2], spec[3], spec[4],
+                         spec[5], spec[6], spec[7], spec[8], spec[9],
+                         (double)par);
+        if (n > 0 && n < (int)sizeof payload) {
+            mid = ambit_store_small(ch, "get_par", start_ms, end_ms, payload);
+        }
+        if (mid < 0) ESP_LOGW(LUA_RUNNER_TAG, "ambit.spec ch%u: store failed", ch);
+    }
+
     lua_newtable(L);
     lua_newtable(L);
     for (int i = 0; i < 10; i++) {
@@ -532,10 +618,12 @@ static int l_device_ambit_get_spec(lua_State *L)
     lua_setfield(L, -2, "spec");
     lua_pushnumber(L, (lua_Number)par);
     lua_setfield(L, -2, "par");
+    if (mid >= 0) { lua_pushinteger(L, (lua_Integer)mid); lua_setfield(L, -2, "id"); }
     return 1;
 }
 
-/* device.ambit_get_temp_raw(ch) → {leaf,leaf1,chip,raw={4 ints}} or nil,err */
+/* ambit.leaf_temp_raw(ch) → {leaf,leaf1,chip,raw={4 ints}} or nil,err
+ * (diagnostic — never stores) */
 static int l_device_ambit_get_temp_raw(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
@@ -556,7 +644,7 @@ static int l_device_ambit_get_temp_raw(lua_State *L)
     return 1;
 }
 
-/* device.ambit_get_info(ch, type) → string (raw bytes) or nil,err */
+/* ambit.get_info(ch, type) → string (raw bytes) or nil,err */
 static int l_device_ambit_get_info(lua_State *L)
 {
     uint8_t ch   = (uint8_t)luaL_checkinteger(L, 1);
@@ -569,9 +657,10 @@ static int l_device_ambit_get_info(lua_State *L)
     return 1;
 }
 
-/* device.ambit_run(ch, run_arr_table, led_persist, allow_interrupt, timeout_ms)
+/* ambit.run_raw(ch, run_arr_table, led_persist, allow_interrupt, timeout_ms)
  *   run_arr_table: flat table of integers (length must be multiple of 8)
- *   Returns: response table (same as uart_query FSM mode) or nil,err */
+ *   Returns: response table (same as ambit.query FSM mode) or nil,err.
+ *   Legacy/diagnostic — materialises arrays into Lua, never stores. */
 static int l_device_ambit_run(lua_State *L)
 {
     uint8_t ch         = (uint8_t)luaL_checkinteger(L, 1);
@@ -626,7 +715,8 @@ static int l_device_ambit_run(lua_State *L)
     return 1;
 }
 
-/* device.ambit_run_mpf(ch, length, interval, change_act, act, timeout_ms) → table */
+/* ambit.run_mpf(ch, length, interval, change_act, act, timeout_ms) → table
+ * (diagnostic — never stores) */
 static int l_device_ambit_run_mpf(lua_State *L)
 {
     uint8_t  ch         = (uint8_t)luaL_checkinteger(L, 1);
@@ -667,7 +757,7 @@ static int l_device_ambit_run_mpf(lua_State *L)
     return 1;
 }
 
-/* device.ambit_blink(ch, id, intensity) → true or nil,err */
+/* ambit.blink(ch, id, intensity) → true or nil,err */
 static int l_device_ambit_blink(lua_State *L)
 {
     uint8_t ch        = (uint8_t)luaL_checkinteger(L, 1);
@@ -679,7 +769,7 @@ static int l_device_ambit_blink(lua_State *L)
     return 1;
 }
 
-/* device.ambit_calibrate_baseline(ch) → true or nil,err */
+/* ambit.calibrate_baseline(ch) → true or nil,err */
 static int l_device_ambit_calibrate_baseline(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
@@ -689,7 +779,7 @@ static int l_device_ambit_calibrate_baseline(lua_State *L)
     return 1;
 }
 
-/* device.ambit_actinic(ch, type, var, var2) → true or nil,err */
+/* ambit.actinic(ch, type, var, var2) → true or nil,err */
 static int l_device_ambit_actinic(lua_State *L)
 {
     uint8_t ch   = (uint8_t)luaL_checkinteger(L, 1);
@@ -702,7 +792,7 @@ static int l_device_ambit_actinic(lua_State *L)
     return 1;
 }
 
-/* device.ambit_set_metadata(ch, metadata_string) → true or nil,err */
+/* ambit.set_metadata(ch, metadata_string) → true or nil,err */
 static int l_device_ambit_set_metadata(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
@@ -715,20 +805,6 @@ static int l_device_ambit_set_metadata(lua_State *L)
 }
 
 /* ── db.* bindings ───────────────────────────────────────────────────── */
-
-/* Take an optional Lua field at index -1 (table on top of stack). Pops it.
- * Writes a non-empty string to `out` (truncated to cap-1). */
-static void lua_get_optional_string(lua_State *L, const char *key,
-                                    char *out, size_t cap)
-{
-    lua_getfield(L, -1, key);
-    if (lua_isstring(L, -1)) {
-        const char *s = lua_tostring(L, -1);
-        strncpy(out, s, cap - 1);
-        out[cap - 1] = '\0';
-    }
-    lua_pop(L, 1);
-}
 
 /* Recursively convert the Lua value at `idx` to a cJSON node. Tables with a
  * non-zero sequence length become JSON arrays; all other tables become JSON
@@ -780,59 +856,40 @@ static cJSON *lua_to_cjson(lua_State *L, int idx)
     }
 }
 
-/* db.store_event{ sensor=, device=, data={...}, metadata=, measure_id=,
- *                 start_ticks=, end_ticks= }
+/* db.store_event{ data={...}, metadata=, channel= }
  *
- *   sensor       required string ("BME280", "AMBIT", …)
- *   data         required table → JSON object of quantities (the payload)
- *   device       optional string; "" / nil = onboard sensor
- *   metadata     optional table → JSON object (or omit)
- *   measure_id   optional int; auto-allocated when omitted
- *   start_ticks  optional UTC-ms; defaults to now
- *   end_ticks    optional UTC-ms; defaults to start_ticks
+ * Custom/derived events only — typed measurement commands (ambit.spec,
+ * ambit.run, device.bme280, …) store themselves. Provenance is firmware-
+ * filled: tag = MEASUREMENT, ticks = now, measure_id auto-allocated.
+ *
+ *   data      required table → JSON object of quantities (the payload)
+ *   metadata  optional table → JSON object
+ *   channel   optional integer 0..3 — attributes the event to a UART port
+ *             ("uart_<n>"); omit for onboard/derived events (JSON null)
  *
  * Returns measure_id on success, or nil,reason. */
 static int l_db_store_event(lua_State *L)
 {
     luaL_checktype(L, 1, LUA_TTABLE);
 
-    /* sensor — required */
-    char sensor[24] = {0};
-    lua_get_optional_string(L, "sensor", sensor, sizeof(sensor));
-    if (sensor[0] == '\0') {
-        return lua_push_nil_reason(L, "store_event: 'sensor' (string) required");
+    /* channel — optional integer → "uart_<n>" */
+    char chan[12] = {0};
+    lua_getfield(L, 1, "channel");
+    if (lua_isinteger(L, -1) || lua_isnumber(L, -1)) {
+        lua_Integer ch = lua_tointeger(L, -1);
+        if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+            lua_pop(L, 1);
+            return lua_push_nil_reason(L, "store_event: channel out of range");
+        }
+        snprintf(chan, sizeof chan, "uart_%d", (int)ch);
     }
+    lua_pop(L, 1);
 
-    /* device — optional ("" / nil = onboard) */
-    char device[24] = {0};
-    lua_get_optional_string(L, "device", device, sizeof(device));
-
-    /* measure_id — optional; auto-allocate when missing */
     int64_t measure_id = 0;
-    lua_getfield(L, 1, "measure_id");
-    bool has_id = (lua_isinteger(L, -1) || lua_isnumber(L, -1));
-    if (has_id) measure_id = (int64_t)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-    if (!has_id) {
-        cmd_result_t idr = cmd_next_measure_id(&measure_id);
-        if (idr.status != ESP_OK) return lua_push_nil_reason(L, idr.message);
-    }
+    cmd_result_t idr = cmd_next_measure_id(&measure_id);
+    if (idr.status != ESP_OK) return lua_push_nil_reason(L, idr.message);
 
-    /* start_ticks / end_ticks — optional; default to now */
-    int64_t now_ms;
-    {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        now_ms = (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
-    }
-    lua_getfield(L, 1, "start_ticks");
-    int64_t start_ms = (lua_isinteger(L, -1) || lua_isnumber(L, -1))
-                       ? (int64_t)lua_tointeger(L, -1) : now_ms;
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "end_ticks");
-    int64_t end_ms = (lua_isinteger(L, -1) || lua_isnumber(L, -1))
-                     ? (int64_t)lua_tointeger(L, -1) : start_ms;
-    lua_pop(L, 1);
+    const int64_t now = lua_now_ms();
 
     /* data — required table → payload JSON object */
     lua_getfield(L, 1, "data");
@@ -856,16 +913,12 @@ static int l_db_store_event(lua_State *L)
     }
     lua_pop(L, 1);
 
-    /* Schema-v2 shim (Phase 1): the legacy Lua 'sensor' string rides in cmd_raw
-     * so its discriminator survives the transition; tag is firmware-fixed.
-     * Phase 2 slims the Lua API to { data, metadata, channel }. */
     measurement_event_desc_t d = {
         .measure_id    = measure_id,
-        .device        = device,
+        .channel       = chan,
         .tag           = MEASUREMENT_TAG_MEASUREMENT,
-        .cmd_raw       = sensor,
-        .start_ms      = start_ms,
-        .end_ms        = end_ms,
+        .start_ms      = now,
+        .end_ms        = now,
         .metadata_json = metadata_json,
         .payload_json  = payload_json,
     };
@@ -898,15 +951,18 @@ static int l_db_next_id(lua_State *L)
 
 /* ── module registration ─────────────────────────────────────────────── */
 
+/* device.* — ONBOARD I/O only (schema-v2 namespacing: per-protocol driver
+ * modules own their sensors; ambit.* owns everything AMBIT, uart.* is raw
+ * transport). device.bme280 is a fused measurement command (stores by
+ * default); the rest is I/O and diagnostics. */
 static void lua_register_device_module(lua_State *L)
 {
     static const luaL_Reg device_api[] = {
         {"set_rgb",                l_device_set_rgb},
         {"read_rtc",               l_device_read_rtc},
         {"status",                 l_device_status},
-        {"read_env",               l_device_read_env},
+        {"bme280",                 l_device_bme280},
         {"power",                  l_device_power},
-        {"record_env",             l_device_record_env},
         {"sd_ready",               l_device_sd_ready},
         {"sleep_ms",               l_device_sleep_ms},
         {"log",                    l_device_log},
@@ -914,29 +970,24 @@ static void lua_register_device_module(lua_State *L)
         {"uptime_ms",              l_device_uptime_ms},
         {"status_report",          l_device_status_report},
         {"PWM",                    l_device_pwm},
-        /* UART raw */
-        {"uart_ping",              l_device_uart_ping},
-        {"uart_query",             l_device_uart_query},
-        {"uart_status",            l_device_uart_status},
-        /* Ambit typed commands */
-        {"ambit_set_gains",        l_device_ambit_set_gains},
-        {"ambit_set_currents",     l_device_ambit_set_currents},
-        {"ambit_config_detector",  l_device_ambit_config_detector},
-        {"ambit_get_temp",         l_device_ambit_get_temp},
-        {"ambit_get_spec",         l_device_ambit_get_spec},
-        {"ambit_get_temp_raw",     l_device_ambit_get_temp_raw},
-        {"ambit_get_info",         l_device_ambit_get_info},
-        {"ambit_run",              l_device_ambit_run},
-        {"ambit_run_mpf",          l_device_ambit_run_mpf},
-        {"ambit_blink",            l_device_ambit_blink},
-        {"ambit_calibrate_baseline", l_device_ambit_calibrate_baseline},
-        {"ambit_actinic",          l_device_ambit_actinic},
-        {"ambit_set_metadata",     l_device_ambit_set_metadata},
         {NULL, NULL},
     };
 
     luaL_newlib(L, device_api);
     lua_setglobal(L, "device");
+}
+
+/* uart.* — raw transport for not-yet-drivered sensors. Never stores. */
+static void lua_register_uart_module(lua_State *L)
+{
+    static const luaL_Reg uart_api[] = {
+        {"query",  l_uart_query},          /* ASCII line query */
+        {"status", l_device_uart_status},  /* per-channel connection state */
+        {NULL, NULL},
+    };
+
+    luaL_newlib(L, uart_api);
+    lua_setglobal(L, "uart");
 }
 
 static void lua_register_db_module(lua_State *L)
@@ -949,16 +1000,6 @@ static void lua_register_db_module(lua_State *L)
 
     luaL_newlib(L, db_api);
     lua_setglobal(L, "db");
-}
-
-/* Parse "<key><number>" out of an ASCII line (e.g. key "T:" from
- * "T:23.45,F:.."). Returns true and writes *out when found. */
-static bool ambit_parse_field(const char *line, const char *key, double *out)
-{
-    const char *p = strstr(line, key);
-    if (p == NULL) return false;
-    *out = strtod(p + strlen(key), NULL);
-    return true;
 }
 
 /* Array index → JSON tag, matching the ambit fw AMBYTE send order
@@ -994,7 +1035,9 @@ static char *s_ambit_payload;
  * every array into one JSON payload keyed by tag (ENV decoded to leaf-temp degC).
  *
  *   segments : array of { pulses=, freq=, actinic= }  (positional [1],[2],[3] ok)
- *   opts     : { persist=false, store=true, timeout_ms=30000, interrupt=false }
+ *   opts     : { persist=false, store=true, timeout_ms=30000, interrupt=false,
+ *                metadata={...} }   -- metadata: extra keys merged into the
+ *                                      event's {"segments":[…]} metadata object
  *
  * Returns { points=<fluor len>, stored=K, leaf_temp=degC, arrays=N }. The per-
  * point arrays are persisted to the DB (the point of the run), not materialised
@@ -1021,6 +1064,40 @@ static uint8_t ambit_actinic_to_dac(lua_Integer actinic, float par_coef)
  * the run metadata (segments JSON) and the measurement start time. */
 static char    s_ambit_meta[UART_SENSOR_NUM_CHANNELS][768];
 static int64_t s_ambit_start_ms[UART_SENSOR_NUM_CHANNELS];
+
+/* Merge the script's opts.metadata table (at stack index `opts_idx`) into the
+ * firmware-built segments metadata: "{"segments":[…]}" + "{user}" →
+ * "{"segments":[…],user-body}". Skipped (with a warning) when the merged
+ * string would exceed `cap`; the segments part always survives. */
+static void ambit_meta_merge_user(lua_State *L, int opts_idx, char *meta, size_t cap)
+{
+    if (!lua_istable(L, opts_idx)) return;
+    lua_getfield(L, opts_idx, "metadata");
+    if (lua_istable(L, -1)) {
+        cJSON *md = lua_to_cjson(L, -1);
+        if (md != NULL) {
+            char *mj = cJSON_PrintUnformatted(md);
+            cJSON_Delete(md);
+            if (mj != NULL) {
+                size_t mlen = strlen(meta), ulen = strlen(mj);
+                /* user "{...}" must be non-empty; meta always ends in '}' */
+                if (ulen > 2 && mlen >= 2) {
+                    if (mlen + ulen - 1 < cap) {
+                        meta[mlen - 1] = ',';          /* replace closing '}' */
+                        memcpy(meta + mlen, mj + 1, ulen - 1);  /* skip user '{' */
+                        meta[mlen + ulen - 1] = '\0';
+                    } else {
+                        ESP_LOGW(LUA_RUNNER_TAG,
+                                 "opts.metadata dropped: merged metadata > %uB",
+                                 (unsigned)cap);
+                    }
+                }
+                cJSON_free(mj);
+            }
+        }
+    }
+    lua_pop(L, 1);
+}
 
 /* Build a malloc'd run_arr (caller frees) of nseg*8 bytes plus a metadata JSON
  * string, from the Lua segments table at `seg_idx`, for channel `ch` (its actinic
@@ -1233,10 +1310,9 @@ static int l_ambit_run(lua_State *L)
 
     char metadata_json[768];
     uint8_t *run_arr = ambit_build_run_arr(L, 2, ch, nseg, metadata_json, sizeof metadata_json);
+    ambit_meta_merge_user(L, 3, metadata_json, sizeof metadata_json);
 
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    int64_t start_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    int64_t start_ms = lua_now_ms();
 
     /* Binary AMBYTE run (cmd 21): the ambit streams each result array back over
      * the FSM handshake as raw uint32 LE — no ASCII text buffer, no cJSON tree.
@@ -1246,8 +1322,7 @@ static int l_ambit_run(lua_State *L)
                                      allow_interrupt, &resp, timeout_ms);
     free(run_arr);
 
-    gettimeofday(&tv, NULL);
-    int64_t end_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    int64_t end_ms = lua_now_ms();
 
     if (res.status != ESP_OK) {
         uart_sensor_response_free(&resp);
@@ -1261,7 +1336,8 @@ static int l_ambit_run(lua_State *L)
  * and return true once the ambit acks (cmd 22). The run executes on the ambit
  * to completion; collect it later with ambit.poll + ambit.fetch. Stashes the
  * run's metadata + start time per channel for the eventual store.
- *   opts : { persist=false, interrupt=false, timeout_ms=3000 } */
+ *   opts : { persist=false, interrupt=false, timeout_ms=3000, metadata={...} }
+ *   (metadata: extra keys merged into the stored event's segments metadata) */
 static int l_ambit_trigger(lua_State *L)
 {
     uint8_t ch = (uint8_t)luaL_checkinteger(L, 1);
@@ -1289,10 +1365,9 @@ static int l_ambit_trigger(lua_State *L)
 
     uint8_t *run_arr = ambit_build_run_arr(L, 2, ch, nseg,
                                            s_ambit_meta[ch], sizeof s_ambit_meta[ch]);
+    ambit_meta_merge_user(L, 3, s_ambit_meta[ch], sizeof s_ambit_meta[ch]);
 
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    s_ambit_start_ms[ch] = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    s_ambit_start_ms[ch] = lua_now_ms();
 
     cmd_result_t res = cmd_ambit_trigger(ch, run_arr, (uint8_t)nseg, persist,
                                          allow_interrupt, timeout_ms);
@@ -1352,9 +1427,7 @@ static int l_ambit_fetch(lua_State *L)
         return lua_push_nil_reason(L, res.message);
     }
 
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    int64_t end_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    int64_t end_ms = lua_now_ms();
 
     return ambit_decode_store_push(L, &resp, ch, store,
                                    s_ambit_start_ms[ch], end_ms, s_ambit_meta[ch],
@@ -1362,9 +1435,10 @@ static int l_ambit_fetch(lua_State *L)
 }
 
 /* ── ambit.* bindings ────────────────────────────────────────────────
- * Exposes the AMBIT binary uart_query (moved from device.uart_query) and the
- * high-level array run. The typed ambit_* helpers still live under device;
- * consolidating them all here is a separate cleanup. */
+ * The one home for everything AMBIT (protocol-driver namespacing). All
+ * functions take the channel as first argument. Measurement commands
+ * (spec, leaf_temp, run, fetch) store by default; config/diagnostic
+ * commands never store. */
 static void lua_register_ambit_module(lua_State *L)
 {
     /* Reserve the run payload buffer up front, while the heap is still
@@ -1379,11 +1453,29 @@ static void lua_register_ambit_module(lua_State *L)
     }
 
     static const luaL_Reg ambit_api[] = {
-        {"uart_query", l_ambit_uart_query},
-        {"run",        l_ambit_run},
-        {"trigger",    l_ambit_trigger},   /* parallel protocol: start retained run */
-        {"poll",       l_ambit_poll},      /*   "    "    "    : query async state  */
-        {"fetch",      l_ambit_fetch},     /*   "    "    "    : collect + store     */
+        /* presence / identity */
+        {"ping",          l_device_uart_ping},        /* 0xAA wake → 0x80 ack */
+        {"get_info",      l_device_ambit_get_info},
+        /* measurements (fused store, {store=false} to opt out) */
+        {"spec",          l_ambit_spec},              /* cmd_raw "get_par"  */
+        {"leaf_temp",     l_ambit_leaf_temp},         /* cmd_raw "get_temp" */
+        {"run",           l_ambit_run},               /* cmd_raw "arrun"    */
+        {"trigger",       l_ambit_trigger},   /* parallel protocol: start retained run */
+        {"poll",          l_ambit_poll},      /*   "    "    "    : query async state  */
+        {"fetch",         l_ambit_fetch},     /*   "    "    "    : collect + store    */
+        /* diagnostics (never store) */
+        {"leaf_temp_raw", l_device_ambit_get_temp_raw},
+        {"query",         l_ambit_uart_query},        /* raw 8-byte binary frames */
+        {"run_raw",       l_device_ambit_run},        /* legacy raw run_arr run   */
+        {"run_mpf",       l_device_ambit_run_mpf},
+        /* configuration / actions */
+        {"set_gains",     l_device_ambit_set_gains},
+        {"set_currents",  l_device_ambit_set_currents},
+        {"config_detector", l_device_ambit_config_detector},
+        {"blink",         l_device_ambit_blink},
+        {"calibrate_baseline", l_device_ambit_calibrate_baseline},
+        {"actinic",       l_device_ambit_actinic},
+        {"set_metadata",  l_device_ambit_set_metadata},
         {NULL, NULL},
     };
 
@@ -1586,6 +1678,7 @@ static void lua_runner_task(void *arg)
 
     luaL_openlibs(L);
     lua_register_device_module(L);
+    lua_register_uart_module(L);
     lua_register_db_module(L);
     lua_register_ambit_module(L);
     lua_register_sync_module(L);

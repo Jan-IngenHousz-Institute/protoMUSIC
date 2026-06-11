@@ -1,15 +1,23 @@
 -- main.lua — measurement schedule for the Ambyte (runs as /sdcard/main.lua).
 --
 -- EXECUTION MODEL
---   The firmware bundles a scheduler (`sched`) and exposes four globals:
---     device.*  on-board I/O      (LED, BME280, RTC, MP2731 power, AMBIT helpers)
---     ambit.*   AMBIT sensor runs (binary protocol over UART)
---     db.*      the event log     (db.store_event, db.next_id)
+--   The firmware bundles a scheduler (`sched`) and exposes five globals:
+--     device.*  on-board I/O      (LED, BME280, RTC, MP2731 power)
+--     ambit.*   everything AMBIT  (ping/spec/leaf_temp/run/trigger/poll/fetch
+--                                  + config/diagnostics; channel is always arg 1)
+--     uart.*    raw serial        (uart.query for not-yet-drivered sensors)
+--     db.*      the event log     (db.store_event for CUSTOM events, db.next_id)
 --     sync.*    RTC-based timing   (sunrise/sunset, intervals, wait)
 --   This file registers jobs with `sched`, then calls sched.run() (never returns).
 --
---   STORE, DON'T PUBLISH. Lua only ever *measures and stores* (db.store_event /
---   ambit.run{store=true}). It never talks to MQTT. A background task
+--   MEASUREMENT COMMANDS STORE THEMSELVES. ambit.spec / ambit.leaf_temp /
+--   ambit.run / ambit.fetch / device.bme280 persist their result as one event
+--   by default (pass {store=false} to probe without storing); the firmware
+--   stamps the provenance (channel, device, cmd_raw, tag, ticks).
+--   db.store_event{ data=, metadata=, channel= } is for derived/custom events
+--   only. Raw transport (uart.query, ambit.query) never stores.
+--
+--   STORE, DON'T PUBLISH. Lua never talks to MQTT. A background task
 --   (sync_runner) is the sole publisher: it drains stored events to the cloud
 --   when, and only when, the device is on external power (the "publish power
 --   gate" — VIN present). On battery, events stay in the log and drain the next
@@ -45,21 +53,17 @@ local function blink()
     device.set_rgb(0, 100, 0); device.sleep_ms(100); device.set_rgb(0, 0, 0)
 end
 
--- One spectrum + PAR per connected AMBIT, each stored as its own event.
+-- One spectrum + PAR per connected AMBIT. ambit.spec stores its own event
+-- (channel/device/cmd_raw="get_par" stamped by the firmware).
 local function record_spectra()
     local stored = 0
     for ch = 0, NUM_CHANNELS - 1 do
-        if device.uart_ping(ch) then
-            local s, err = device.ambit_get_spec(ch)
+        if ambit.ping(ch) then
+            local s, err = ambit.spec(ch)
             if s then
-                local id = db.store_event{
-                    sensor = "AMBIT",
-                    device = string.format("AMBIT%d", ch + 1),
-                    data   = { spec = s.spec, par = s.par },
-                }
-                stored = stored + (id and 1 or 0)
+                stored = stored + (s.id and 1 or 0)
                 device.log(string.format("spectra ch%d: PAR=%.2f%s",
-                           ch, s.par, id and (" id=" .. id) or " store failed"))
+                           ch, s.par, s.id and (" id=" .. s.id) or " store failed"))
             else
                 device.log(string.format("spectra ch%d: read failed: %s", ch, err or "?"))
             end
@@ -100,7 +104,7 @@ local function run_trace(tag, trace)
     local pending = {}                 -- ch -> t0 (uptime_ms at trigger)
     local count   = 0
     for ch = 0, NUM_CHANNELS - 1 do
-        if device.uart_ping(ch) then
+        if ambit.ping(ch) then
             local ok, err = ambit.trigger(ch, trace, { interrupt = false })
             if ok then
                 pending[ch] = device.uptime_ms()
@@ -149,14 +153,15 @@ local function run_trace(tag, trace)
     device.measurement_window(false)
 end
 
--- Periodic device status, stored as a sensor="status" event. db.store_event
--- stamps it with the capture time in startTicks; sync_runner publishes it under
--- the same power gate as measurements (so on battery these queue and flush once
--- external power returns). Also logged for live visibility on the console.
+-- Periodic device status, stored as a custom event (identified downstream by
+-- its data keys until the Phase-4 firmware heartbeat takes over with
+-- tag=STATUS). db.store_event stamps the capture time in startTicks;
+-- sync_runner publishes it under the same power gate as measurements (so on
+-- battery these queue and flush once external power returns).
 local function status_heartbeat()
     local s = device.status_report()
     if s then
-        db.store_event{ sensor = "status", data = s }
+        db.store_event{ data = s }
         device.log(string.format("status: src=%s gate=%s Vbat=%.2fV Iin=%dmA",
                    s.input_present and "external" or "battery",
                    s.publish_gate and "OPEN" or "CLOSED",

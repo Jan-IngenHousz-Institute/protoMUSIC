@@ -112,11 +112,12 @@ cmd_result_t cmd_read_power(power_reading_t *out);
  * resolution is chosen automatically from freq_hz (up to 14-bit). */
 cmd_result_t cmd_pwm(float duty_pct, uint32_t freq_hz, bool enable);
 
-/* Read BME280 and persist temperature/humidity/pressure as one event row
- * (payload {"temperature":..,"humidity":..,"pressure":..}). The background sync
- * task (sync_runner) publishes it as one MQTT message. Pass NULL to ignore the
- * allocated measure_id. */
-cmd_result_t cmd_record_env(int64_t *out_measure_id);
+/* Read BME280 and persist temperature/humidity/pressure as one event
+ * (payload {"temperature":..,"humidity":..,"pressure":..}, cmd_raw
+ * "device.bme280"). The background sync task (sync_runner) publishes it as one
+ * MQTT message. Either out-pointer may be NULL; out_reading receives the
+ * measured values (this is the fused-store backing of Lua device.bme280). */
+cmd_result_t cmd_record_env(int64_t *out_measure_id, measurement_t *out_reading);
 
 /* Returns true when the SD card is mounted (and therefore the SQLite event DB
  * is writable). main.lua should consult this before starting a measurement
@@ -174,23 +175,18 @@ cmd_result_t cmd_uart_query(uint8_t channel, const uint8_t cmd[8],
 cmd_result_t cmd_uart_ping(uint8_t channel, bool *connected);
 cmd_result_t cmd_uart_status(void);
 
-/* Generic ASCII line-oriented UART query.
+/* Generic ASCII line-oriented UART query (transport/diagnostic — NEVER stores;
+ * schema-v2 rule: measurement commands store, transport commands don't).
  *
  * Sends `cmd` followed by `terminator` over UART channel `channel`, then
  * reads one line (until `terminator` again) into `out_resp` or aborts after
  * `timeout_ms`. If the first line echoes the sent command verbatim it is
- * discarded and the next line is returned.
- *
- * When `save` is true, the response (or an empty string on timeout) is
- * stored as a single measurement event with
- *   channel = "uart_<N>", tag = MEASUREMENT, cmd_raw = the literal command,
- *   payload = {"response":"<text>"}
- * via cmd_store_event. `out_resp` is always set (NUL-terminated, possibly
- * empty) on return.
+ * discarded and the next line is returned. `out_resp` is always set
+ * (NUL-terminated, possibly empty) on return.
  */
 cmd_result_t cmd_uart_text_query(uint8_t channel,
                                  const char *cmd, const char *terminator,
-                                 uint32_t timeout_ms, bool save,
+                                 uint32_t timeout_ms,
                                  char *out_resp, size_t resp_cap,
                                  size_t *resp_len);
 

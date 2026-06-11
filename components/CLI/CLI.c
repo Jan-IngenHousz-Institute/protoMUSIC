@@ -266,7 +266,7 @@ static int cli_cmd_record_env(int argc, char **argv)
     }
 
     int64_t mid = 0;
-    cmd_result_t res = cmd_record_env(&mid);
+    cmd_result_t res = cmd_record_env(&mid, NULL);
     if (res.status != ESP_OK) {
         printf("record_env failed: %s\r\n", res.message);
         return 1;
@@ -411,8 +411,7 @@ static int cli_cmd_uart_status(int argc, char **argv)
 /* uart_query <ch> <message> [timeout_ms=1000]
  *   Sends the ASCII line <message> (single token, LF-terminated) over channel
  *   <ch> and prints the reply. timeout_ms is optional and defaults to 1000.
- *   Always passes save=false so manual probing doesn't pollute the
- *   measurements DB. */
+ *   Transport-only — text queries never store (schema-v2 rule). */
 static int cli_cmd_uart_query(int argc, char **argv)
 {
     if (argc < 3 || argc > 4) {
@@ -437,7 +436,7 @@ static int cli_cmd_uart_query(int argc, char **argv)
     char   resp[256];
     size_t resp_len = 0;
     cmd_result_t res = cmd_uart_text_query((uint8_t)ch, cmd, "\n",
-                                           (uint32_t)timeout_ms, false,
+                                           (uint32_t)timeout_ms,
                                            resp, sizeof(resp), &resp_len);
 
     if (res.status == ESP_ERR_TIMEOUT) {
@@ -792,7 +791,7 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t uart_query_cmd = {
         .command = "uart_query",
-        .help    = "uart_query <ch> <message> [timeout_ms=1000]  ASCII line query (LF-terminated, save=false)",
+        .help    = "uart_query <ch> <message> [timeout_ms=1000]  ASCII line query (LF-terminated, never stores)",
         .func    = cli_cmd_uart_query,
     };
     static const esp_console_cmd_t ambit_temp_cmd = {

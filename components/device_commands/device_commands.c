@@ -10,7 +10,6 @@
 #include <time.h>
 
 #include "ambit_protocol.h"
-#include "cJSON.h"
 
 #include "esp_log.h"
 #include "esp_rom_crc.h"
@@ -392,7 +391,7 @@ bool device_commands_publish_power_ok(void)
     return s_pub_gate_open;
 }
 
-cmd_result_t cmd_record_env(int64_t *out_measure_id)
+cmd_result_t cmd_record_env(int64_t *out_measure_id, measurement_t *out_reading)
 {
     if (!s_initialized || s_cfg.read_env == NULL ||
         s_cfg.store_event == NULL || s_cfg.next_id == NULL) {
@@ -406,6 +405,7 @@ cmd_result_t cmd_record_env(int64_t *out_measure_id)
     if (err != ESP_OK) {
         return make_result(err, "env read failed: %s", esp_err_to_name(err));
     }
+    if (out_reading) *out_reading = m;
 
     int64_t mid = 0;
     if ((err = s_cfg.next_id(&mid)) != ESP_OK) {
@@ -855,12 +855,12 @@ cmd_result_t cmd_uart_status(void)
 }
 
 /* Generic ASCII line-oriented query — sends "<cmd><terminator>", reads one
- * line back, discards the first line if it echoes the command verbatim, and
- * optionally stores the response in the measurements DB. See
- * cmd_uart_text_query() in device_commands.h for the contract. */
+ * line back, and discards the first line if it echoes the command verbatim.
+ * Transport/diagnostic only: NEVER stores (schema-v2 rule — measurement
+ * commands store, transport commands don't). See device_commands.h. */
 cmd_result_t cmd_uart_text_query(uint8_t channel,
                                  const char *cmd, const char *terminator,
-                                 uint32_t timeout_ms, bool save,
+                                 uint32_t timeout_ms,
                                  char *out_resp, size_t resp_cap,
                                  size_t *resp_len)
 {
@@ -875,9 +875,6 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
         return make_result(ESP_ERR_INVALID_ARG, "bad args");
     }
 
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    int64_t start_ms_val = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
     int64_t t0_us = esp_timer_get_time();  /* monotonic, for echo-retry budget */
     *resp_len = 0;
     out_resp[0] = '\0';
@@ -911,48 +908,10 @@ cmd_result_t cmd_uart_text_query(uint8_t channel,
     }
     device_commands_measurement_end();
 
-    /* On hard error (other than timeout) propagate without saving. */
+    /* On hard error (other than timeout) propagate. */
     if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
         return make_result(err, "uart_text_query ch%u failed: %s",
                            channel, esp_err_to_name(err));
-    }
-
-    /* save=true: store one event with channel="uart_<N>" and cmd_raw = the
-     * literal command. On timeout the payload carries response="" (empty
-     * string) to indicate "queried but nothing came back". */
-    if (save && s_cfg.store_event != NULL && s_cfg.next_id != NULL) {
-        int64_t mid = 0;
-        if (s_cfg.next_id(&mid) == ESP_OK) {
-            gettimeofday(&tv, NULL);
-            int64_t end_ms_val = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-            char chan[12];
-            snprintf(chan, sizeof(chan), "uart_%u", channel);
-            /* One event, payload {"response":"..."}; cJSON escapes the string. */
-            cJSON *p = cJSON_CreateObject();
-            if (p != NULL) {
-                cJSON_AddStringToObject(p, "response", out_resp);
-                char *pj = cJSON_PrintUnformatted(p);
-                cJSON_Delete(p);
-                if (pj != NULL) {
-                    measurement_event_desc_t d = {
-                        .measure_id   = mid,
-                        .channel      = chan,
-                        .tag          = MEASUREMENT_TAG_MEASUREMENT,
-                        .cmd_raw      = cmd,
-                        .start_ms     = start_ms_val,
-                        .end_ms       = end_ms_val,
-                        .payload_json = pj,
-                    };
-                    esp_err_t store_err = s_cfg.store_event(&d);
-                    free(pj);
-                    if (store_err != ESP_OK) {
-                        ESP_LOGW(TAG, "uart_text_query: save failed: %s", esp_err_to_name(store_err));
-                    } else {
-                        notify_sync();   /* wake the publisher */
-                    }
-                }
-            }
-        }
     }
 
     if (err == ESP_ERR_TIMEOUT) {

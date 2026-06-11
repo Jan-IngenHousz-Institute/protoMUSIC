@@ -5,10 +5,11 @@ builder is `cmd_mqtt_publish_next_event()` in
 [components/device_commands/device_commands.c](../components/device_commands/device_commands.c)
 — if this document and the code disagree, the code wins.
 
-> Schema v2 wire format (Phase 1 of [payload-v2-plan.md](payload-v2-plan.md))
-> landed 2026-06-11. The Lua API, device discovery, and the firmware heartbeat
-> are later phases — the **Transitional notes** below mark what still carries
-> v1 shims.
+> Schema v2 wire format (Phase 1) and the Lua API surface (Phase 2:
+> `ambit.*` consolidation, fused stores, slimmed `db.store_event`) of
+> [payload-v2-plan.md](payload-v2-plan.md) landed 2026-06-11. Device
+> discovery (Phase 3) and the firmware heartbeat (Phase 4) are pending —
+> the **Transitional note** below marks the remaining shim.
 
 ## Model: store, then publish
 
@@ -96,27 +97,31 @@ Field notes:
 `data` is whatever the producer serialises; the shapes below are what the
 current firmware paths and the shipped schedule script produce.
 
+Measurement commands **store by default** (`{store=false}` to probe without
+storing); transport/diagnostic commands (`uart.query`, `ambit.query`,
+`ambit.run_raw`, `ambit.leaf_temp_raw`, …) never store. `db.store_event{
+data=, metadata=, channel= }` remains for derived/custom script events.
+
 | Event | `channel` | `device` | `cmd_raw` | `data` |
 |---|---|---|---|---|
-| AMBIT fluorescence run (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `arrun` | `{"env":[…],"s_fluo":[…],"r_fluo":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` |
-| BME280 via CLI/`device.record_env` | `null` | `null` | `device.bme280` | `{"temperature":f,"humidity":f,"pressure":f}` |
-| UART text query (`save=true`) | `uart_<n>` | `null` | the literal command | `{"response":"…"}` (empty string on timeout) |
-| Lua `db.store_event{}` (spectra, heartbeat, custom) | `null` | script `device` field | *transitional:* the legacy `sensor` string | script-defined |
+| AMBIT trace (`ambit.run` / `trigger`+`fetch`) | `uart_<ch>` | `ambit` | `arrun` | `{"env":[…],"s_fluo":[…],"r_fluo":[…],"sun":[…],"leaf":[…],"s_730":[…],"r_730":[…],"timing":[…]}` + `metadata.segments` |
+| Spectrum + PAR (`ambit.spec`) | `uart_<ch>` | `ambit` | `get_par` | `{"spec":[10 ints],"par":f}` |
+| Leaf temperature (`ambit.leaf_temp`) | `uart_<ch>` | `ambit` | `get_temp` | `{"leaf":f,"chip":f}` |
+| BME280 (`device.bme280` / CLI `record_env`) | `null` | `null` | `device.bme280` | `{"temperature":f,"humidity":f,"pressure":f}` |
+| Lua `db.store_event{}` (heartbeat, custom/derived) | `uart_<n>` if `channel=` given, else `null` | `null` (Phase 3 attaches the cache) | `null` | script-defined |
 
 `cmd_raw` uses the **target device's own command vocabulary** — for the AMBIT,
 the ASCII command names from its firmware (`do_command.h`): `arrun` for any
 trace run (the binary sync run, cmd 21, and the async trigger/fetch pair,
-cmds 22/24, are the same stimulus — sync vs async is transport). Phase 2's
-fused commands follow suit: `get_par` (spectrum+PAR), `get_temp` (leaf temp).
-Onboard sources use the firmware's logical name (`device.bme280`).
+cmds 22/24, are the same stimulus — sync vs async is transport), `get_par`,
+`get_temp`. Onboard sources use the firmware's logical name (`device.bme280`).
+The AMBIT run/trigger `opts.metadata` table is merged into the event's
+`{"segments":[…]}` metadata object.
 
-**Transitional notes (until Phase 2/4 of the plan):**
-- `db.store_event`'s legacy `sensor` string (e.g. `"status"`, `"AMBIT"`)
-  rides in `cmd_raw` so its discriminator survives; the Lua API slims to
-  `{ data, metadata, channel }` in Phase 2.
-- The status heartbeat is still a script job storing via `db.store_event`
-  (so it appears with `tag:"MEASUREMENT"`, `cmd_raw:"status"`); it becomes a
-  firmware task with `tag:"STATUS"` in Phase 4.
+**Transitional note (until Phase 4):** the status heartbeat is still a script
+job storing via `db.store_event` — it appears with `tag:"MEASUREMENT"` and
+null provenance, identifiable by its data keys (`battery_v`, `publish_gate`,
+…). It becomes a firmware task with `tag:"STATUS"` in Phase 4.
 
 ### AMBIT `data` keys
 
