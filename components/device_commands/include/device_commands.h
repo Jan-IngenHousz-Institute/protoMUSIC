@@ -218,9 +218,18 @@ cmd_result_t cmd_ambit_get_temp_raw(uint8_t ch, float *leaf, float *leaf1,
 cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
                                  uint8_t *out, size_t out_size, size_t *out_len);
 
-/* Cached per-channel AMBIT identity for event metadata. These values are static
- * per sensor, so they're fetched once (cmd 33: FW info + calibration) and cached
- * — a measurement reads them with zero UART cost. */
+/* Cached per-channel AMBIT identity + config for event provenance.
+ *
+ * Two halves with different lifecycles:
+ *  - identity/calibration (valid, device_id, fw_version, cal_version, ambit_name,
+ *    actinic_coef): STATIC per connection. Fetched once via cmd 33 (FW + calib)
+ *    and cached; a measurement reads them with zero UART cost. On the first
+ *    successful fetch after a (re)connect the firmware emits one DEVICE_INFO
+ *    event carrying the full calibration.
+ *  - gains/currents: MUTABLE, but only the ambyte changes them (cmd 1/cmd 2;
+ *    the AMBIT has no read-back). Tracked at set-time, so they're known without
+ *    a query. Reset to "unset" on (re)connect (the AMBIT booted with its own
+ *    defaults, unknown to us, until a set_gains/set_currents). */
 typedef struct {
     bool     valid;
     char     device_id[18];   /* "AA:BB:CC:DD:EE:FF" from the AMBIT efuse MAC */
@@ -228,12 +237,18 @@ typedef struct {
     uint32_t cal_version;      /* CRC32 of the calibration struct (bumps on any cal change) */
     char     ambit_name[20];   /* calibration ambit_name, e.g. "AmbitV003" */
     float    actinic_coef;     /* PAR(µmol)→DAC byte = actinic_coef × PAR; 0 if cal unread */
+    bool     gains_set;        /* true once the ambyte has set gains this connection */
+    uint8_t  gains[6];         /* fluo, fluoref, ir, irref, sun, leaf (cmd 1 order) */
+    bool     currents_set;     /* true once the ambyte has set currents this connection */
+    uint8_t  currents[3];      /* i620, i720, ir (cmd 2 order) */
 } ambit_device_info_t;
 
-/* Return cached identity for `ch`, lazily fetching on first use (one-time UART
- * cost, then free). *out is zeroed + valid=false on a fetch failure. */
+/* Return cached identity+config for `ch`, lazily fetching identity on first use
+ * (one-time UART cost, then free). *out is zeroed + valid=false on a fetch
+ * failure (gains/currents fields still reflect any tracked set commands). */
 cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out);
-/* Drop a channel's cache so the next read re-fetches — call on (re)connect / swap. */
+/* Drop a channel's identity cache AND tracked gains/currents so the next read
+ * re-fetches and re-announces — call on (re)connect / swap. */
 void cmd_ambit_device_info_invalidate(uint8_t ch);
 
 /* Measurements (FSM response) */

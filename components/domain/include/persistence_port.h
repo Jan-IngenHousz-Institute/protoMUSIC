@@ -20,8 +20,10 @@ typedef enum {
 } measurement_sync_state_t;
 
 /* Origin tags (schema v2). Firmware-assigned — never user strings. */
-#define MEASUREMENT_TAG_MEASUREMENT "MEASUREMENT"   /* script-originated data   */
-#define MEASUREMENT_TAG_STATUS      "STATUS"        /* background status report */
+#define MEASUREMENT_TAG_MEASUREMENT "MEASUREMENT"   /* script-originated data    */
+#define MEASUREMENT_TAG_STATUS      "STATUS"        /* background status report  */
+#define MEASUREMENT_TAG_DEVICE_INFO "DEVICE_INFO"   /* sensor identity + calib.,
+                                                     * once per connection       */
 
 /* One row per measurement *event*. All quantities measured together (a BME280
  * read's T/H/P, or an AMBIT run's leaf_temp/fluor/fluoRef arrays) live in one

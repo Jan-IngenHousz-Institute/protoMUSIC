@@ -1069,6 +1069,13 @@ static cmd_result_t ambit_action(uint8_t ch, const uint8_t cmd[8],
     return make_result(ESP_OK, "AMBIT%u cmd %u OK", ch + 1, cmd[0]);
 }
 
+/* Per-channel AMBIT identity + config cache. Identity/calibration is fetched
+ * once via cmd 33 (see ambit_info_fetch below); gains/currents are tracked here
+ * at set-time. Written from the measurement (Lua) task, so no lock as long as
+ * that stays the only writer. */
+#define AMBIT_INFO_NUM_CH 4
+static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
+
 /* Cmd 1 — Set photodetector gains on the ADPD6100.
  * Values 1-6 map to gain levels (0 = skip / keep current).
  * Must be called before cmd_ambit_config_detector() or cmd_ambit_run().
@@ -1079,7 +1086,16 @@ cmd_result_t cmd_ambit_set_gains(uint8_t ch, uint8_t fluo, uint8_t fluoref,
                                   uint8_t sun, uint8_t leaf)
 {
     uint8_t cmd[8] = { AMBIT_CMD_SET_GAINS, fluo, fluoref, ir, irref, sun, leaf, 0 };
-    return ambit_ack_only(ch, cmd);
+    cmd_result_t r = ambit_ack_only(ch, cmd);
+    /* Track at set-time — the AMBIT has no read-back, and we're the only setter,
+     * so this stays authoritative for the event metadata. */
+    if (r.status == ESP_OK && ch < AMBIT_INFO_NUM_CH) {
+        s_ambit_info[ch].gains[0] = fluo;    s_ambit_info[ch].gains[1] = fluoref;
+        s_ambit_info[ch].gains[2] = ir;      s_ambit_info[ch].gains[3] = irref;
+        s_ambit_info[ch].gains[4] = sun;     s_ambit_info[ch].gains[5] = leaf;
+        s_ambit_info[ch].gains_set = true;
+    }
+    return r;
 }
 
 /* Cmd 2 — Set LED drive currents (0-126).
@@ -1090,7 +1106,13 @@ cmd_result_t cmd_ambit_set_currents(uint8_t ch, uint8_t i620, uint8_t i720,
                                      uint8_t ir)
 {
     uint8_t cmd[8] = { AMBIT_CMD_SET_CURRENTS, i620, i720, ir, 0, 0, 0, 0 };
-    return ambit_ack_only(ch, cmd);
+    cmd_result_t r = ambit_ack_only(ch, cmd);
+    if (r.status == ESP_OK && ch < AMBIT_INFO_NUM_CH) {
+        s_ambit_info[ch].currents[0] = i620; s_ambit_info[ch].currents[1] = i720;
+        s_ambit_info[ch].currents[2] = ir;
+        s_ambit_info[ch].currents_set = true;
+    }
+    return r;
 }
 
 /* Cmd 10 — Apply stored gains and currents to the ADPD6100 detector.
@@ -1236,12 +1258,65 @@ cmd_result_t cmd_ambit_get_info(uint8_t ch, uint8_t info_type,
 }
 
 /* ── Cached AMBIT device identity (deviceID / fw_version / cal_version) ──────
- * Static per sensor, so fetched once via cmd 33 and cached; a measurement reads
- * it with zero UART cost. Written only from the measurement (Lua) task's lazy
- * fetch, so no lock is needed as long as that stays the only writer. */
-#define AMBIT_INFO_NUM_CH 4
+ * The cache + setters live above (near cmd_ambit_set_gains); below is the
+ * one-time fetch that fills identity/calibration and announces it. */
 
-static ambit_device_info_t s_ambit_info[AMBIT_INFO_NUM_CH];
+/* Emit one DEVICE_INFO event (tag DEVICE_INFO, channel uart_<ch>, device =
+ * ambit_name, cmd_raw "get_info") carrying the full calibration. Called once
+ * per connection from ambit_info_fetch. Best-effort: a store failure must not
+ * fail the identity fetch. */
+static void ambit_emit_device_info(uint8_t ch, const ambit_device_info_t *e,
+                                   const ambit_calibration_t *cal, bool have_cal)
+{
+    if (s_cfg.store_event == NULL || s_cfg.next_id == NULL) return;
+
+    char payload[768];
+    int o = snprintf(payload, sizeof payload,
+        "{\"device_id\":\"%s\",\"fw\":\"%s\",\"cal_version\":\"%08lx\"",
+        e->device_id, e->fw_version, (unsigned long)e->cal_version);
+    if (have_cal && o > 0 && o < (int)sizeof payload) {
+        o += snprintf(payload + o, sizeof payload - o, ",\"mlx_coef\":[");
+        for (int i = 0; i < 14 && o > 0 && o < (int)sizeof payload; i++)
+            o += snprintf(payload + o, sizeof payload - o, "%s%ld",
+                          i ? "," : "", (long)cal->mlx_coef[i]);
+        o += snprintf(payload + o, sizeof payload - o, "],\"adpd\":[");
+        for (int i = 0; i < 6 && o > 0 && o < (int)sizeof payload; i++)
+            o += snprintf(payload + o, sizeof payload - o, "%s%lu",
+                          i ? "," : "", (unsigned long)cal->adpd[i]);
+        o += snprintf(payload + o, sizeof payload - o,
+            "],\"temp_offset\":%.4f,\"temp_slope\":%.4f,\"actinic_coef\":%.6f,"
+            "\"spec_coef\":%.6f,\"act\":[%u,%u,%u,%u,%u],"
+            "\"mlx_emissivity\":%.4f,\"sun_coef\":%.6f,\"tick_factor\":%.6f",
+            (double)cal->temp_offset, (double)cal->temp_slope, (double)cal->actinic_coef,
+            (double)cal->spec_coef, (unsigned)cal->act_50, (unsigned)cal->act_100,
+            (unsigned)cal->act_150, (unsigned)cal->act_200, (unsigned)cal->act_250,
+            (double)cal->mlx_emissivity, (double)cal->sun_coef, (double)cal->tick_factor);
+    }
+    if (o < 0 || o >= (int)sizeof payload) {
+        ESP_LOGW(TAG, "AMBIT%u device_info payload truncated", ch + 1);
+        return;
+    }
+
+    int64_t mid = 0;
+    if (s_cfg.next_id(&mid) != ESP_OK) return;
+    char chan[12];
+    snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
+    measurement_event_desc_t d = {
+        .measure_id   = mid,
+        .channel      = chan,
+        .device       = (e->ambit_name[0] != '\0') ? e->ambit_name : "ambit",
+        .tag          = MEASUREMENT_TAG_DEVICE_INFO,
+        .cmd_raw      = "get_info",
+        .start_ms     = now_ms(),
+        .end_ms       = now_ms(),
+        .payload_json = payload,
+    };
+    if (s_cfg.store_event(&d) == ESP_OK) {
+        notify_sync();
+        ESP_LOGI(TAG, "AMBIT%u DEVICE_INFO stored (%s cal=%08lx)",
+                 ch + 1, e->ambit_name, (unsigned long)e->cal_version);
+    }
+}
 
 static esp_err_t ambit_info_fetch(uint8_t ch)
 {
@@ -1267,15 +1342,27 @@ static esp_err_t ambit_info_fetch(uint8_t ch)
      * is recalibrated. The struct has no native version field. */
     ambit_calibration_t cal;
     size_t cgot = 0;
+    bool have_cal = false;
     cmd_result_t cr = cmd_ambit_get_info(ch, AMBIT_INFO_CALIBRATION, (uint8_t *)&cal, sizeof cal, &cgot);
     if (cr.status == ESP_OK && cgot >= sizeof cal) {
+        have_cal        = true;
         e.cal_version   = esp_rom_crc32_le(0, (const uint8_t *)&cal, sizeof cal);
         e.actinic_coef  = cal.actinic_coef;
         memcpy(e.ambit_name, cal.ambit_name, sizeof e.ambit_name - 1);
     }
 
+    /* Preserve gains/currents tracked since the last (re)connect — the identity
+     * fetch must not clobber them (they live in the same cache struct). */
+    e.gains_set     = s_ambit_info[ch].gains_set;
+    memcpy(e.gains, s_ambit_info[ch].gains, sizeof e.gains);
+    e.currents_set  = s_ambit_info[ch].currents_set;
+    memcpy(e.currents, s_ambit_info[ch].currents, sizeof e.currents);
+
     e.valid = true;
     s_ambit_info[ch] = e;
+
+    /* Announce the freshly-connected sensor's identity + calibration once. */
+    ambit_emit_device_info(ch, &e, &cal, have_cal);
     return ESP_OK;
 }
 
@@ -1298,7 +1385,14 @@ cmd_result_t cmd_ambit_device_info(uint8_t ch, ambit_device_info_t *out)
 
 void cmd_ambit_device_info_invalidate(uint8_t ch)
 {
-    if (ch < AMBIT_INFO_NUM_CH) s_ambit_info[ch].valid = false;
+    if (ch < AMBIT_INFO_NUM_CH) {
+        /* Drop identity (re-fetch + re-announce next use) AND tracked gains/
+         * currents — the reconnected AMBIT booted with its own defaults, unknown
+         * to us until the script sets them again. */
+        s_ambit_info[ch].valid        = false;
+        s_ambit_info[ch].gains_set    = false;
+        s_ambit_info[ch].currents_set = false;
+    }
 }
 
 /* Cmd 21 — Run an array-mode measurement on the ADPD6100.

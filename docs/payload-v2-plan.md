@@ -153,7 +153,11 @@ time, not the publish time.
 each lands with correct `tag`/`channel`/`cmd_raw` and that `ambit.trigger`
 alone stores nothing.
 
-## Phase 3 — device identity discovery
+## Phase 3 — device identity discovery  ⟵ *DONE 2026-06-11
+(device = ambit_name from the cmd-33 cache; gains/currents tracked at set-time
+and carried per-measurement with cal_version; full calibration emitted once per
+connection as a DEVICE_INFO event. No per-measurement query — static identity
+cached on connect, mutable config tracked when the ambyte sets it.)*
 
 - Per-channel identity cache in the uart_sensor layer:
   `{ name[24]; valid; }` per channel.

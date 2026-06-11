@@ -5,11 +5,12 @@ builder is `cmd_mqtt_publish_next_event()` in
 [components/device_commands/device_commands.c](../components/device_commands/device_commands.c)
 — if this document and the code disagree, the code wins.
 
-> Phases 1 (v2 wire format), 2 (`ambit.*` consolidation, fused stores,
-> slimmed `db.store_event`) and 4 (firmware STATUS heartbeat + clock gate +
-> status-LED blinker) of [payload-v2-plan.md](payload-v2-plan.md) landed
-> 2026-06-11. Device discovery (Phase 3) is the remaining gap: `device` is
-> hardcoded `"ambit"` on AMBIT store paths and `null` elsewhere.
+> All of [payload-v2-plan.md](payload-v2-plan.md) landed 2026-06-11 — Phases 1
+> (v2 wire format), 2 (`ambit.*` consolidation, fused stores, slimmed
+> `db.store_event`), 4 (firmware STATUS heartbeat + clock gate + status-LED
+> blinker), and 3 (AMBIT identity discovery: `device` = `ambit_name`,
+> per-measurement `cal_version`/`gains`/`currents`, once-per-connection
+> `DEVICE_INFO` event).
 
 ## Model: store, then publish
 
@@ -53,7 +54,7 @@ example:
     "endTicks":   1765459210456,        // epoch ms, measurement end
     "published": "2026-06-11T09:30:00Z",// UTC ISO-8601 at PUBLISH time
     "channel": "uart_1",                // physical port, null = onboard
-    "device":  "ambit",                 // discovered sensor name, null = unknown
+    "device":  "AmbitV003",             // discovered sensor name (cmd 33), "ambit" until known, null = onboard
     "cmd_raw": "arrun 1,0,0,0,0,4,0,4,0,1", // full device-vocabulary command (with args), null = none
     "tag": "MEASUREMENT",               // origin enum (firmware-assigned)
     "metadata": { "segments": [ ... ] },// object, or null when absent
@@ -83,8 +84,9 @@ Field notes:
   missing/crashed main.lua).
 - `channel` is `"uart_<n>"` (0-based) for the UART sensor ports, `"usb_<n>"`
   reserved for the USB hub; JSON `null` = onboard source.
-- `device` is best-effort sensor self-identification — `null` until Phase 3
-  discovery lands (the AMBIT store path hardcodes `"ambit"` already).
+- `device` is sensor self-identification: the AMBIT's `ambit_name` from its
+  calibration (cmd 33), discovered once per connection and cached; `"ambit"`
+  until that first fetch succeeds, `null` for onboard sources.
 - `measure_id` is a plain monotonic `int64` from the event log (starts at 1,
   reseeded above the highest id found on the SD card at boot). Unique **per
   device only** — and note the cloud does NOT dedupe: QoS-1 redeliveries land
@@ -111,6 +113,7 @@ data=, metadata=, channel= }` remains for derived/custom script events.
 | Leaf temperature (`ambit.leaf_temp`) | `uart_<ch>` | `ambit` | `get_temp` | `{"leaf":f,"chip":f}` |
 | BME280 (`device.bme280` / CLI `record_env`) | `null` | `null` | `device.bme280` | `{"temperature":f,"humidity":f,"pressure":f}` |
 | **STATUS heartbeat** (firmware, tag `STATUS`) | `null` | `null` | `null` | `{"wifi":b,"provisioned":b,"db_online":b,"publish_gate":b,"battery_v":f,"input_v":f,"system_v":f,"input_ma":n,"charge_ma":n,"input_present":b,"charge_status":n}` (power keys omitted if charger read fails) |
+| **AMBIT identity** (firmware, tag `DEVICE_INFO`, once per connection) | `uart_<ch>` | `ambit_name` | `get_info` | `{"device_id":"…","fw":"…","cal_version":"…",`<br>`"mlx_coef":[…14…],"adpd":[…6…],"temp_offset":f,…,"tick_factor":f}` |
 | Lua `db.store_event{}` (custom/derived) | `uart_<n>` if `channel=` given, else `null` | `null` (Phase 3 attaches the cache) | `null` | script-defined |
 
 `cmd_raw` is the **full command in the target device's own vocabulary**,
@@ -122,6 +125,14 @@ command), and the argument-free `get_par` / `get_temp`. Onboard sources use
 the firmware's logical name (`device.bme280`). `cmd_raw` is the literal command
 (replayable); `metadata.segments` is the decoded, analysis-friendly view of the
 same trace, and the AMBIT run/trigger `opts.metadata` table is merged into it.
+
+Every AMBIT measurement's `metadata` also carries the sensor's current config —
+`cal_version` (CRC32 of the calibration; the join key to the `DEVICE_INFO`
+event), and `gains`/`currents` when the script has set them this connection
+(firmware tracks them at set-time — the AMBIT has no read-back). The full
+calibration (the heavy `mlx_coef`/`adpd`/coefficients) is **not** repeated per
+measurement; it's emitted once per connection as the `DEVICE_INFO` event,
+joined on `device_id` + `cal_version`.
 
 
 ### AMBIT `data` keys

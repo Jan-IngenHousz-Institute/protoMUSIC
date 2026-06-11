@@ -510,10 +510,42 @@ static int l_device_ambit_config_detector(lua_State *L)
     return 1;
 }
 
-/* Fused store for small typed AMBIT queries: one event with channel
- * "uart_<ch>", device "ambit", tag MEASUREMENT, cmd_raw in the AMBIT's own
- * ASCII vocabulary. Returns the measure_id, or -1 on store failure. */
-static int64_t ambit_store_small(uint8_t ch, const char *cmd_ascii,
+/* Resolve the cached AMBIT name for the event's `device` field (Phase 3),
+ * lazily fetching identity (which also emits the once-per-connection DEVICE_INFO
+ * event). Fills *info for the config metadata; returns the name, or the generic
+ * "ambit" until discovery succeeds. */
+static const char *ambit_device_name(uint8_t ch, ambit_device_info_t *info)
+{
+    cmd_ambit_device_info(ch, info);
+    return (info->valid && info->ambit_name[0] != '\0') ? info->ambit_name : "ambit";
+}
+
+/* Write the per-measurement config key/values from cached identity+config — no
+ * surrounding braces, so it splices into any metadata object:
+ *   "cal_version":"hex"|null[,"gains":[6]][,"currents":[3]]
+ * cal_version is always present, so gains/currents prepend a comma cleanly. */
+static int ambit_config_kvs(const ambit_device_info_t *info, char *buf, size_t cap)
+{
+    int o = 0;
+    if (info->valid)
+        o += snprintf(buf, cap, "\"cal_version\":\"%08lx\"", (unsigned long)info->cal_version);
+    else
+        o += snprintf(buf, cap, "\"cal_version\":null");
+    if (info->gains_set && o > 0 && o < (int)cap)
+        o += snprintf(buf + o, cap - o, ",\"gains\":[%u,%u,%u,%u,%u,%u]",
+                      info->gains[0], info->gains[1], info->gains[2],
+                      info->gains[3], info->gains[4], info->gains[5]);
+    if (info->currents_set && o > 0 && o < (int)cap)
+        o += snprintf(buf + o, cap - o, ",\"currents\":[%u,%u,%u]",
+                      info->currents[0], info->currents[1], info->currents[2]);
+    return o;
+}
+
+/* Fused store for small typed AMBIT queries: one MEASUREMENT event, channel
+ * "uart_<ch>", device + metadata supplied by the caller, cmd_raw in the AMBIT's
+ * own ASCII vocabulary. Returns the measure_id, or -1 on store failure. */
+static int64_t ambit_store_small(uint8_t ch, const char *device, const char *cmd_ascii,
+                                 const char *metadata_json,
                                  int64_t start_ms, int64_t end_ms,
                                  const char *payload_json)
 {
@@ -522,14 +554,15 @@ static int64_t ambit_store_small(uint8_t ch, const char *cmd_ascii,
     int64_t mid = 0;
     if (cmd_next_measure_id(&mid).status != ESP_OK) return -1;
     measurement_event_desc_t d = {
-        .measure_id   = mid,
-        .channel      = chan,
-        .device       = "ambit",
-        .tag          = MEASUREMENT_TAG_MEASUREMENT,
-        .cmd_raw      = cmd_ascii,
-        .start_ms     = start_ms,
-        .end_ms       = end_ms,
-        .payload_json = payload_json,
+        .measure_id    = mid,
+        .channel       = chan,
+        .device        = device,
+        .tag           = MEASUREMENT_TAG_MEASUREMENT,
+        .cmd_raw       = cmd_ascii,
+        .start_ms      = start_ms,
+        .end_ms        = end_ms,
+        .metadata_json = metadata_json,
+        .payload_json  = payload_json,
     };
     return (cmd_store_event(&d).status == ESP_OK) ? mid : -1;
 }
@@ -554,7 +587,13 @@ static int l_ambit_leaf_temp(lua_State *L)
         char payload[64];
         snprintf(payload, sizeof payload, "{\"leaf\":%.2f,\"chip\":%.2f}",
                  (double)leaf, (double)chip);
-        mid = ambit_store_small(ch, "get_temp", start_ms, end_ms, payload);
+        ambit_device_info_t info;
+        const char *dev = ambit_device_name(ch, &info);
+        char meta[200];
+        int o = snprintf(meta, sizeof meta, "{");
+        o += ambit_config_kvs(&info, meta + o, sizeof meta - o);
+        snprintf(meta + o, sizeof meta - o, "}");
+        mid = ambit_store_small(ch, dev, "get_temp", meta, start_ms, end_ms, payload);
         if (mid < 0) ESP_LOGW(LUA_RUNNER_TAG, "ambit.leaf_temp ch%u: store failed", ch);
     }
 
@@ -590,7 +629,13 @@ static int l_ambit_spec(lua_State *L)
                          spec[5], spec[6], spec[7], spec[8], spec[9],
                          (double)par);
         if (n > 0 && n < (int)sizeof payload) {
-            mid = ambit_store_small(ch, "get_par", start_ms, end_ms, payload);
+            ambit_device_info_t info;
+            const char *dev = ambit_device_name(ch, &info);
+            char meta[200];
+            int mo = snprintf(meta, sizeof meta, "{");
+            mo += ambit_config_kvs(&info, meta + mo, sizeof meta - mo);
+            snprintf(meta + mo, sizeof meta - mo, "}");
+            mid = ambit_store_small(ch, dev, "get_par", meta, start_ms, end_ms, payload);
         }
         if (mid < 0) ESP_LOGW(LUA_RUNNER_TAG, "ambit.spec ch%u: store failed", ch);
     }
@@ -1051,7 +1096,7 @@ static uint8_t ambit_actinic_to_dac(lua_Integer actinic, float par_coef)
 
 /* Per-channel state stashed by ambit.trigger for the eventual ambit.fetch store:
  * the run metadata (segments JSON) and the measurement start time. */
-static char    s_ambit_meta[UART_SENSOR_NUM_CHANNELS][768];
+static char    s_ambit_meta[UART_SENSOR_NUM_CHANNELS][1024];
 static char    s_ambit_cmd[UART_SENSOR_NUM_CHANNELS][AMBIT_CMD_ASCII_CAP];
 static int64_t s_ambit_start_ms[UART_SENSOR_NUM_CHANNELS];
 
@@ -1159,7 +1204,8 @@ static uint8_t *ambit_build_run_arr(lua_State *L, int seg_idx, uint8_t ch, int n
         line[7] = 1;                              /* subsampling: every point */
     }
 
-    /* Run metadata (small, bounded), built from the packed segment array. */
+    /* Run metadata, built from the packed segment array, with the channel's
+     * config (gains/currents/cal_version) spliced into the same object. */
     {
         int off = snprintf(metadata_json, meta_cap, "{\"segments\":[");
         for (int i = 0; i < nseg && off > 0 && off < (int)meta_cap; i++) {
@@ -1169,8 +1215,11 @@ static uint8_t *ambit_build_run_arr(lua_State *L, int seg_idx, uint8_t ch, int n
                             ((unsigned)line[2] << 8) | line[3],
                             ((unsigned)line[4] << 8) | line[5], (unsigned)line[6]);
         }
-        if (off < 0 || off > (int)meta_cap - 3) off = (int)meta_cap - 3;
-        snprintf(metadata_json + off, meta_cap - off, "]}");
+        /* Reserve room for "]," + config kvs + "}" + NUL (≤ ~100 B). */
+        if (off < 0 || off > (int)meta_cap - 100) off = (int)meta_cap - 100;
+        off += snprintf(metadata_json + off, meta_cap - off, "],");
+        off += ambit_config_kvs(&info, metadata_json + off, meta_cap - off);
+        snprintf(metadata_json + off, meta_cap - off, "}");
     }
     return run_arr;
 }
@@ -1253,12 +1302,14 @@ static int ambit_decode_store_push(lua_State *L, uart_sensor_response_t *resp,
     if (store && !trunc) {
         char chan[12];
         snprintf(chan, sizeof chan, "uart_%u", (unsigned)ch);
+        ambit_device_info_t info;
+        const char *dev = ambit_device_name(ch, &info);   /* cached name, or "ambit" */
         int64_t mid = 0;
         if (cmd_next_measure_id(&mid).status == ESP_OK) {
             measurement_event_desc_t d = {
                 .measure_id    = mid,
                 .channel       = chan,
-                .device        = "ambit",
+                .device        = dev,
                 .tag           = MEASUREMENT_TAG_MEASUREMENT,
                 .cmd_raw       = cmd_name,
                 .start_ms      = start_ms,
@@ -1312,7 +1363,7 @@ static int l_ambit_run(lua_State *L)
         lua_pop(L, 1);
     }
 
-    char metadata_json[768];
+    char metadata_json[1024];
     uint8_t *run_arr = ambit_build_run_arr(L, 2, ch, nseg, metadata_json, sizeof metadata_json);
     ambit_meta_merge_user(L, 3, metadata_json, sizeof metadata_json);
 
