@@ -110,6 +110,22 @@ static bool already_applied(const char *id)
 static void ota_do_update(const ota_request_t *r)
 {
     ESP_LOGW(TAG, "OTA requested id=%s url=%s", r->id, r->url);
+
+    /* Guard the #1 foot-gun: a github.com *browse* URL (/blob/ or /tree/) serves
+     * an HTML page, not the binary — esp_https_ota downloads it and rejects it as
+     * a bad image ("Mismatch chip id … found 20569"). Catch it up front, while
+     * MQTT is still up, with an actionable message. (/raw/ and release-asset
+     * /releases/download/ URLs are fine and not matched here.) */
+    if (strstr(r->url, "/blob/") != NULL || strstr(r->url, "/tree/") != NULL) {
+        ESP_LOGE(TAG, "URL is a GitHub web page (/blob/ or /tree/), not a downloadable file:");
+        ESP_LOGE(TAG, "  %s", r->url);
+        ESP_LOGE(TAG, "use a RELEASE ASSET url — no /blob/ or /tree/, no branch name:");
+        ESP_LOGE(TAG, "  https://github.com/<owner>/<repo>/releases/download/<tag>/firmware.bin");
+        ESP_LOGE(TAG, "  (Releases page -> right-click the asset -> Copy link address)");
+        ota_report("failed", r->id, "bad_url: use a release-asset link, not a /blob//tree/ web url");
+        return;
+    }
+
     ota_report("accepted", r->id, NULL);
     vTaskDelay(pdMS_TO_TICKS(500));   /* let the accepted report flush before comms drop */
 
@@ -147,9 +163,17 @@ static void ota_do_update(const ota_request_t *r)
     /* Failed: not booting the new image — bring comms back and report. The id is
      * NOT latched, so the same id can be re-sent to retry. */
     ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
+    const char *detail = esp_err_to_name(err);
+    if (err == ESP_ERR_INVALID_VERSION) {
+        /* esp_https_ota got bytes but the image header was invalid — almost
+         * always an HTML page (wrong URL) rather than a firmware.bin. */
+        ESP_LOGE(TAG, "downloaded content is not a valid ESP32-S3 image — did the URL "
+                      "serve HTML? point at a release-asset firmware.bin");
+        detail = "not_an_image: URL served non-firmware (HTML?) — use a release-asset .bin";
+    }
     if (s_cfg.comms_resume != NULL) s_cfg.comms_resume();
     if (wait_connected(60)) {
-        ota_report("failed", r->id, esp_err_to_name(err));
+        ota_report("failed", r->id, detail);
     }
 }
 
