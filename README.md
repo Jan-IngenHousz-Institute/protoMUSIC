@@ -182,7 +182,7 @@ uv run docs/mqtt_tls_test_client.py --publish --mqtt5
 uv run docs/mqtt_tls_test_client.py --publish some/topic --message 'hello from python'
 ```
 
-Any flag overrides its `.env` counterpart. Remember AWS IoT Core's 7-slash limit on topic filters — see the device's publish topic shape at [components/device_commands/device_commands.c](components/device_commands/device_commands.c).
+Any flag overrides its `.env` counterpart. Remember AWS IoT Core's 7-slash limit on topic filters. The device's publish topic shape and the exact JSON envelope it sends are documented in [docs/mqtt-payload.md](docs/mqtt-payload.md).
 
 ## 8. Lua script on SD card
 

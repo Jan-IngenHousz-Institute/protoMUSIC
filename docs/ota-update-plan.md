@@ -1,37 +1,88 @@
 # OTA firmware update — staged plan
 
-Host-triggered, MQTT-commanded OTA for the **ambyte** (ESP32-S3 gateway), and
-later the **ambit** sensors (ESP32-C3) over UART. Companion to
+Host-triggered OTA for the **ambyte** (ESP32-S3 gateway), and later the
+**ambit** sensors (ESP32-C3) over UART. Companion to
 [device-script-delivery.md](../device-script-delivery.md), which describes the
 Lua-script push that shares the same inbound channel.
 
-## Decisions already taken
-- **Trigger transport:** MQTT command on a single inbound topic, `type`-dispatched
-  (same channel serves `ota_update`, `script_update`, future commands).
-- **Firmware source:** the trigger payload carries the **full download URL**
-  (any GitHub release asset or `raw.githubusercontent.com/<repo>/<branch>/…`),
-  so we can point at an arbitrary branch or tag without reflashing.
-- **OTA mechanism:** application-level `esp_https_ota` into a dual-OTA partition
-  layout, TLS validated by the Mozilla cert bundle, with rollback.
+> **Revised 2026-06-11:** the trigger/orchestration layer moves from a custom
+> MQTT command topic to **AWS IoT Jobs** (the mechanism underneath AWS's OTA
+> update tasks). The download path is unchanged (Stage-0-proven
+> `esp_https_ota`). Stages 2–4 are rewritten; Stage 0 (passed) and Stage 1
+> are untouched. The custom-channel code already built for Stage 2
+> (subscribe + reassembly in `mqtt_client.c`, JSON router + NVS dedupe in
+> `command_router/`) is repointed, not discarded.
 
-## Corrections folded in from the critical review
-1. **The OTA must run in its own task**, not in the MQTT `MQTT_EVENT_DATA`
-   callback (a multi-minute blocking download there stalls the MQTT event loop /
-   keepalive). The callback only parses → validates → dedupes → signals.
-2. **Retain stays ON; the handler is made idempotent** (not retain-off). Retain-off
-   would mean an offline device never gets the trigger (AWS IoT does not reliably
-   queue QoS-1 for disconnected sessions). Safety comes from a **version-aware,
-   NVS-persisted dedupe**: ignore a trigger whose `id` was already applied OR whose
-   target version already equals the running version. This is what stops a retained
-   trigger from re-flashing on every reboot.
+## Decisions already taken
+
+- **Trigger transport: AWS IoT Jobs** on the reserved
+  `$aws/things/<thingName>/jobs/*` topics, over the existing esp-mqtt
+  connection. A job's document carries the same payload the custom trigger
+  would have (`type`-dispatched: `ota_update`, `script_update`, future
+  commands).
+- **Firmware source:** the job document carries the **full download URL**
+  (any GitHub release asset or `raw.githubusercontent.com/<repo>/<branch>/…`),
+  so we can point at an arbitrary branch or tag without reflashing. If the
+  platform team prefers S3 hosting, job documents support
+  `${aws:iot:s3-presigned-url:…}` placeholders — a drop-in swap later.
+- **OTA mechanism:** application-level `esp_https_ota` into a dual-OTA
+  partition layout, TLS validated by the Mozilla cert bundle, with rollback.
+
+## Why Jobs instead of the custom trigger
+
+1. **It dissolves the Stage-2 policy blocker.** The custom command topic is
+   dead in the water because openJII's subscribe policy is scoped by a Cognito
+   identity variable that is *empty* for cert-authenticated devices (the
+   SUBACK 135 failure). Jobs topics are granted with the standard
+   `${iot:Connection.Thing.ThingName}` thing-policy variable — the documented
+   pattern for cert-auth fleets. Precondition (already true in our setup,
+   enforced by their policy anyway): the device connects with **client ID =
+   thing name** and the cert attached to the thing.
+2. **The retain/idempotency hack becomes unnecessary.** Jobs have a real
+   per-device execution lifecycle (QUEUED → IN_PROGRESS → SUCCEEDED/FAILED/
+   TIMED_OUT). An offline device picks its QUEUED job up on reconnect — the
+   problem retain-ON was solving — and an applied job never re-fires, the
+   problem the NVS last-id dedupe was solving. The NVS latch survives in a
+   smaller role (reboot correlation, below).
+3. **Fleet visibility for free:** per-device status, statusDetails, timeouts
+   (`inProgressTimeoutInMinutes` → auto-TIMED_OUT watchdog), thing-group
+   targeting and staged rollout/abort configs in the AWS console — all things
+   the custom status topic would have reimplemented poorly.
+
+## Why NOT the full AWS OTA Update service (CreateOTAUpdate + OTA agent)
+
+Assessed and deferred, not rejected on principle:
+
+- The official OTA agent (`ota-for-aws-iot-embedded-sdk` via `esp-aws-iot`)
+  is built on **coreMQTT/coreHTTP**, not esp-mqtt. Adopting it means either a
+  full MQTT-stack migration or a second TLS session — the latter is
+  heap-prohibitive on this board (~17 KB steady-state largest block), the
+  former a rework far larger than OTA itself. AWS's own current guidance has
+  shifted toward exactly the Jobs-based custom flow we're adopting.
+- `CreateOTAUpdate` adds AWS Signer **code signing** — real authenticity, and
+  the honest answer to correction #4 below. It layers cleanly on top of a
+  Jobs-based device flow later (verify the signature file referenced by the
+  job document before `esp_ota_set_boot_partition`). Park it with Secure Boot
+  v2 as the hardening path.
+
+## Corrections carried over from the original critical review
+
+1. **The OTA must run in its own task**, not in the MQTT event callback (a
+   multi-minute blocking download there stalls the MQTT event loop /
+   keepalive). The callback only parses → validates → signals.
+2. ~~Retain + NVS-dedupe idempotency~~ — superseded by the job execution
+   lifecycle (see above). The NVS jobId latch remains for **reboot
+   correlation only**: it tells the freshly-booted image which execution to
+   report on.
 3. **`mark_app_valid` is gated on connectivity:** the new image only cancels
-   rollback after it has reconnected to MQTT, so a connectivity-breaking update
-   auto-rolls-back instead of stranding the device.
-4. **`sha256` + `size` in the payload are integrity, not authenticity.** The real
-   trust boundary is "who can publish to the device's AWS IoT topic." For branch
-   builds the hash is a moving target — accept that friction or restrict OTA to
-   tagged release assets. (True authenticity would need Secure Boot v2 + signed
-   images — out of scope for now.)
+   rollback after it has reconnected to MQTT — at which point it also reports
+   the job SUCCEEDED. A connectivity-breaking update rolls back instead of
+   stranding the device, and the rolled-back image reports the job FAILED.
+4. **`sha256` + `size` in the job document are integrity, not authenticity.**
+   The trust boundary becomes "who can create jobs in the openJII AWS
+   account" (IAM) — strictly better than "who can publish to a topic", but
+   still not signed images. True authenticity = AWS Signer and/or Secure
+   Boot v2, out of scope for now.
 
 ---
 
@@ -59,33 +110,11 @@ public GitHub release (`protoMUSIC/releases/ota-spike-test`) end-to-end:
    `sdkconfig.defaults` so it affects NORMAL builds too — confirm steady-state MQTT is
    unaffected (watch the `sync_runner` "heap:" line) after reflashing normal firmware.
 
-The progression itself validated the spike approach: each run peeled off one mundane
-fixable layer (HTTP buffer → TLS record size) while the genuinely risky unknown (the
-handshake) passed on the first attempt and held every run.
-
-**What landed:**
-- `components/ota_spike/` — runs the real `esp_https_ota` advanced API against a
-  GitHub URL, logs the handshake result + the internal-RAM largest-block low-water
-  through the whole download, then **aborts before finish** (never sets boot;
-  there is no otadata partition yet anyway).
-- `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE` + `_DEFAULT_FULL` added to `sdkconfig.defaults`.
-- `-DSPIKE_OTA` / `-DSPIKE_OTA_URL` build flags in `platformio.ini` (commented).
-- Spike hook in `app_main.c`, placed before MQTT/sensors start (maximal heap →
-  a failure is a pure TLS-buffer verdict, not heap exhaustion).
-
-**How to run:**
-1. Uncomment the `SPIKE_OTA` `build_flags` block in `platformio.ini` and set
-   `SPIKE_OTA_URL` to a real esp32s3 `firmware.bin` (release asset or raw branch path).
-2. Delete `sdkconfig.esp32-s3-devkitm-1` so the cert-bundle change regenerates.
-3. Build + flash, watch the serial log for `OTA SPIKE RESULT` / `VERDICT`.
+**What landed:** `components/ota_spike/` (re-runnable test harness),
+cert-bundle config in `sdkconfig.defaults`, `-DSPIKE_OTA` build flags in
+`platformio.ini` (commented), spike hook in `app_main.c`.
 
 **Gate: PASSED → GitHub-hosted OTA is viable; proceed to Stage 1.**
-Cleanup after the run: re-comment the `SPIKE_OTA` `build_flags` in `platformio.ini`
-and reflash normal firmware; the `sdkconfig.defaults` changes (cert bundle +
-`IN_CONTENT_LEN=16384`) STAY — they are production settings. The throwaway
-`ota-spike-test` release can be deleted and `protoMUSIC` re-privated (but production
-then needs a public source or the private-repo signed-URL auth path). The
-`components/ota_spike/` harness can stay as a re-runnable test until Stage 3 lands.
 
 ---
 
@@ -106,60 +135,91 @@ not an OTA-capable layout. Rework to `ota_0 + ota_1 + otadata` (drop `factory`).
 
 ---
 
-## Stage 2 — Inbound MQTT command channel  ("publishing to a device")
+## Stage 2 — Jobs channel  *(rework of the built custom channel)*
 
-The current `mqtt_client.c` is **publish-only** — no subscribe, no
-`MQTT_EVENT_DATA` handler, no dispatcher. This stage builds that foundation, which
-is shared by OTA (Stage 3) and script push (Stage 4). **Build and prove it with a
-trivial command first, independent of OTA.**
+Repoint the existing inbound infrastructure (connect-time subscribe +
+multi-part reassembly in `mqtt_client.c`; JSON router in `command_router/`)
+from the custom command topic to the Jobs reserved topics. Hand-rolled on
+esp-mqtt + cJSON — the AWS Jobs "library" is mostly topic-string helpers; we
+don't need it.
 
-**Scope:**
-- Subscribe to `device/cmd/v1/{sensorType}/{sensorVersion}/{thingName}` on
-  `MQTT_EVENT_CONNECTED` (QoS 1), retain ON.
-- `MQTT_EVENT_DATA` handler that **reassembles multi-part payloads**
-  (`current_data_offset` / `total_data_len`) before parsing — mandatory because
-  esp-mqtt chunks payloads > ~1 KB (the inline-Lua script can be 128 KB).
-- A small command router that parses JSON and dispatches on `type`.
-- A first `type: "ping"` (or `"status"`) command that just publishes a reply on a
-  status topic — proves the round trip end-to-end.
-- **AWS IoT policy update** granting `iot:Subscribe` + `iot:Receive` on the new
-  topic (an unauthorized subscribe can make AWS *drop the connection* → reconnect
-  loop, so this is load-bearing, not cosmetic).
-- Shared idempotency helper: persisted "last applied command `id`" in NVS.
+**Device flow:**
+- On `MQTT_EVENT_CONNECTED`: subscribe (QoS 1) to
+  `$aws/things/<tn>/jobs/notify-next`,
+  `$aws/things/<tn>/jobs/start-next/accepted` + `/rejected`,
+  `$aws/things/<tn>/jobs/+/update/accepted` + `/rejected`;
+  then publish `{}` to `$aws/things/<tn>/jobs/start-next` to claim any QUEUED
+  execution (this is how offline-queued jobs are picked up — no retain).
+- `start-next/accepted` carries the **execution + job document**; the router
+  dispatches on the document's `type` exactly as designed for the custom
+  channel. Claiming via start-next marks it IN_PROGRESS server-side.
+- Replies become `UpdateJobExecution` publishes
+  (`$aws/things/<tn>/jobs/<jobId>/update` with `status` + `statusDetails`)
+  instead of the custom status topic.
+- Reassembly stays (esp-mqtt chunks inbound > ~1 KB; job documents are small
+  but multi-KB). **Job documents are capped at 32 KB** — see Stage 4 for the
+  consequence on script delivery.
+- `handle_ping` survives as a no-op job type (`{"type":"ping"}` → report
+  SUCCEEDED with uptime/fw in `statusDetails`) — the Stage-2 end-to-end proof.
 
-**Deliverable:** the device receives a published command and acknowledges it on a
-status topic. No OTA, no script logic yet.
+**Policy ask to the platform team** (replaces the Cognito-policy fix):
+`iot:Subscribe`/`iot:Receive` on
+`$aws/things/${iot:Connection.Thing.ThingName}/jobs/*` topic filters and
+`iot:Publish` on the matching topics. Standard AWS pattern, resolves for
+cert auth because client ID = thing name. Plus: whoever triggers updates
+needs IAM `iot:CreateJob` (+ console or a small boto3 script — replaces
+`docs/stage2_command_test.py`, which becomes a job-creation/monitor tool).
+
+**Cleanup:** `AMBYTE_COMMAND_TOPIC` / `AMBYTE_STATUS_TOPIC` env keys and their
+NVS plumbing go away (jobs topics derive from the thing name = client ID).
+
+**Deliverable:** create a `ping` job in the console → device claims it,
+reports SUCCEEDED with statusDetails visible in the console. No OTA yet.
 
 ---
 
 ## Stage 3 — ambyte self-OTA handler  *(depends on Stage 1 + 2, gated by Stage 0)*
 
-Wire `type: "ota_update"`, `target: "ambyte"` to a dedicated OTA **task**:
+Wire `type: "ota_update"`, `target: "ambyte"` to a dedicated OTA **task**.
+Job document (jobId replaces the old `id` field):
 
 ```json
-{ "type":"ota_update", "id":"ota-2026-06-10-1", "target":"ambyte",
+{ "type":"ota_update", "target":"ambyte", "version":"1.4.0",
   "url":"https://raw.githubusercontent.com/Ludo-lab/ambyte-iot-ludo/<branch>/firmware.bin",
   "sha256":"<hex>", "size":1356608 }
 ```
 
-Flow: dedupe (id + running-version) → publish "accepted" status → quiesce Lua +
-publishing → `esp_https_ota` from `url` via cert bundle (follows the 302) → verify
-`sha256`/`size` → set boot → store id in NVS → reboot → **after MQTT reconnects**,
-`esp_ota_mark_app_valid_cancel_rollback()` → publish "success" status (a download
-or boot failure rolls back / reports "failed").
+Flow: claim via start-next → skip-if-current (`version` == running → report
+SUCCEEDED with `statusDetails: {"skipped":"already at version"}`) → report
+IN_PROGRESS detail "downloading" → quiesce Lua + publishing →
+`esp_https_ota` from `url` via cert bundle (follows the 302) → verify
+`sha256`/`size` → set boot → **latch jobId + target version in NVS** →
+reboot → new image boots, MQTT reconnects →
+`esp_ota_mark_app_valid_cancel_rollback()` → report the latched jobId
+SUCCEEDED → clear latch. Failure paths: download/verify error → report
+FAILED with reason, no reboot; connectivity-breaking image → bootloader
+rolls back → old image finds the latch with version ≠ running → reports
+FAILED `{"rolled_back":true}`. Set `inProgressTimeoutInMinutes` (~30) on the
+job as the server-side watchdog for bricked-silent outcomes.
 
-**Deliverable:** publish a trigger → device self-updates from GitHub and reports
-the result; a bad/connectivity-breaking image rolls back automatically.
+**Deliverable:** create an OTA job → device self-updates from GitHub and the
+job shows SUCCEEDED in the console; a bad/connectivity-breaking image rolls
+back and the job shows FAILED with the rollback detail.
 
 ---
 
-## Stage 4 — Lua `script_update` over the same channel  *(parallel to Stage 3)*
+## Stage 4 — Lua `script_update` as a job  *(parallel to Stage 3)*
 
-Reuse Stage 2's channel for `type: "script_update"` per
-[device-script-delivery.md](../device-script-delivery.md): verify checksum, write
-to SD/littlefs, restart `lua_runner`. Note the **firmware ↔ script compatibility
-contract** — an OTA and a script push can each break the other if their API
-versions drift.
+`type: "script_update"` per
+[device-script-delivery.md](../device-script-delivery.md), with one
+structural change: the 32 KB job-document cap means the **inline-script
+variant dies** (scripts can be 128 KB). The document carries a `url` +
+`checksum` instead, and the device fetches the script over HTTPS exactly like
+firmware — which also deletes the only consumer of >32 KB MQTT reassembly.
+Verify checksum → write to SD/littlefs → restart `lua_runner` → report
+SUCCEEDED. `device-script-delivery.md` needs a matching revision when this
+lands. Note the **firmware ↔ script compatibility contract** — an OTA and a
+script push can each break the other if their API versions drift.
 
 ---
 
@@ -167,5 +227,7 @@ versions drift.
 
 Out of scope here. Download `.bin` to the ambyte SD → framed/CRC'd/ACK'd UART
 chunk protocol → Arduino `Update` on the C3 (which already has dual-OTA partitions
-and is USB-JTAG recoverable). A *different* handler from Stage 3; the `target`
-field reserves the slot. See the OTA-plan memory and ambit-firmware-interop notes.
+and is USB-JTAG recoverable). Same jobs channel, `target: "ambit"` in the job
+document reserves the slot; long-running executions suit jobs well
+(IN_PROGRESS statusDetails per chunk phase, generous timeout). See the
+OTA-plan memory and ambit-firmware-interop notes.
