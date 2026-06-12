@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "ota_update.h"
+#include "ambit_ota.h"
 
 #define TAG "cmd_router"
 
@@ -81,6 +82,45 @@ static void on_message(const char *topic, const char *payload, size_t len, void 
             } else {
                 ESP_LOGW(TAG, "ota_update id=%s dispatched (url=%s)", id ? id : "", url);
             }
+        }
+    } else if (strcmp(type, "ambit_ota") == 0) {
+        /* Stream a new AMBIT (C3) firmware image over UART. {url, channel}:
+         * channel 0-3 = one sensor; "all" or a negative number = every channel.
+         * ambit_ota owns dedupe (on success) + the download/stream/reboot. */
+        const cJSON *jurl = cJSON_GetObjectItemCaseSensitive(root, "url");
+        const cJSON *jch  = cJSON_GetObjectItemCaseSensitive(root, "channel");
+        const char *url = cJSON_IsString(jurl) ? jurl->valuestring : NULL;
+        uint8_t ch = 0;
+        bool ch_ok = true;
+        if (cJSON_IsNumber(jch) && jch->valueint >= 0 && jch->valueint < 4) {
+            ch = (uint8_t)jch->valueint;
+        } else if (cJSON_IsNumber(jch) && jch->valueint < 0) {
+            ch = AMBIT_OTA_CH_ALL;
+        } else if (cJSON_IsString(jch) && strcmp(jch->valuestring, "all") == 0) {
+            ch = AMBIT_OTA_CH_ALL;
+        } else {
+            ch_ok = false;
+        }
+        if (url == NULL) {
+            ESP_LOGW(TAG, "ambit_ota id=%s missing 'url' — ignoring", id ? id : "");
+        } else if (!ch_ok) {
+            ESP_LOGW(TAG, "ambit_ota id=%s bad/missing 'channel' (0-3 or \"all\") — ignoring",
+                     id ? id : "");
+        } else {
+            esp_err_t err = ambit_ota_request(ch, url, id);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "ambit_ota id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
+            } else {
+                ESP_LOGW(TAG, "ambit_ota id=%s dispatched (ch=%u url=%s)", id ? id : "", ch, url);
+            }
+        }
+    } else if (strcmp(type, "ambit_versions") == 0) {
+        /* Sweep every channel's AMBIT firmware version → one ambit_versions
+         * report on the status topic. Runs on the ambit_ota worker, off this
+         * (MQTT) task. */
+        esp_err_t err = ambit_ota_report_versions(id);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "ambit_versions id=%s dispatch failed: %s", id ? id : "", esp_err_to_name(err));
         }
     } else if (strcmp(type, "script_update") == 0) {
         ESP_LOGW(TAG, "script_update received (id=%s) — Stage-4 handler not wired yet",

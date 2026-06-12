@@ -291,6 +291,10 @@ cmd_result_t cmd_ambit_ota_data(uint8_t ch, uint16_t seq,
                                 const uint8_t *chunk, uint8_t len, uint8_t *status);
 cmd_result_t cmd_ambit_ota_end(uint8_t ch, uint8_t *status);
 cmd_result_t cmd_ambit_ota_abort(uint8_t ch, uint8_t *status);
+/* Mark the AMBIT's just-booted image valid (cancel its pending rollback). Sent
+ * after the post-OTA reboot once the new image is seen to answer; if never sent,
+ * the AMBIT bootloader rolls back to the previous image on its next reboot. */
+cmd_result_t cmd_ambit_ota_confirm(uint8_t ch, uint8_t *status);
 
 /* Call from the Wi-Fi disconnect event handler to clear any in-flight publish slot */
 void device_commands_on_mqtt_disconnect(void);

@@ -44,6 +44,7 @@ extern "C" {
 #define AMBIT_CMD_OTA_DATA           26   /* cmd[1]=len, cmd[2..3]=seq(LE); extra = data + CRC16(LE) */
 #define AMBIT_CMD_OTA_END            27   /* finalize + verify + reboot into the new slot */
 #define AMBIT_CMD_OTA_ABORT          28   /* discard a partial update */
+#define AMBIT_CMD_OTA_CONFIRM        29   /* mark the rebooted image valid (cancel rollback) */
 #define AMBIT_OTA_CHUNK_MAX         200   /* max data bytes per OTA_DATA (fits the C3 256 B RX + frame) */
 
 /* ── Info sub-types (cmd_arr[1] for cmd 33) ───────────────────────── */

@@ -842,22 +842,57 @@ static int cli_cmd_ota_mark_valid(int argc, char **argv)
 static int cli_cmd_ambit_ota(int argc, char **argv)
 {
     if (argc != 3) {
-        printf("Usage: ambit_ota <channel 0-3> <firmware-url>\r\n");
-        printf("  URL must be a direct .bin (raw.githubusercontent.com/...), not a\r\n");
-        printf("  github.com /blob/ or /tree/ web page. Suspends Lua+MQTT (~1-2 min).\r\n");
+        printf("Usage: ambit_ota <channel 0-3 | all> <firmware-url>\r\n");
+        printf("  'all' = every present channel (sequential). URL must be a direct .bin\r\n");
+        printf("  (raw.githubusercontent.com/...), not a /blob//tree/ page. Suspends Lua+MQTT.\r\n");
         return 1;
     }
-    int ch = atoi(argv[1]);
-    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
-        printf("Channel 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
-        return 1;
+    uint8_t ch;
+    if (strcmp(argv[1], "all") == 0) {
+        ch = AMBIT_OTA_CH_ALL;
+    } else {
+        int c = atoi(argv[1]);
+        if (c < 0 || c >= UART_SENSOR_NUM_CHANNELS) {
+            printf("Channel 0-%d or 'all'\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+            return 1;
+        }
+        ch = (uint8_t)c;
     }
-    esp_err_t err = ambit_ota_request((uint8_t)ch, argv[2]);
+    esp_err_t err = ambit_ota_request(ch, argv[2], NULL /* CLI: no dedupe id */);
     if (err != ESP_OK) {
         printf("ambit_ota: could not queue (%s)\r\n", esp_err_to_name(err));
         return 1;
     }
-    printf("AMBIT%d OTA queued — watch the log; the sensor reboots on success.\r\n", ch + 1);
+    printf("AMBIT OTA queued (%s) — watch the log; the sensor reboots on success.\r\n",
+           (ch == AMBIT_OTA_CH_ALL) ? "all" : argv[1]);
+    return 0;
+}
+
+/* Print the firmware version of every present AMBIT (cmd 33/2) — the fleet
+ * staleness view. Synchronous (console task); the MQTT `ambit_versions` command
+ * does the same sweep on the worker and publishes a JSON report. */
+static int cli_cmd_ambit_versions(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    printf("AMBIT firmware versions:\r\n");
+    for (uint8_t c = 0; c < UART_SENSOR_NUM_CHANNELS; c++) {
+        bool connected = false;
+        cmd_result_t pr = cmd_uart_ping(c, &connected);
+        if (pr.status != ESP_OK || !connected) {
+            printf("  AMBIT%u: absent\r\n", c + 1);
+            continue;
+        }
+        uint8_t buf[64];
+        size_t  len = 0;
+        cmd_result_t r = cmd_ambit_get_info(c, AMBIT_INFO_FW, buf, sizeof(buf), &len);
+        if (r.status == ESP_OK && len >= sizeof(ambit_fw_info_t)) {
+            const ambit_fw_info_t *fw = (const ambit_fw_info_t *)buf;
+            printf("  AMBIT%u: v%u.%u.%u  (built %.12s)\r\n",
+                   c + 1, fw->major, fw->minor, fw->batch, fw->fw_date);
+        } else {
+            printf("  AMBIT%u: present, no version (%s)\r\n", c + 1, esp_err_to_name(r.status));
+        }
+    }
     return 0;
 }
 
@@ -939,8 +974,13 @@ static esp_err_t cli_register_commands(void)
     };
     static const esp_console_cmd_t ambit_ota_cmd = {
         .command = "ambit_ota",
-        .help    = "ambit_ota <0-3> <url>  stream a new AMBIT firmware image over UART (OTA)",
+        .help    = "ambit_ota <0-3|all> <url>  stream a new AMBIT firmware image over UART (OTA)",
         .func    = cli_cmd_ambit_ota,
+    };
+    static const esp_console_cmd_t ambit_versions_cmd = {
+        .command = "ambit_versions",
+        .help    = "ambit_versions  print every present AMBIT's firmware version",
+        .func    = cli_cmd_ambit_versions,
     };
     static const esp_console_cmd_t wifi_reset_cmd = {
         .command = "wifi_reset",
@@ -1056,6 +1096,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&ambit_ota_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_versions_cmd);
     if (err != ESP_OK) {
         return err;
     }

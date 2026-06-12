@@ -1656,3 +1656,9 @@ cmd_result_t cmd_ambit_ota_abort(uint8_t ch, uint8_t *status)
     return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000);
 }
 
+cmd_result_t cmd_ambit_ota_confirm(uint8_t ch, uint8_t *status)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_OTA_CONFIRM, 0, 0, 0, 0, 0, 0, 0 };
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000);
+}
+

@@ -28,6 +28,9 @@ extern "C" {
  * v1 is CLI-triggered (`ambit_ota <ch> <url>`); an MQTT trigger is a follow-up.
  */
 
+/* channel value meaning "every responding AMBIT (0..3), in turn". */
+#define AMBIT_OTA_CH_ALL  0xFFu
+
 typedef struct {
     void (*workload_suspend)(void);   /* stop the Lua task during the update; NULL = skip */
     void (*workload_resume)(void);    /* restart it afterward; NULL = skip */
@@ -46,10 +49,18 @@ esp_err_t ambit_ota_init(const ambit_ota_config_t *cfg);
 
 /* Queue an AMBIT firmware update on `channel` (0-3) from `url` (a direct .bin —
  * raw.githubusercontent.com/… or a release-asset link, NOT a /blob//tree/ page).
- * Non-blocking: the worker quiesces, downloads, streams, and the AMBIT reboots.
- * ESP_ERR_INVALID_STATE before init; ESP_ERR_INVALID_ARG on a bad channel/url;
- * ESP_ERR_NO_MEM if an update is already queued. */
-esp_err_t ambit_ota_request(uint8_t channel, const char *url);
+ * `id` correlates status reports and dedupes a retained MQTT trigger (latched
+ * only on success, so a failed attempt retries under the same id); pass NULL
+ * from the CLI to never dedupe. Non-blocking: the worker quiesces, downloads,
+ * streams, and the AMBIT reboots. ESP_ERR_INVALID_STATE before init;
+ * ESP_ERR_INVALID_ARG on a bad channel/url; ESP_ERR_NO_MEM if one is in flight. */
+esp_err_t ambit_ota_request(uint8_t channel, const char *url, const char *id);
+
+/* Queue a fleet version sweep: read each channel's AMBIT firmware version (cmd
+ * 33/2) and publish one `ambit_versions` JSON report (+ log per channel). Runs
+ * on the worker task (off the MQTT loop). `id` correlates the report; NULL ok.
+ * The CLI reads versions directly instead (synchronous console output). */
+esp_err_t ambit_ota_report_versions(const char *id);
 
 #ifdef __cplusplus
 }
