@@ -279,6 +279,19 @@ cmd_result_t cmd_ambit_actinic(uint8_t ch, uint8_t type, uint8_t var, uint8_t va
 /* Write commands (extra data buffered, wait for CMD_END) */
 cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t len);
 
+/* AMBIT OTA-over-UART (cmds 25-28). Stream a new C3 firmware image: begin(size),
+ * then data(seq, chunk) for each <=AMBIT_OTA_CHUNK_MAX-byte chunk in order, then
+ * end() (the AMBIT verifies the image + reboots into the new slot). *status (may
+ * be NULL) receives the AMBIT's 1-byte reply — 0 = ok; non-zero = a per-command
+ * error code (OTA_DATA: 1 CRC, 2 out-of-order, 3 write-fail, 4 bad-len, 5 short,
+ * 6 no-begin). The CRC16 over each chunk is computed here. Orchestrated by
+ * components/ambit_ota; not for use from main.lua. */
+cmd_result_t cmd_ambit_ota_begin(uint8_t ch, uint32_t image_size, uint8_t *status);
+cmd_result_t cmd_ambit_ota_data(uint8_t ch, uint16_t seq,
+                                const uint8_t *chunk, uint8_t len, uint8_t *status);
+cmd_result_t cmd_ambit_ota_end(uint8_t ch, uint8_t *status);
+cmd_result_t cmd_ambit_ota_abort(uint8_t ch, uint8_t *status);
+
 /* Call from the Wi-Fi disconnect event handler to clear any in-flight publish slot */
 void device_commands_on_mqtt_disconnect(void);
 

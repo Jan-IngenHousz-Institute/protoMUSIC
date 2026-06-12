@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "ambit_ota.h"
 #include "ambit_protocol.h"
 #include "device_commands.h"
 #include "time_sync.h"
@@ -834,6 +835,32 @@ static int cli_cmd_ota_mark_valid(int argc, char **argv)
     return (err == ESP_OK) ? 0 : 1;
 }
 
+/* Stream a new AMBIT (C3) firmware image over UART. Non-blocking: queues the
+ * request and the ambit_ota worker downloads to SD, suspends Lua+MQTT, streams,
+ * and the sensor reboots into the new slot. Watch the log for progress. Use
+ * `ambit_info <ch> 2` before/after to read the version. */
+static int cli_cmd_ambit_ota(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("Usage: ambit_ota <channel 0-3> <firmware-url>\r\n");
+        printf("  URL must be a direct .bin (raw.githubusercontent.com/...), not a\r\n");
+        printf("  github.com /blob/ or /tree/ web page. Suspends Lua+MQTT (~1-2 min).\r\n");
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= UART_SENSOR_NUM_CHANNELS) {
+        printf("Channel 0-%d\r\n", UART_SENSOR_NUM_CHANNELS - 1);
+        return 1;
+    }
+    esp_err_t err = ambit_ota_request((uint8_t)ch, argv[2]);
+    if (err != ESP_OK) {
+        printf("ambit_ota: could not queue (%s)\r\n", esp_err_to_name(err));
+        return 1;
+    }
+    printf("AMBIT%d OTA queued — watch the log; the sensor reboots on success.\r\n", ch + 1);
+    return 0;
+}
+
 static esp_err_t cli_register_commands(void)
 {
     if (s_cli_commands_registered) {
@@ -909,6 +936,11 @@ static esp_err_t cli_register_commands(void)
         .command = "ambit_blink",
         .help    = "ambit_blink <0-3> <id> <brightness>  blink AMBIT LED",
         .func    = cli_cmd_ambit_blink,
+    };
+    static const esp_console_cmd_t ambit_ota_cmd = {
+        .command = "ambit_ota",
+        .help    = "ambit_ota <0-3> <url>  stream a new AMBIT firmware image over UART (OTA)",
+        .func    = cli_cmd_ambit_ota,
     };
     static const esp_console_cmd_t wifi_reset_cmd = {
         .command = "wifi_reset",
@@ -1019,6 +1051,11 @@ static esp_err_t cli_register_commands(void)
     }
 
     err = esp_console_cmd_register(&ambit_blink_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_cmd_register(&ambit_ota_cmd);
     if (err != ESP_OK) {
         return err;
     }

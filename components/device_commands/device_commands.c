@@ -1578,3 +1578,81 @@ cmd_result_t cmd_ambit_set_metadata(uint8_t ch, const uint8_t *metadata, size_t 
     return ambit_action(ch, cmd, metadata, len, 5000);
 }
 
+/* ── AMBIT OTA-over-UART (cmds 25-28) ───────────────────────────────────────
+ * Each command sends its 8-byte header (+ optional chunk payload) and reads the
+ * AMBIT's 1-byte status reply (DONE + status + END). The ambit_ota component
+ * orchestrates begin → data* → end; these only frame one exchange. */
+
+static uint16_t ambit_crc16_ccitt(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t b = 0; b < 8; b++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+/* Send one OTA command (cmd[8] + optional extra) and read the 1-byte status. */
+static cmd_result_t ambit_ota_cmd(uint8_t ch, const uint8_t cmd[8],
+                                  const uint8_t *extra, size_t extra_len,
+                                  uint8_t *status, uint32_t timeout_ms)
+{
+    if (!s_initialized || s_cfg.uart_query == NULL) {
+        return make_result(ESP_ERR_NOT_SUPPORTED, "UART sensors not available");
+    }
+    uart_sensor_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    esp_err_t err = s_cfg.uart_query(ch, cmd, extra, extra_len,
+                                     1 /* 1-byte status */, &resp, timeout_ms);
+    if (err != ESP_OK || resp.raw == NULL || resp.raw_len < 1) {
+        uart_sensor_response_free(&resp);
+        return make_result(err != ESP_OK ? err : ESP_FAIL,
+                           "AMBIT%u OTA cmd %u: no answer", ch + 1, cmd[0]);
+    }
+    uint8_t st = resp.raw[0];
+    if (status) *status = st;
+    uart_sensor_response_free(&resp);
+    return make_result(ESP_OK, "AMBIT%u OTA cmd %u status=%u", ch + 1, cmd[0], st);
+}
+
+cmd_result_t cmd_ambit_ota_begin(uint8_t ch, uint32_t image_size, uint8_t *status)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_OTA_BEGIN,
+                       (uint8_t)image_size,         (uint8_t)(image_size >> 8),
+                       (uint8_t)(image_size >> 16), (uint8_t)(image_size >> 24),
+                       0, 0, 0 };
+    /* begin() erases the target OTA partition (~hundreds of ms) — allow time. */
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 15000);
+}
+
+cmd_result_t cmd_ambit_ota_data(uint8_t ch, uint16_t seq,
+                                const uint8_t *chunk, uint8_t len, uint8_t *status)
+{
+    if (chunk == NULL || len == 0 || len > AMBIT_OTA_CHUNK_MAX) {
+        return make_result(ESP_ERR_INVALID_ARG, "OTA chunk len must be 1-%d", AMBIT_OTA_CHUNK_MAX);
+    }
+    uint8_t cmd[8] = { AMBIT_CMD_OTA_DATA, len,
+                       (uint8_t)seq, (uint8_t)(seq >> 8), 0, 0, 0, 0 };
+    uint8_t extra[AMBIT_OTA_CHUNK_MAX + 2];
+    memcpy(extra, chunk, len);
+    uint16_t crc = ambit_crc16_ccitt(chunk, len);
+    extra[len]     = (uint8_t)crc;
+    extra[len + 1] = (uint8_t)(crc >> 8);
+    return ambit_ota_cmd(ch, cmd, extra, (size_t)len + 2, status, 5000);
+}
+
+cmd_result_t cmd_ambit_ota_end(uint8_t ch, uint8_t *status)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_OTA_END, 0, 0, 0, 0, 0, 0, 0 };
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 10000);
+}
+
+cmd_result_t cmd_ambit_ota_abort(uint8_t ch, uint8_t *status)
+{
+    uint8_t cmd[8] = { AMBIT_CMD_OTA_ABORT, 0, 0, 0, 0, 0, 0, 0 };
+    return ambit_ota_cmd(ch, cmd, NULL, 0, status, 5000);
+}
+

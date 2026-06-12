@@ -15,6 +15,7 @@
 #include "bme280.h"
 #include "command_router.h"
 #include "ota_update.h"
+#include "ambit_ota.h"
 #include "device_commands.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -500,6 +501,24 @@ void app_main(void)
     };
     if (ota_update_init(&ota_cfg) != ESP_OK) {
         ESP_LOGW(APP_TAG, "OTA worker not started");
+    }
+
+    /* Host-driven AMBIT (C3) firmware update over UART. CLI-triggered
+     * (`ambit_ota <ch> <url>`): downloads the C3 image to SD, suspends Lua + MQTT,
+     * streams it to the sensor over the binary UART link; the AMBIT verifies and
+     * reboots into its spare slot. Same quiesce hooks as the self-OTA. */
+    ambit_ota_config_t ambit_ota_cfg = {
+        .workload_suspend = app_workload_suspend,
+        .workload_resume  = app_workload_resume,
+        .comms_suspend    = mqtt_client_stop,
+        .comms_resume     = mqtt_client_start,
+        .publish          = mqtt_client_get_publish_fn(),
+        .is_connected     = mqtt_client_get_is_connected_fn(),
+        .status_topic     = status_topic,
+        .device_id        = device_id,
+    };
+    if (ambit_ota_init(&ambit_ota_cfg) != ESP_OK) {
+        ESP_LOGW(APP_TAG, "AMBIT OTA worker not started");
     }
 
     /* ── Wi-Fi init + start ───────────────────────────────────────── */

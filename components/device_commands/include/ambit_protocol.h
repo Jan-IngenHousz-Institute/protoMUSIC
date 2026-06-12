@@ -36,6 +36,16 @@ extern "C" {
 #define AMBIT_CMD_NVS_SCALAR         17
 #define AMBIT_CMD_NVS_ARRAY          18
 
+/* OTA-over-UART (ambit-1 run_esp.cpp cmds 25-28): the ambyte streams a new C3
+ * firmware image in CRC16-checked, sequenced chunks; the AMBIT writes it to its
+ * spare OTA slot via Update and reboots into it. Each returns a 1-byte status
+ * (0 = ok). Orchestrated by components/ambit_ota. */
+#define AMBIT_CMD_OTA_BEGIN          25   /* cmd[1..4] = image size (LE u32) */
+#define AMBIT_CMD_OTA_DATA           26   /* cmd[1]=len, cmd[2..3]=seq(LE); extra = data + CRC16(LE) */
+#define AMBIT_CMD_OTA_END            27   /* finalize + verify + reboot into the new slot */
+#define AMBIT_CMD_OTA_ABORT          28   /* discard a partial update */
+#define AMBIT_OTA_CHUNK_MAX         200   /* max data bytes per OTA_DATA (fits the C3 256 B RX + frame) */
+
 /* ── Info sub-types (cmd_arr[1] for cmd 33) ───────────────────────── */
 
 #define AMBIT_INFO_CALIBRATION  1
