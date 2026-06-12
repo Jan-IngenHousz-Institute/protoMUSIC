@@ -259,10 +259,16 @@ is "who can publish to the command topic."
    { "type":"ota_update", "id":"ota-2026-06-11-1",
      "url":"https://github.com/<owner>/<repo>/releases/download/<tag>/firmware.bin" }
    ```
-   - `url`: a **public** HTTPS app-image (GitHub **release asset** — upload the
-     branch-built `firmware.bin` to a release; the URL points at that asset, not
-     at the git branch). A missing asset is the `File not found(404)` you'll see
-     in the log.
+   - `url`: a **public** HTTPS app-image. Two working forms:
+     - a GitHub **Release asset**: `https://github.com/<o>/<r>/releases/download/<tag>/firmware.bin`
+       — only resolves if an actual Release with that tag has the file attached
+       (404 = no such Release/asset). A repo *folder* named `releases/…` is NOT
+       a Release.
+     - a **file committed in the repo**, via the raw host:
+       `https://raw.githubusercontent.com/<o>/<r>/<branch>/<path>/firmware.bin`.
+     NOT working: `github.com/...(/tree/|/blob/)...` — those are the web file
+     browser and serve HTML (rejected by the device with a bad_url / not-an-image
+     error).
    - `id`: latched only on a **successful** update (to stop a retained trigger
      re-OTAing). A failed attempt is *not* latched, so you can re-send the same
      `id` to retry; only a completed update locks its id (use a new one next time).
