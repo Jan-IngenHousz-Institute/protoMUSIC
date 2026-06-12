@@ -14,6 +14,7 @@
 #include "device_config.h"
 #include "bme280.h"
 #include "command_router.h"
+#include "ota_update.h"
 #include "device_commands.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -30,13 +31,20 @@
 #include "sd_card.h"
 #include "sd_logger.h"
 #include "spike_log.h"
-#include "ota_spike.h"
 #include "event_log.h"
 #include "sync_runner.h"
 #include "uart_sensors.h"
 #include "wifi_manager.h"
 
 #define APP_TAG "APP_MAIN"
+
+/* Human-visible build marker, logged loudly at boot. For an OTA HW test, bump
+ * this in the image you publish (e.g. "ota-test-1") so the new image is
+ * unmistakable in the boot log vs. the one flashed over USB. Overridable from
+ * platformio.ini build_flags as -DAMBYTE_FW_TAG=... if you prefer. */
+#ifndef AMBYTE_FW_TAG
+#define AMBYTE_FW_TAG "dev"
+#endif
 
 /* Re-sync the ESP system clock from the RTC at this cadence (drift correction +
  * recovery if the RTC is set/validated after boot). */
@@ -110,6 +118,21 @@ static bool app_wifi_provisioned(void)
     bool provisioned = false;
     (void)wifi_manager_is_provisioned(&provisioned);
     return provisioned;
+}
+
+/* Pause/resume the Lua measurement task for the OTA worker — stopping it during
+ * the download frees its heap (8 KB AMBIT buffer + transient tables) so the
+ * download's TLS doesn't fragment against concurrent measurement allocations. */
+static void app_workload_suspend(void)
+{
+    if (lua_runner_stop(5000) != ESP_OK) {
+        ESP_LOGW(APP_TAG, "Lua task did not stop before OTA — heap may fragment");
+    }
+}
+
+static void app_workload_resume(void)
+{
+    (void)lua_runner_start();   /* reloads /sdcard/main.lua after a failed OTA */
 }
 
 static esp_err_t app_init_i2c_and_sensors(void)
@@ -326,6 +349,7 @@ void app_main(void)
 
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(APP_TAG, "app_main entered");
+    ESP_LOGW(APP_TAG, "firmware build tag: %s", AMBYTE_FW_TAG);
 
     /* ── NVS ──────────────────────────────────────────────────────── */
     esp_err_t err = app_init_nvs();
@@ -460,6 +484,24 @@ void app_main(void)
         ESP_LOGI(APP_TAG, "command router wired (cmd topic: %s)", command_topic);
     }
 
+    /* MQTT-triggered self-OTA (docs/ota-update-plan.md Stage 3). The worker
+     * suspends MQTT during the download (the board can't hold two TLS sessions),
+     * and confirms a just-applied image on the next MQTT reconnect (else rolls
+     * back). Triggered by command_router's ota_update dispatch. */
+    ota_update_config_t ota_cfg = {
+        .publish          = mqtt_client_get_publish_fn(),
+        .is_connected     = mqtt_client_get_is_connected_fn(),
+        .comms_suspend    = mqtt_client_stop,
+        .comms_resume     = mqtt_client_start,
+        .workload_suspend = app_workload_suspend,
+        .workload_resume  = app_workload_resume,
+        .status_topic     = status_topic,
+        .device_id        = device_id,
+    };
+    if (ota_update_init(&ota_cfg) != ESP_OK) {
+        ESP_LOGW(APP_TAG, "OTA worker not started");
+    }
+
     /* ── Wi-Fi init + start ───────────────────────────────────────── */
     err = app_start_wifi();
     if (err != ESP_OK) {
@@ -492,29 +534,6 @@ void app_main(void)
         ESP_LOGW(APP_TAG, "Wi-Fi connect failed: %s", esp_err_to_name(err));
     }
 
-#ifdef SPIKE_OTA
-    /* Stage-0 OTA spike (docs/ota-update-plan.md). Runs the real esp_https_ota
-     * download against a GitHub URL to answer the gating question (does the TLS
-     * handshake fit in the 8 KiB record buffer + does the streaming download stay
-     * within the internal-RAM budget) and then ABORTS — it never sets the boot
-     * partition. Deliberately placed BEFORE MQTT/sensors/persistence start, so it
-     * runs with maximal free heap: a failure here is a pure TLS-buffer verdict,
-     * not heap exhaustion. Set the URL with -DSPIKE_OTA_URL=\"https://...\". */
-#ifndef SPIKE_OTA_URL
-#define SPIKE_OTA_URL "https://raw.githubusercontent.com/OWNER/REPO/BRANCH/firmware.bin"
-#endif
-    /* Give Wi-Fi a moment if the initial connect timed out (background reconnect). */
-    for (int i = 0; i < 30 && !wifi_manager_is_connected(); i++) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    if (wifi_manager_is_connected()) {
-        ota_spike_run(SPIKE_OTA_URL);
-    } else {
-        ESP_LOGE(APP_TAG, "SPIKE_OTA: Wi-Fi not connected — cannot run OTA spike");
-    }
-    ESP_LOGW(APP_TAG, "SPIKE_OTA build — normal startup skipped");
-    return;
-#endif
 
     /* ── Wi-Fi → MQTT lifecycle event handlers ────────────────────── */
     /* Registered after the provisioning/connect block so they cannot fire

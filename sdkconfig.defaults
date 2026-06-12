@@ -11,6 +11,11 @@ CONFIG_ESPTOOLPY_FLASHSIZE_DETECT=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # CONFIG_PARTITION_TABLE_SINGLE_APP is not set
+# OTA Stage 1: dual-OTA partition table (ota_0/ota_1/otadata) needs rollback so a
+# bad self-OTA image (booted PENDING_VERIFY) reverts unless the new app calls
+# esp_ota_mark_app_valid_cancel_rollback() — wired in Stage 3, gated on MQTT
+# reconnect. Harmless for esptool-flashed apps (they boot VALID, never roll back).
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_MQTT_PROTOCOL_5=y
 # CONFIG_MQTT_PROTOCOL_311 is not set
 CONFIG_ESP_TASK_WDT_PANIC=y

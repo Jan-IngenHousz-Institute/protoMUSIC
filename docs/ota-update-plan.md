@@ -5,13 +5,23 @@ Host-triggered OTA for the **ambyte** (ESP32-S3 gateway), and later the
 [device-script-delivery.md](../device-script-delivery.md), which describes the
 Lua-script push that shares the same inbound channel.
 
-> **Revised 2026-06-11:** the trigger/orchestration layer moves from a custom
-> MQTT command topic to **AWS IoT Jobs** (the mechanism underneath AWS's OTA
-> update tasks). The download path is unchanged (Stage-0-proven
-> `esp_https_ota`). Stages 2–4 are rewritten; Stage 0 (passed) and Stage 1
-> are untouched. The custom-channel code already built for Stage 2
-> (subscribe + reassembly in `mqtt_client.c`, JSON router + NVS dedupe in
-> `command_router/`) is repointed, not discarded.
+> **Revised 2026-06-11 (a):** the trigger/orchestration layer was going to move
+> to **AWS IoT Jobs**. The download path is unchanged either way (Stage-0-proven
+> `esp_https_ota`).
+>
+> **Revised 2026-06-11 (b) — SHIP NOW via the custom topic; Jobs later.** The
+> partner fixed the subscribe policy, so the **custom command topic works today**
+> (`device/scripts/v1/…`, SUBACK rc=1). AWS Jobs, by contrast, still needs partner
+> work the device can't self-serve: `$aws/things/<thing>/jobs/*` requires
+> `client_id == thing name` (currently `client_id=AMBYTE{MAC}` ≠ thing
+> `dom_ludo_…`) **and** a separate jobs-topic policy grant. Since OTA is needed
+> now, **Stage 3 ships triggered by the working custom topic** carrying a GitHub
+> URL (the original idea); **Stage 2 (Jobs) is deferred** to a later swap of just
+> the trigger transport. Everything else — Stage-1 dual-OTA partitions + rollback,
+> `esp_https_ota` download, the Stage-3b Signer option — is unchanged and reused.
+> The Jobs migration becomes: align `client_id` to thing name, get the jobs
+> policy, repoint `mqtt_client` subscribe + the router from the custom topic to
+> the `$aws/.../jobs/*` topics. The handler/download/rollback don't change.
 
 ## Decisions already taken
 
@@ -110,28 +120,60 @@ public GitHub release (`protoMUSIC/releases/ota-spike-test`) end-to-end:
    `sdkconfig.defaults` so it affects NORMAL builds too — confirm steady-state MQTT is
    unaffected (watch the `sync_runner` "heap:" line) after reflashing normal firmware.
 
-**What landed:** `components/ota_spike/` (re-runnable test harness),
-cert-bundle config in `sdkconfig.defaults`, `-DSPIKE_OTA` build flags in
-`platformio.ini` (commented), spike hook in `app_main.c`.
+**What landed:** the cert-bundle config in `sdkconfig.defaults` (kept — the
+real OTA path needs it). The throwaway `components/ota_spike/` harness, its
+`-DSPIKE_OTA` build flags, and the `app_main.c` hook were **removed** once
+Stage 3 shipped and was HW-validated (the real `ota_update` component
+superseded them).
 
 **Gate: PASSED → GitHub-hosted OTA is viable; proceed to Stage 1.**
 
 ---
 
-## Stage 1 — Partition migration + rollback  *(prerequisite, forces one hand-reflash)*
+## Stage 1 — Partition migration + rollback  ⟵ *IMPLEMENTED 2026-06-11 on branch
+`feature/ota-stage1-partitions` (build passes; NOT yet flashed)*
 
-Today's `partitions.csv` has `factory + ota_0` with **no `otadata` / `ota_1`** —
-not an OTA-capable layout. Rework to `ota_0 + ota_1 + otadata` (drop `factory`).
+The v1 `partitions.csv` had `factory + ota_0` with **no `otadata` / `ota_1`** —
+not OTA-capable. Reworked to the dual-OTA layout:
 
-- Keep `littlefs` and `storage` at their current offsets so a reflash that writes
-  only bootloader + table + app (no `erase_flash`) **preserves field data**.
-- Enable `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` (+ `…ROLLBACK_REASON` optional).
-- **Bootstrap caveat:** you cannot OTA into a new layout — every already-fielded
-  ambyte needs this one-time physical reflash. OTA only helps units flashed after
-  the migration. (Also re-seeds NVS per the known PlatformIO reflash behaviour.)
+```
+nvs       0x9000   0x6000     (unchanged — provisioning image flashes here)
+otadata   0xf000   0x2000     (NEW — bootloader slot selector)
+phy_init  0x11000  0x1000     (moved; RF cal self-heals)
+ota_0     0x20000  0x2F0000   (2.94 MB; app boots here; ~44% used)
+ota_1     0x310000 0x2F0000   (2.94 MB; OTA target slot)
+coredump  0x610000 0x10000    (unchanged)
+littlefs  0x620000 0x80000    (unchanged — field data preserved)
+storage   0x6A0000 0x960000   (unchanged — field data preserved)
+```
 
-**Deliverable:** new partition table + rollback config, validated by a manual
-`esp_ota` round-trip (write the other slot, switch, mark valid).
+- `littlefs`/`storage`/`coredump` keep their v1 offsets, so a migration reflash
+  that does **not** `erase_flash` preserves internal-flash field data. (Physical
+  SD-card data — the event log — is on a separate medium and always survives.)
+- `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` added. Harmless for esptool-flashed
+  apps (they boot VALID); only OTA images boot PENDING_VERIFY and need
+  `esp_ota_mark_app_valid_cancel_rollback()` (wired in Stage 3, gated on MQTT
+  reconnect). 56 KiB gap before `ota_0` is 64 KiB app-partition alignment.
+- The build emits **`ota_data_initial.bin`** (empty/0xFF) → the flasher writes
+  it to `otadata`, so the bootloader cleanly boots `ota_0` after migration; no
+  stale-otadata hazard.
+
+**Migration procedure (the one-time hand-reflash per fielded unit):**
+- A normal `pio run -t upload` writes bootloader + partition table +
+  `ota_data_initial` (→ `otadata`) + app (→ `ota_0`) + the NVS image (@0x9000),
+  and does **not** `erase_flash` — so `littlefs`/`storage` survive. NVS runtime
+  keys (cursor/next_id) are re-seeded as usual; the event log reseeds `next_id`
+  from the SD card.
+- Do **NOT** `erase_flash` (it would wipe internal field data). If a unit fails
+  to boot the new slot, erase only the `otadata` region (`0xf000 0x2000`) and
+  re-upload — don't whole-chip erase.
+- You cannot OTA *into* this layout — every already-fielded ambyte needs this
+  physical reflash once. OTA only helps units flashed after the migration.
+
+**Remaining for Stage 1 closure:** flash the branch to a bench unit and do the
+manual `esp_ota` round-trip (write `ota_1`, `esp_ota_set_boot_partition`,
+reboot, confirm it boots `ota_1`, mark valid) to prove the dual-slot + rollback
+config end-to-end before Stage 2/3 build on it.
 
 ---
 
@@ -178,33 +220,93 @@ reports SUCCEEDED with statusDetails visible in the console. No OTA yet.
 
 ---
 
-## Stage 3 — ambyte self-OTA handler  *(depends on Stage 1 + 2, gated by Stage 0)*
+## Stage 3 — ambyte self-OTA handler  ⟵ *IMPLEMENTED 2026-06-11 on branch
+`feature/ota-stage1-partitions` via the CUSTOM command topic (build passes; NOT
+yet HW-tested). Jobs-triggered variant deferred — see the Revised(b) note.*
 
-Wire `type: "ota_update"`, `target: "ambyte"` to a dedicated OTA **task**.
-Job document (jobId replaces the old `id` field):
+Component `ota_update` (`components/ota_update/`), dispatched by `command_router`
+on an `ota_update` command on the custom command topic:
 
 ```json
-{ "type":"ota_update", "target":"ambyte", "version":"1.4.0",
-  "url":"https://raw.githubusercontent.com/Ludo-lab/ambyte-iot-ludo/<branch>/firmware.bin",
-  "sha256":"<hex>", "size":1356608 }
+{ "type": "ota_update", "id": "<unique-each-time>",
+  "url": "https://github.com/<owner>/<repo>/releases/download/<tag>/firmware.bin" }
 ```
 
-Flow: claim via start-next → skip-if-current (`version` == running → report
-SUCCEEDED with `statusDetails: {"skipped":"already at version"}`) → report
-IN_PROGRESS detail "downloading" → quiesce Lua + publishing →
-`esp_https_ota` from `url` via cert bundle (follows the 302) → verify
-`sha256`/`size` → set boot → **latch jobId + target version in NVS** →
-reboot → new image boots, MQTT reconnects →
-`esp_ota_mark_app_valid_cancel_rollback()` → report the latched jobId
-SUCCEEDED → clear latch. Failure paths: download/verify error → report
-FAILED with reason, no reboot; connectivity-breaking image → bootloader
-rolls back → old image finds the latch with version ≠ running → reports
-FAILED `{"rolled_back":true}`. Set `inProgressTimeoutInMinutes` (~30) on the
-job as the server-side watchdog for bricked-silent outcomes.
+Flow: `command_router` dedupes on `id` (already-applied → ignore) and marks it
+applied up front (a retained/duplicate trigger can't re-OTA) → `ota_update_request`
+→ worker task: report `accepted` → **latch `id` in NVS** → `comms_suspend`
+(`mqtt_client_stop`, freeing the TLS heap — the board can't hold two TLS
+sessions) → `esp_https_ota(url)` with the Stage-0 settings (cert bundle, 4 KiB
+HTTP buffers, follows the 302) → `esp_restart` → new image boots PENDING_VERIFY
+→ on MQTT reconnect, `esp_ota_mark_app_valid_cancel_rollback()` + report
+`success` (with the running `fw` version) → clear latch. Failure paths: download
+error → clear latch, `comms_resume`, report `failed`; image boots but can't
+reconnect within 5 min → `esp_ota_mark_app_invalid_rollback_and_reboot()`
+(reverts to the known-good slot).
 
-**Deliverable:** create an OTA job → device self-updates from GitHub and the
-job shows SUCCEEDED in the console; a bad/connectivity-breaking image rolls
-back and the job shows FAILED with the rollback detail.
+Status JSON on the status topic:
+`{"type":"ota_status","device_id":…,"id":…,"state":"accepted|failed|success","fw":"<version>"[,"detail":…]}`.
+
+Integrity today = HTTPS + the esp-image validation `esp_https_ota` performs.
+Authenticity (AWS Signer) is **Stage 3b**, not yet wired — so the trust boundary
+is "who can publish to the command topic."
+
+### Operating — triggering an OTA
+
+1. The **target `firmware.bin` must be built from an OTA-capable branch** (dual-OTA
+   partitions + rollback + this `ota_update` handler). An image without the
+   handler boots but never marks itself valid → rolls back after 5 min.
+2. Publish to the device's command topic (the one that SUBACKs rc=1):
+   ```json
+   { "type":"ota_update", "id":"ota-2026-06-11-1",
+     "url":"https://github.com/<owner>/<repo>/releases/download/<tag>/firmware.bin" }
+   ```
+   - `url`: a **public** HTTPS app-image. Two working forms:
+     - a GitHub **Release asset**: `https://github.com/<o>/<r>/releases/download/<tag>/firmware.bin`
+       — only resolves if an actual Release with that tag has the file attached
+       (404 = no such Release/asset). A repo *folder* named `releases/…` is NOT
+       a Release.
+     - a **file committed in the repo**, via the raw host:
+       `https://raw.githubusercontent.com/<o>/<r>/<branch>/<path>/firmware.bin`.
+     NOT working: `github.com/...(/tree/|/blob/)...` — those are the web file
+     browser and serve HTML (rejected by the device with a bad_url / not-an-image
+     error).
+   - `id`: latched only on a **successful** update (to stop a retained trigger
+     re-OTAing). A failed attempt is *not* latched, so you can re-send the same
+     `id` to retry; only a completed update locks its id (use a new one next time).
+3. Watch the status topic for `accepted` → (download, ~1 min) → after reboot,
+   `success` with the new `fw`. Serial shows `firmware build tag:` + the new
+   boot offset.
+
+### Stage-3 HW test (step by step)
+
+Two images from the same branch, distinguished by `AMBYTE_FW_TAG` (main/app_main.c):
+
+1. **Build + flash image A (the migration flash):** set `AMBYTE_FW_TAG "ota-A"`,
+   `pio run -t upload` (a normal upload — **never `erase_flash`**). Confirm the
+   boot log: `Loaded app from partition at offset 0x20000`, `firmware build tag:
+   ota-A`, and `event_log: ready … pending=…` (field data preserved).
+2. **Build + publish image B (the OTA target):** set `AMBYTE_FW_TAG "ota-B"`,
+   `pio run` (no upload). Create a **public** GitHub release and attach
+   `.pio/build/esp32-s3-devkitm-1/firmware.bin`. Copy the asset download URL.
+3. **Trigger:** publish the `ota_update` command (above) with that URL. Expect
+   `ota_status state=accepted` on the status topic, then the serial log: MQTT
+   disconnect → `esp_https_ota` download progress → reboot. (Re-sending the same
+   `id` after a failed attempt is fine — only a *successful* update locks the id.)
+4. **Confirm the swap:** new boot log shows `Loaded app from partition at offset
+   0x310000` (= `ota_1`) and `firmware build tag: ota-B`. After MQTT reconnects,
+   `ota_status state=success fw=<B version>`. → OTA downloaded + ran the new bits.
+5. **`ota_status`** at the console: `running: ota_1 … state=VALID` (mark-valid
+   committed it). A second OTA would target `ota_0`, ping-ponging slots.
+6. **Failure path:** trigger an OTA with a bogus `url` (404 / not an image) and a
+   fresh `id` → `ota_status state=failed`, device stays on the current image
+   (no reboot). (The *connectivity*-rollback path is already proven by the
+   Stage-1 `ota_selftest` round-trip; reproducing it here needs a deliberately
+   unconnectable image.)
+
+**Deliverable:** publish an `ota_update` → device self-updates from a GitHub
+release, boots the new slot, confirms `success`; a bad URL reports `failed` and
+stays put.
 
 ---
 
