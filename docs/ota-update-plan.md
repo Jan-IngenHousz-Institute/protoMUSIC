@@ -120,9 +120,11 @@ public GitHub release (`protoMUSIC/releases/ota-spike-test`) end-to-end:
    `sdkconfig.defaults` so it affects NORMAL builds too — confirm steady-state MQTT is
    unaffected (watch the `sync_runner` "heap:" line) after reflashing normal firmware.
 
-**What landed:** `components/ota_spike/` (re-runnable test harness),
-cert-bundle config in `sdkconfig.defaults`, `-DSPIKE_OTA` build flags in
-`platformio.ini` (commented), spike hook in `app_main.c`.
+**What landed:** the cert-bundle config in `sdkconfig.defaults` (kept — the
+real OTA path needs it). The throwaway `components/ota_spike/` harness, its
+`-DSPIKE_OTA` build flags, and the `app_main.c` hook were **removed** once
+Stage 3 shipped and was HW-validated (the real `ota_update` component
+superseded them).
 
 **Gate: PASSED → GitHub-hosted OTA is viable; proceed to Stage 1.**
 

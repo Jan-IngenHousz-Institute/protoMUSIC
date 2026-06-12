@@ -199,6 +199,18 @@ Behaviour when the script is missing:
 
 Functions available to scripts are defined in the `device`, `db`, and `mqtt` Lua tables — see the `luaL_Reg` arrays at the bottom of [components/lua_runner/lua_runner.c](components/lua_runner/lua_runner.c). The starter script in [docs/main.lua.example](docs/main.lua.example) drives PWM on GPIO4 and is a good template for any new script.
 
+## 9. Firmware updates (OTA)
+
+The device self-updates over MQTT: publish an `ota_update` command with a public HTTPS URL to a `firmware.bin` and the device downloads it, reboots into the spare OTA slot, and confirms (or rolls back) on reconnect. Requires the dual-OTA partition layout — a one-time USB reflash migrates a device from the legacy single-app layout; after that, updates are remote.
+
+```sh
+# id must be unique per update; a failed attempt is retryable with the same id.
+uv run docs/mqtt_tls_test_client.py --publish "$AMBYTE_COMMAND_TOPIC" --qos 1 --mqtt5 \
+  --message '{"type":"ota_update","id":"ota-1","url":"https://github.com/<owner>/<repo>/releases/download/<tag>/firmware.bin"}'
+```
+
+The `url` must be a real downloadable binary: a **GitHub Release asset** (`…/releases/download/<tag>/firmware.bin`) or a **committed file via the raw host** (`https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>/firmware.bin`). A `github.com/.../tree/` or `/blob/` web URL serves HTML and is rejected. The full flow, operating notes, and the step-by-step hardware test are in [docs/ota-update-plan.md](docs/ota-update-plan.md).
+
 ## Troubleshooting
 
 | Symptom | Fix |
